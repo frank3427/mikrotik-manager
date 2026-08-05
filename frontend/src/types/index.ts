@@ -3,7 +3,9 @@ export type UserRole = 'admin' | 'operator' | 'viewer';
 export interface User {
   id: number;
   username: string;
+  email?: string | null;
   role: UserRole;
+  auth_provider?: 'local' | 'oidc';
   created_at?: string;
 }
 
@@ -56,6 +58,8 @@ export interface Device {
   ros_version?: string;
   latest_ros_version?: string;
   firmware_update_available?: boolean;
+  routerboard_upgrade_available?: boolean;
+  upgrade_firmware_version?: string;
   device_type: DeviceType;
   status: DeviceStatus;
   last_seen?: string;
@@ -67,6 +71,14 @@ export interface Device {
   rack_slot?: string;
   created_at: string;
   updated_at?: string;
+  tags?: { id: number; name: string; color: string }[];
+}
+
+export interface Tag {
+  id: number;
+  name: string;
+  color: string;
+  device_count?: number;
 }
 
 export interface Interface {
@@ -106,6 +118,28 @@ export interface BridgeVlanEntry {
 
 export interface SwitchPort extends Interface {
   bridgeInfo?: BridgeVlanEntry | null;
+}
+
+export interface PortClient {
+  mac_address: string;
+  hostname: string | null;
+  custom_name: string | null;
+  vendor: string | null;
+  ip_address: string | null;
+  client_type: string;
+  vlan_id: number | null;
+  signal_strength: number | null;
+  first_seen: string | null;
+  last_seen: string | null;
+}
+
+export interface PortClientsResult {
+  classification: 'access' | 'uplink';
+  reason: string;
+  mac_count: number;
+  vlan_count: number;
+  neighbor: { neighbor_identity: string | null; neighbor_platform: string | null } | null;
+  clients: PortClient[];
 }
 
 export interface PortMonitorData {
@@ -158,6 +192,12 @@ export interface Client {
   device_name?: string;
   mac_address: string;
   custom_name?: string;
+  /** Effective device category: user override if set, else the fingerprint. */
+  device_category?: string;
+  /** What the fingerprint engine detected (before any user override). */
+  auto_category?: string;
+  /** User's manual category override, if any. */
+  custom_category?: string | null;
   hostname?: string;
   vendor?: string;
   ip_address?: string;
@@ -169,6 +209,8 @@ export interface Client {
   client_type: 'wired' | 'wireless';
   active: boolean;
   last_seen?: string;
+  /** Today's NetFlow upload+download total (0 when NetFlow is not collecting). */
+  traffic_today_bytes?: number;
 }
 
 export interface Backup {
@@ -177,7 +219,7 @@ export interface Backup {
   device_name?: string;
   filename: string;
   size_bytes?: number;
-  backup_type: 'manual' | 'scheduled';
+  backup_type: 'manual' | 'scheduled' | 'config-snapshot';
   notes?: string;
   created_at: string;
 }
@@ -190,6 +232,8 @@ export interface TopologyDevice {
   device_type: DeviceType;
   status: DeviceStatus;
   ros_version?: string;
+  /** Cached /ip/address rows from the device (set by backend sync). */
+  ip_addresses_jsonb?: { address: string; interface?: string; dynamic?: boolean }[];
 }
 
 export interface TopologyLink {
@@ -226,6 +270,21 @@ export interface MetricsSummary {
   devices: { total: number; online: number; offline: number };
   clients: { total: number; active: number };
   alerts: { critical: number; warning: number };
+  availability?: { fleetUptimePct30d: number };
+}
+
+export interface DeviceAvailability {
+  uptimePct: number;
+  totalOutages: number;
+  longestOutageSec: number;
+  totalOutageSec: number;
+  outages: {
+    id: number;
+    went_offline_at: string;
+    came_back_online_at: string | null;
+    duration_seconds: number | null;
+  }[];
+  range: string;
 }
 
 export interface TimeSeriesPoint {
@@ -311,4 +370,96 @@ export interface WirelessMetricPoint {
   ssid?: string;
   registered_clients?: number;
   noise_floor?: number;
+}
+
+// ─── Rogue AP detection ─────────────────────────────────────────────────────
+
+export interface RogueAp {
+  ssid: string; bssid: string; vendor: string; signal: number; band: string;
+  seenBy: string; scannedAt: string;
+}
+export interface NeighborAp extends RogueAp { security: string }
+export interface RogueApReport {
+  rogues: RogueAp[];
+  neighbors: NeighborAp[];
+  lastScanAt: string | null;
+  scannedDevices: number;
+}
+
+// ─── RF Health ──────────────────────────────────────────────────────────────
+
+export interface RfChannelRow {
+  device_id: number;
+  device_name: string;
+  name: string;
+  ssid?: string;
+  band?: string;
+  frequency: number;
+  channel_width?: string;
+  registered_clients: number;
+}
+
+export interface RfSignalRow {
+  mac_address: string;
+  signal_strength: number;
+  device_id: number;
+  device_name: string;
+  custom_name?: string | null;
+  hostname?: string | null;
+}
+
+export interface RfTxQualityRow {
+  device_id: string;
+  device_name?: string;
+  interface: string;
+  band: string;
+  tx_retry_pct: number;
+}
+
+export interface RfConnectivityStage {
+  success: number;
+  failure: number;
+  pct: number | null;
+}
+
+export interface RfConnectivity {
+  range: string;
+  log_derived: boolean;
+  stages: {
+    association: RfConnectivityStage;
+    authentication: RfConnectivityStage;
+    dhcp: RfConnectivityStage;
+  };
+}
+
+export interface ConfigSnapshotMeta {
+  id: number;
+  device_id: number;
+  config_hash: string | null;
+  change_summary: string | null;
+  backup_id: number | null;
+  has_backup: boolean;
+  collected_at: string;
+}
+
+export interface ConfigSnapshotFull extends ConfigSnapshotMeta {
+  config_text: string | null;
+  text: string;
+}
+
+export interface ConfigDiffSide {
+  id: number;
+  text: string;
+  collected_at: string;
+}
+
+export interface ConfigDiffResponse {
+  from: ConfigDiffSide;
+  to: ConfigDiffSide;
+}
+
+export interface ConfigCaptureResult {
+  created: boolean;
+  message: string;
+  snapshot: ConfigSnapshotMeta;
 }

@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  ArrowLeft, RefreshCw, Activity, Cpu, MemoryStick, Clock, ExternalLink, TerminalSquare,
+  ArrowLeft, RefreshCw, Activity, Cpu, MemoryStick, Clock, ExternalLink, TerminalSquare, ShieldCheck,
 } from 'lucide-react';
-import { devicesApi } from '../services/api';
+import { devicesApi, metricsApi } from '../services/api';
 import { useCanWrite } from '../hooks/useCanWrite';
 import SwitchPortDiagram from '../components/ports/SwitchPortDiagram';
 import TerminalModal from '../components/TerminalModal';
@@ -13,12 +13,16 @@ import VlansTab from '../components/device-detail/VlansTab';
 import RoutingTab from '../components/device-detail/RoutingTab';
 import FirewallTab from '../components/device-detail/FirewallTab';
 import SystemConfigTab from '../components/device-detail/SystemConfigTab';
+import ConfigHistoryTab from '../components/device-detail/ConfigHistoryTab';
 import HardwareTab from '../components/device-detail/HardwareTab';
 import ToolsTab from '../components/device-detail/ToolsTab';
 import RadiosTab from '../components/device-detail/RadiosTab';
+import ConnectionsTab from '../components/device-detail/ConnectionsTab';
+import QueuesTab from '../components/device-detail/QueuesTab';
+import SecurityTab from '../components/device-detail/SecurityTab';
 import clsx from 'clsx';
 
-type TabKey = 'overview' | 'ports' | 'vlans' | 'routing' | 'firewall' | 'config' | 'hardware' | 'tools' | 'radios';
+type TabKey = 'overview' | 'ports' | 'vlans' | 'routing' | 'firewall' | 'security' | 'queues' | 'connections' | 'config' | 'config-history' | 'hardware' | 'tools' | 'radios';
 
 function formatUptime(raw: string): string {
   if (!raw) return '—';
@@ -45,7 +49,10 @@ export default function DeviceDetailPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const canWrite = useCanWrite();
-  const [activeTab, setActiveTab] = useState<TabKey>('overview');
+  const [searchParams] = useSearchParams();
+  const VALID_TABS: TabKey[] = ['overview', 'ports', 'vlans', 'routing', 'firewall', 'security', 'queues', 'connections', 'config', 'config-history', 'hardware', 'tools', 'radios'];
+  const requestedTab = searchParams.get('tab') as TabKey | null;
+  const [activeTab, setActiveTab] = useState<TabKey>(requestedTab && VALID_TABS.includes(requestedTab) ? requestedTab : 'overview');
   const [autoOpenBridge, setAutoOpenBridge] = useState<string | null>(null);
   const [showTerminal, setShowTerminal] = useState(false);
 
@@ -62,6 +69,12 @@ export default function DeviceDetailPage() {
     queryFn: () => devicesApi.getResources(deviceId).then((r) => r.data),
     refetchInterval: 30_000,
     enabled: device?.status === 'online',
+  });
+
+  const { data: availability } = useQuery({
+    queryKey: ['device-availability', deviceId],
+    queryFn: () => metricsApi.deviceAvailability(deviceId, '30d').then((r) => r.data),
+    refetchInterval: 60_000,
   });
 
   const syncMutation = useMutation({
@@ -99,7 +112,13 @@ export default function DeviceDetailPage() {
     { key: 'vlans', label: 'VLANs' },
     { key: 'routing', label: 'Routing' },
     { key: 'firewall', label: 'Firewall' },
+    { key: 'security', label: 'Security' },
+    // RouterOS L3 features are available on every managed device, so show them
+    // for all device types (the tabs render a clean empty state when unused).
+    { key: 'queues', label: 'Bandwidth' },
+    { key: 'connections', label: 'Connections' },
     { key: 'config', label: 'Config' },
+    { key: 'config-history', label: 'Config History' },
     { key: 'hardware', label: 'Hardware' },
     ...(isWirelessAP ? [{ key: 'radios' as TabKey, label: 'Radios' }] : []),
     { key: 'tools', label: 'Tools' },
@@ -161,14 +180,16 @@ export default function DeviceDetailPage() {
             <ExternalLink className="w-4 h-4" />
             <span className="hidden sm:inline">Web Admin</span>
           </button>
-          <button
-            onClick={() => setShowTerminal(true)}
-            className="btn-secondary flex items-center gap-2 text-sm"
-            title="Open SSH terminal"
-          >
-            <TerminalSquare className="w-4 h-4" />
-            <span className="hidden sm:inline">Terminal</span>
-          </button>
+          {canWrite && (
+            <button
+              onClick={() => setShowTerminal(true)}
+              className="btn-secondary flex items-center gap-2 text-sm"
+              title="Open SSH terminal"
+            >
+              <TerminalSquare className="w-4 h-4" />
+              <span className="hidden sm:inline">Terminal</span>
+            </button>
+          )}
           {canWrite && (
             <button
               onClick={() => syncMutation.mutate()}
@@ -265,6 +286,56 @@ export default function DeviceDetailPage() {
             </div>
           </div>
 
+          {/* Availability card */}
+          <div className="card p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <ShieldCheck className="w-4 h-4 text-blue-500" />
+              <span className="text-sm font-semibold text-gray-900 dark:text-white">30-Day Availability</span>
+            </div>
+            {availability ? (
+              <div className="flex flex-wrap gap-6">
+                <div>
+                  <div className={clsx(
+                    'text-3xl font-bold',
+                    availability.uptimePct >= 99 ? 'text-green-500' : availability.uptimePct >= 95 ? 'text-yellow-500' : 'text-red-500'
+                  )}>
+                    {availability.uptimePct.toFixed(2)}%
+                  </div>
+                  <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">Uptime</div>
+                </div>
+                <div>
+                  <div className="text-2xl font-bold text-gray-900 dark:text-white">{availability.totalOutages}</div>
+                  <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">Outages</div>
+                </div>
+                {availability.longestOutageSec > 0 && (
+                  <div>
+                    <div className="text-2xl font-bold text-gray-900 dark:text-white">
+                      {availability.longestOutageSec < 60
+                        ? `${availability.longestOutageSec}s`
+                        : availability.longestOutageSec < 3600
+                        ? `${Math.round(availability.longestOutageSec / 60)}m`
+                        : `${(availability.longestOutageSec / 3600).toFixed(1)}h`}
+                    </div>
+                    <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">Longest outage</div>
+                  </div>
+                )}
+                <div className="flex-1 min-w-[120px] self-center">
+                  <div className="h-2 bg-gray-200 dark:bg-slate-600 rounded-full overflow-hidden">
+                    <div
+                      className={clsx(
+                        'h-full rounded-full transition-all',
+                        availability.uptimePct >= 99 ? 'bg-green-500' : availability.uptimePct >= 95 ? 'bg-yellow-500' : 'bg-red-500'
+                      )}
+                      style={{ width: `${availability.uptimePct}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="text-sm text-gray-400 dark:text-slate-500">No availability data yet</div>
+            )}
+          </div>
+
           {/* System details */}
           <div className="card p-5">
             <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">
@@ -306,12 +377,18 @@ export default function DeviceDetailPage() {
       {activeTab === 'vlans' && (
         <VlansTab
           deviceId={deviceId}
+          deviceName={device?.name}
+          deviceType={device?.device_type}
           onGoToPorts={(bridgeName) => { setAutoOpenBridge(bridgeName); setActiveTab('ports'); }}
         />
       )}
       {activeTab === 'routing' && <RoutingTab deviceId={deviceId} />}
-      {activeTab === 'firewall' && <FirewallTab deviceId={deviceId} deviceType={device?.device_type} />}
-      {activeTab === 'config' && <SystemConfigTab deviceId={deviceId} />}
+      {activeTab === 'firewall' && <FirewallTab deviceId={deviceId} />}
+      {activeTab === 'security' && <SecurityTab deviceId={deviceId} />}
+      {activeTab === 'queues' && <QueuesTab deviceId={deviceId} />}
+      {activeTab === 'connections' && <ConnectionsTab deviceId={deviceId} />}
+      {activeTab === 'config' && <SystemConfigTab deviceId={deviceId} device={device} />}
+      {activeTab === 'config-history' && <ConfigHistoryTab deviceId={deviceId} />}
       {activeTab === 'hardware' && <HardwareTab deviceId={deviceId} />}
       {activeTab === 'radios' && <RadiosTab deviceId={deviceId} deviceStatus={device.status} />}
       {activeTab === 'tools' && <ToolsTab deviceId={deviceId} />}

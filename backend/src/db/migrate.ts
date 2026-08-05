@@ -160,6 +160,71 @@ CREATE TABLE IF NOT EXISTS app_settings (
 ALTER TABLE clients ADD COLUMN IF NOT EXISTS vendor VARCHAR(255);
 ALTER TABLE clients ADD COLUMN IF NOT EXISTS vlan_id INTEGER;
 ALTER TABLE clients ADD COLUMN IF NOT EXISTS custom_name VARCHAR(255);
+-- first_seen: when this client was first discovered ("connected since"); set once, preserved across polls
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ;
+UPDATE clients SET first_seen = last_seen WHERE first_seen IS NULL;
+-- custom_category: user override of the fingerprinted device category
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS custom_category VARCHAR(30);
+
+-- Firmware orchestration: staged fleet upgrades in waves
+CREATE TABLE IF NOT EXISTS firmware_rollouts (
+  id              SERIAL PRIMARY KEY,
+  name            VARCHAR(100) NOT NULL,
+  status          VARCHAR(20) NOT NULL DEFAULT 'pending', -- pending|running|completed|failed|cancelled
+  halt_on_failure BOOLEAN NOT NULL DEFAULT TRUE,
+  pre_backup      BOOLEAN NOT NULL DEFAULT TRUE,
+  scheduled_at    TIMESTAMPTZ,
+  started_at      TIMESTAMPTZ,
+  finished_at     TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS firmware_rollout_devices (
+  id           SERIAL PRIMARY KEY,
+  rollout_id   INTEGER NOT NULL REFERENCES firmware_rollouts(id) ON DELETE CASCADE,
+  device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  wave         INTEGER NOT NULL DEFAULT 1,
+  status       VARCHAR(20) NOT NULL DEFAULT 'pending', -- pending|backing_up|upgrading|rebooting|verifying|success|failed|skipped
+  from_version VARCHAR(30),
+  to_version   VARCHAR(30),
+  error        TEXT,
+  started_at   TIMESTAMPTZ,
+  finished_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_fw_rollout_devices ON firmware_rollout_devices(rollout_id, wave, id);
+
+-- Platform & automation: scoped API tokens, outbound webhooks, scheduled reports
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id           SERIAL PRIMARY KEY,
+  name         VARCHAR(100) NOT NULL,
+  token_hash   VARCHAR(64) NOT NULL UNIQUE,
+  prefix       VARCHAR(12) NOT NULL,
+  scope        VARCHAR(10) NOT NULL DEFAULT 'read', -- read|write
+  created_by   VARCHAR(50),
+  last_used_at TIMESTAMPTZ,
+  expires_at   TIMESTAMPTZ,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS webhooks (
+  id            SERIAL PRIMARY KEY,
+  name          VARCHAR(100) NOT NULL,
+  url           TEXT NOT NULL,
+  secret        VARCHAR(128),
+  events        TEXT[] NOT NULL DEFAULT '{}',
+  enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+  last_status   INTEGER,
+  last_fired_at TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS report_schedules (
+  id           SERIAL PRIMARY KEY,
+  name         VARCHAR(100) NOT NULL,
+  frequency    VARCHAR(10) NOT NULL DEFAULT 'weekly', -- daily|weekly|monthly
+  recipients   TEXT NOT NULL,
+  enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+  last_sent_at TIMESTAMPTZ,
+  next_run_at  TIMESTAMPTZ NOT NULL,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
 ALTER TABLE events ADD COLUMN IF NOT EXISTS log_id VARCHAR(20);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_events_device_log_id ON events(device_id, log_id);
 ALTER TABLE topology_links ADD COLUMN IF NOT EXISTS neighbor_mac VARCHAR(17);
@@ -173,8 +238,34 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS rack_name VARCHAR(100);
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS rack_slot VARCHAR(20);
 ALTER TABLE topology_links ADD COLUMN IF NOT EXISTS neighbor_caps VARCHAR(255);
 ALTER TABLE topology_links ADD COLUMN IF NOT EXISTS discovered_by VARCHAR(50);
+-- RouterOS can return a long comma-separated discovered-by list; 50 chars was too small.
+ALTER TABLE topology_links ALTER COLUMN discovered_by TYPE VARCHAR(512);
+-- Interface names from neighbor discovery can exceed 50 chars (long bridge/bond names).
+ALTER TABLE topology_links ALTER COLUMN from_interface TYPE VARCHAR(512);
+ALTER TABLE topology_links ALTER COLUMN to_interface TYPE VARCHAR(512);
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS firmware_update_available BOOLEAN DEFAULT FALSE;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS latest_ros_version VARCHAR(20);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS routerboard_upgrade_available BOOLEAN DEFAULT FALSE;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS upgrade_firmware_version VARCHAR(20);
+
+-- Config history / drift detection: each snapshot stores the canonical /export
+-- .rsc text (config_text), deduped by content hash, and links to the restorable
+-- backup that holds the same .rsc. The snapshot and its backup are one artifact,
+-- so deleting the backup cascades to remove the snapshot (kept consistent).
+ALTER TABLE device_configs ADD COLUMN IF NOT EXISTS config_hash VARCHAR(64);
+ALTER TABLE device_configs ADD COLUMN IF NOT EXISTS change_summary TEXT;
+ALTER TABLE device_configs ADD COLUMN IF NOT EXISTS config_text TEXT;
+ALTER TABLE device_configs ADD COLUMN IF NOT EXISTS backup_id INTEGER REFERENCES backups(id) ON DELETE SET NULL;
+-- Upgrade the backup_id FK from SET NULL to CASCADE so a snapshot and its backup
+-- stay in lockstep (deleting the backup removes the now-unrestorable snapshot).
+ALTER TABLE device_configs DROP CONSTRAINT IF EXISTS device_configs_backup_id_fkey;
+ALTER TABLE device_configs ADD CONSTRAINT device_configs_backup_id_fkey
+  FOREIGN KEY (backup_id) REFERENCES backups(id) ON DELETE CASCADE;
+
+-- Cached IPv4/IPv6 addresses from /ip/address (per device) for topology resolution:
+-- neighbors seen only by IP (CDP/MNDP) can be matched to managed devices even
+-- when the address is not the device's management IP.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS ip_addresses_jsonb JSONB;
 
 -- Allow multiple neighbors per interface (one row per neighbor, not per port)
 ALTER TABLE topology_links DROP CONSTRAINT IF EXISTS topology_links_from_device_id_from_interface_key;
@@ -260,6 +351,153 @@ CREATE TABLE IF NOT EXISTS ap_scan_data (
 CREATE INDEX IF NOT EXISTS idx_ap_scan_device
   ON ap_scan_data(device_id, scanned_at DESC);
 
+-- Device credential presets — reusable API/SSH credential sets, referenced
+-- by name when adding or editing a managed device. Passwords are stored
+-- encrypted at rest (same scheme as devices.api_password_encrypted) so the
+-- plaintext never leaves the backend.
+CREATE TABLE IF NOT EXISTS credential_presets (
+  id                      SERIAL PRIMARY KEY,
+  name                    VARCHAR(100) NOT NULL UNIQUE,
+  api_username            VARCHAR(50)  NOT NULL,
+  api_password_encrypted  TEXT         NOT NULL,
+  api_port                INTEGER,
+  ssh_username            VARCHAR(50),
+  ssh_password_encrypted  TEXT,
+  ssh_port                INTEGER,
+  notes                   TEXT,
+  created_at              TIMESTAMPTZ DEFAULT NOW(),
+  updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE credential_presets ADD COLUMN IF NOT EXISTS allow_operator_use BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Maintenance windows — suppress alerts for planned downtime
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+  id             SERIAL PRIMARY KEY,
+  name           VARCHAR(100) NOT NULL,
+  device_ids     INTEGER[] NOT NULL DEFAULT '{}',
+  start_at       TIMESTAMPTZ NOT NULL,
+  end_at         TIMESTAMPTZ NOT NULL,
+  recurring_cron VARCHAR(100),
+  active         BOOLEAN NOT NULL DEFAULT true,
+  created_at     TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_maintenance_windows_active ON maintenance_windows(active, start_at, end_at);
+
+-- Device tags
+CREATE TABLE IF NOT EXISTS tags (
+  id         SERIAL PRIMARY KEY,
+  name       VARCHAR(50) NOT NULL UNIQUE,
+  color      VARCHAR(20) NOT NULL DEFAULT '#6366f1',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS device_tags (
+  device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  tag_id    INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY (device_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_device_tags_tag ON device_tags(tag_id);
+
+-- Audit log — records all write operations performed by authenticated users
+CREATE TABLE IF NOT EXISTS audit_log (
+  id           SERIAL PRIMARY KEY,
+  user_id      INTEGER,
+  username     VARCHAR(50),
+  method       VARCHAR(10) NOT NULL,
+  path         TEXT NOT NULL,
+  entity_type  VARCHAR(50),
+  entity_id    INTEGER,
+  summary      TEXT,
+  ip_address   VARCHAR(45),
+  status_code  INTEGER,
+  created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC);
+
+-- Device availability (offline/online outage tracking)
+CREATE TABLE IF NOT EXISTS device_availability (
+  id                  SERIAL PRIMARY KEY,
+  device_id           INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  went_offline_at     TIMESTAMPTZ NOT NULL,
+  came_back_online_at TIMESTAMPTZ,
+  duration_seconds    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_device_availability_device ON device_availability(device_id, went_offline_at DESC);
+
+-- Manual topology links — user-drawn connections for devices with no auto-discovery
+CREATE TABLE IF NOT EXISTS manual_topology_links (
+  id               SERIAL PRIMARY KEY,
+  from_device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  to_device_id     INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  label            VARCHAR(100),
+  created_at       TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(from_device_id, to_device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_manual_topology_links_from ON manual_topology_links(from_device_id);
+CREATE INDEX IF NOT EXISTS idx_manual_topology_links_to   ON manual_topology_links(to_device_id);
+
+-- Configuration templates (reusable config sets pushed to devices or groups)
+CREATE TABLE IF NOT EXISTS config_templates (
+  id               SERIAL PRIMARY KEY,
+  name             VARCHAR(100) NOT NULL UNIQUE,
+  description      TEXT,
+  applies_to_type  VARCHAR(20),
+  template_json    JSONB NOT NULL DEFAULT '{}',
+  created_at       TIMESTAMPTZ DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- TOTP two-factor authentication
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(64);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled BOOLEAN NOT NULL DEFAULT false;
+
+-- OIDC / SSO identity mapping. Local users keep password_hash; SSO users are
+-- keyed by (oidc_issuer, oidc_subject) and have a null password_hash.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_subject VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS oidc_issuer VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR(20) NOT NULL DEFAULT 'local';
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc ON users (oidc_issuer, oidc_subject) WHERE oidc_subject IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (lower(email)) WHERE email IS NOT NULL;
+
+-- Per-client daily traffic rollups from the NetFlow collector. mac_address
+-- also holds the pseudo-clients 'unknown' (unmapped local IPs) and 'other'
+-- (clients folded by the top-N cardinality cap).
+CREATE TABLE IF NOT EXISTS client_traffic_daily (
+  mac_address    VARCHAR(17) NOT NULL,
+  day            DATE        NOT NULL,
+  upload_bytes   BIGINT      NOT NULL DEFAULT 0,
+  download_bytes BIGINT      NOT NULL DEFAULT 0,
+  app_breakdown  JSONB       NOT NULL DEFAULT '{}',
+  PRIMARY KEY (mac_address, day)
+);
+CREATE INDEX IF NOT EXISTS idx_client_traffic_daily_day ON client_traffic_daily(day DESC);
+
+-- Change Guard: in-flight and historical "safe apply" operations. A pending row
+-- means a restore point + auto-revert scheduler are armed on the device; the
+-- manager either commits (disarms) or leaves the device to restore itself.
+CREATE TABLE IF NOT EXISTS device_change_guards (
+  id             SERIAL PRIMARY KEY,
+  device_id      INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  token          VARCHAR(64) NOT NULL,
+  mode           VARCHAR(10) NOT NULL DEFAULT 'binary',
+  restore_point  VARCHAR(64),
+  scheduler_name VARCHAR(64),
+  status         VARCHAR(16) NOT NULL DEFAULT 'pending',
+  change_kind    VARCHAR(64),
+  change_summary TEXT,
+  note           TEXT,
+  user_id        INTEGER,
+  created_at     TIMESTAMPTZ DEFAULT NOW(),
+  expires_at     TIMESTAMPTZ,
+  committed_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_change_guards_device ON device_change_guards(device_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_change_guards_pending ON device_change_guards(status, expires_at);
+
 -- Wireless security profiles (WPA/WPA2/WPA3 config)
 CREATE TABLE IF NOT EXISTS wireless_security_profiles (
   id                    SERIAL PRIMARY KEY,
@@ -291,6 +529,24 @@ const DEFAULT_SETTINGS = [
   { key: 'spectral_scan_interval_hours', value: 24 },
   { key: 'ap_scan_enabled', value: false },
   { key: 'ap_scan_interval_hours', value: 24 },
+  { key: 'login_rate_limit_window_sec', value: 60 },
+  { key: 'login_rate_limit_max', value: 10 },
+  { key: 'config_snapshot_enabled', value: true },
+  { key: 'config_snapshot_interval_min', value: 60 },
+  { key: 'config_snapshot_retention', value: 30 },
+  { key: 'netflow_enabled', value: false },
+  { key: 'netflow_collector_address', value: '' },
+  { key: 'netflow_collector_port', value: 2055 },
+  { key: 'netflow_version', value: '9' },
+  { key: 'netflow_active_timeout', value: '1m' },
+  { key: 'netflow_inactive_timeout', value: '15s' },
+  { key: 'netflow_topn_clients', value: 50 },
+  { key: 'netflow_accept_unknown', value: true },
+  { key: 'netflow_retention_days', value: 30 },
+  { key: 'netflow_daily_retention_days', value: 365 },
+  { key: 'change_guard_enabled', value: true },
+  { key: 'change_guard_mode', value: 'binary' },
+  { key: 'change_guard_timeout_sec', value: 120 },
 ];
 
 export async function runMigrations(): Promise<void> {

@@ -9,7 +9,7 @@ import { alertService } from './AlertService';
 
 interface PollJob {
   deviceId: number;
-  type: 'fast' | 'slow' | 'logs' | 'full' | 'macscan' | 'spectral' | 'apscan';
+  type: 'fast' | 'slow' | 'logs' | 'full' | 'macscan' | 'spectral' | 'apscan' | 'configsnap';
 }
 
 export class PollerService {
@@ -73,6 +73,8 @@ export class PollerService {
       await this.slowQueue.add('device-spectral', jobData, { attempts: 1 });
     } else if (type === 'apscan') {
       await this.slowQueue.add('device-apscan', jobData, { attempts: 1 });
+    } else if (type === 'configsnap') {
+      await this.slowQueue.add('device-configsnap', jobData, { attempts: 1 });
     }
   }
 
@@ -96,6 +98,10 @@ export class PollerService {
       const spectralIntervalHours = (appSettings['spectral_scan_interval_hours'] as number) || 24;
       const apScanEnabled         = appSettings['ap_scan_enabled'] === true;
       const apScanIntervalHours   = (appSettings['ap_scan_interval_hours'] as number) || 24;
+      const backupScheduleEnabled = appSettings['backup_schedule_enabled'] === true;
+      const backupScheduleCron    = (appSettings['backup_schedule_cron'] as string) || '0 2 * * *';
+      const configSnapEnabled      = appSettings['config_snapshot_enabled'] !== false;
+      const configSnapIntervalMin  = (appSettings['config_snapshot_interval_min'] as number) || 60;
 
       const devices = await query<DeviceRow>(
         `SELECT * FROM devices WHERE status != 'disabled'`
@@ -151,6 +157,20 @@ export class PollerService {
             await this.setTimestamp(apScanKey, now);
           }
         }
+
+        // Config snapshot — capture config history & detect drift, user-configured
+        // interval (default 60min). The snapshot itself dedups by content hash, so
+        // this only stores a new row when the device config actually changed.
+        if (configSnapEnabled) {
+          const configKey = `poll:configsnap:${device.id}`;
+          const lastConfig = await this.getTimestamp(configKey);
+          if (now - lastConfig > configSnapIntervalMin * 60_000) {
+            await this.scheduleDeviceSync(device.id, 'configsnap');
+            // Keep the gate key alive for the full interval (+ buffer) so the
+            // snapshot honours the configured cadence rather than the default TTL.
+            await this.setTimestamp(configKey, now, configSnapIntervalMin * 60 + 120);
+          }
+        }
       }
 
       // Reverse DNS enrichment — global, runs every 5 minutes when enabled
@@ -165,6 +185,18 @@ export class PollerService {
         }
       }
 
+      // Stale topology-link cleanup — runs every 15 minutes.
+      // Removes neighbor rows whose reporting device missed enough slow polls
+      // (slow poll = 5 min; 20-min window = 4 missed polls) without being
+      // explicitly marked offline, e.g. after a crash.
+      const staleLinksKey = 'task:stale_topology_links';
+      const lastStaleLinks = await this.getTimestamp(staleLinksKey);
+      if (now - lastStaleLinks > 900_000) {
+        await this.setTimestamp(staleLinksKey, now);
+        query(`DELETE FROM topology_links WHERE discovered_at < NOW() - INTERVAL '20 minutes'`)
+          .catch((e) => console.error('[Poller] Stale topology-link cleanup error:', e));
+      }
+
       // Firmware update check — runs once per day
       const firmwareKey = 'task:firmware_check';
       const lastFirmware = await this.getTimestamp(firmwareKey);
@@ -172,6 +204,17 @@ export class PollerService {
         await this.setTimestamp(firmwareKey, now);
         this.checkAllDevicesFirmware(devices).catch((e) =>
           console.error('[Poller] Firmware check error:', e)
+        );
+      }
+
+      // NetFlow data retention — runs once per day. Purges old client_traffic
+      // points from InfluxDB and old daily rollups from Postgres.
+      const netflowPruneKey = 'task:netflow_retention';
+      const lastNetflowPrune = await this.getTimestamp(netflowPruneKey);
+      if (now - lastNetflowPrune > 86_400_000) {
+        await this.setTimestamp(netflowPruneKey, now, 86_400 + 3_600);
+        this.purgeNetflowData().catch((e) =>
+          console.error('[Poller] NetFlow retention error:', e)
         );
       }
 
@@ -185,6 +228,19 @@ export class PollerService {
           console.error('[Poller] Client prune error:', e)
         );
       }
+
+      // Scheduled backups — fire when the cron expression matches the current minute/hour.
+      // Redis key with 1-hour TTL prevents double-firing within the same cron window.
+      if (backupScheduleEnabled && this.cronMatchesNow(backupScheduleCron)) {
+        const backupKey = 'task:scheduled_backup';
+        const lastBackup = await this.getTimestamp(backupKey);
+        if (now - lastBackup > 3_600_000) {
+          await this.setTimestamp(backupKey, now);
+          this.runScheduledBackups().catch((e) =>
+            console.error('[Poller] Scheduled backup error:', e)
+          );
+        }
+      }
     } catch (err) {
       console.error('Scheduler error:', err);
     }
@@ -197,7 +253,9 @@ export class PollerService {
          WHERE key IN ('mac_scan_enabled', 'mac_scan_interval', 'reverse_dns_enabled',
                        'retention_clients_days', 'spectral_scan_enabled',
                        'spectral_scan_interval_hours', 'ap_scan_enabled',
-                       'ap_scan_interval_hours')`
+                       'ap_scan_interval_hours', 'backup_schedule_enabled',
+                       'backup_schedule_cron', 'config_snapshot_enabled',
+                       'config_snapshot_interval_min')`
       );
       const map: Record<string, unknown> = {};
       for (const row of rows) map[row.key] = row.value;
@@ -205,6 +263,68 @@ export class PollerService {
     } catch {
       return {};
     }
+  }
+
+  // Returns true if the 5-part cron expression matches the current time.
+  // Evaluates all five fields — minute, hour, day-of-month, month, day-of-week —
+  // so weekly (e.g. `0 3 * * 0`) and monthly (`0 3 1 * *`) schedules fire only on
+  // the right day, not every day. Supports: *, exact numbers, comma lists,
+  // ranges (a-b), and step values (*/n). Day-of-month and day-of-week follow the
+  // standard cron rule: when both are restricted the job runs if either matches;
+  // when only one is restricted, only that one must match.
+  private cronMatchesNow(cron: string): boolean {
+    const parts = cron.trim().split(/\s+/);
+    if (parts.length < 5) return false;
+    const [minuteField, hourField, domField, monthField, dowField] = parts;
+    const now = new Date();
+    const matchField = (field: string, val: number): boolean => {
+      if (field === '*') return true;
+      return field.split(',').some((f) => {
+        if (f.includes('/')) {
+          const [base, step] = f.split('/');
+          const start = base === '*' ? 0 : Number(base);
+          return val >= start && (val - start) % Number(step) === 0;
+        }
+        if (f.includes('-')) {
+          const [lo, hi] = f.split('-').map(Number);
+          return val >= lo && val <= hi;
+        }
+        return Number(f) === val;
+      });
+    };
+
+    if (!matchField(minuteField, now.getMinutes())) return false;
+    if (!matchField(hourField, now.getHours())) return false;
+    if (!matchField(monthField, now.getMonth() + 1)) return false; // cron months are 1-12
+
+    // Day-of-month (1-31) and day-of-week (0-6, Sun=0). getDay() returns 0 for Sunday.
+    const domRestricted = domField !== '*';
+    const dowRestricted = dowField !== '*';
+    const domMatch = matchField(domField, now.getDate());
+    const dowMatch = matchField(dowField, now.getDay());
+    let dayMatch: boolean;
+    if (!domRestricted && !dowRestricted) dayMatch = true;
+    else if (domRestricted && dowRestricted) dayMatch = domMatch || dowMatch;
+    else dayMatch = domRestricted ? domMatch : dowMatch;
+    return dayMatch;
+  }
+
+  private async runScheduledBackups(): Promise<void> {
+    const { BackupService } = await import('./BackupService');
+    const backupService = new BackupService();
+    const devices = await query<{
+      id: number; name: string; ip_address: string; ssh_port: number;
+      ssh_username: string; ssh_password_encrypted: string;
+      api_username: string; api_password_encrypted: string;
+    }>(`SELECT id, name, ip_address, ssh_port, ssh_username, ssh_password_encrypted,
+               api_username, api_password_encrypted
+        FROM devices WHERE status = 'online'`);
+    console.log(`[Poller] Starting scheduled backup for ${devices.length} online device(s)`);
+    const results = await Promise.allSettled(
+      devices.map((d) => backupService.createBackup(d, 'Scheduled backup', 'scheduled'))
+    );
+    const succeeded = results.filter((r) => r.status === 'fulfilled').length;
+    console.log(`[Poller] Scheduled backup complete: ${succeeded}/${devices.length} succeeded`);
   }
 
   private async resolveClientHostnames(): Promise<void> {
@@ -242,6 +362,48 @@ export class PollerService {
     if (updated > 0) {
       console.log(`[Poller] Reverse DNS enriched ${updated} client hostname(s)`);
       this.io?.emit('clients:updated', {});
+    }
+  }
+
+  private async purgeNetflowData(): Promise<void> {
+    const rows = await query<{ key: string; value: unknown }>(
+      `SELECT key, value FROM app_settings
+       WHERE key IN ('netflow_retention_days', 'netflow_daily_retention_days')`
+    );
+    const map: Record<string, unknown> = {};
+    for (const row of rows) map[row.key] = row.value;
+    const detailDays = Number(map['netflow_retention_days']) || 30;
+    const dailyDays = Number(map['netflow_daily_retention_days']) || 365;
+
+    // InfluxDB: delete client_traffic points older than the detail retention
+    const { DeleteAPI } = await import('@influxdata/influxdb-client-apis');
+    const { getInfluxClient, org, bucket } = await import('../config/influxdb');
+    const stop = new Date(Date.now() - detailDays * 86_400_000).toISOString();
+    await new DeleteAPI(getInfluxClient())
+      .postDelete({
+        org,
+        bucket,
+        body: {
+          start: '1970-01-01T00:00:00Z',
+          stop,
+          predicate: '_measurement="client_traffic"',
+        },
+      })
+      .catch((e) => console.error('[Poller] NetFlow Influx purge error:', (e as Error).message));
+
+    // Postgres: delete daily rollups older than the rollup retention
+    const result = await query<{ count: string }>(
+      `WITH deleted AS (
+         DELETE FROM client_traffic_daily
+         WHERE day < CURRENT_DATE - ($1 || ' days')::interval
+         RETURNING 1
+       )
+       SELECT COUNT(*) AS count FROM deleted`,
+      [dailyDays]
+    );
+    const count = parseInt(result[0]?.count || '0', 10);
+    if (count > 0) {
+      console.log(`[Poller] NetFlow retention pruned ${count} daily rollup row(s) (> ${dailyDays} days)`);
     }
   }
 
@@ -295,10 +457,10 @@ export class PollerService {
     }
   }
 
-  private async setTimestamp(key: string, ts: number): Promise<void> {
+  private async setTimestamp(key: string, ts: number, ttlSec = 600): Promise<void> {
     try {
       const { redis } = await import('../config/redis');
-      await redis.set(key, String(ts), 'EX', 600);
+      await redis.set(key, String(ts), 'EX', ttlSec);
     } catch { /* redis unavailable — timestamp not cached */ }
   }
 
@@ -364,6 +526,16 @@ export class PollerService {
           deviceId: device.id,
           deviceName: device.name,
         }).catch(() => {});
+        // Close the open outage row if one exists
+        if (prevStatus === 'offline') {
+          query(
+            `UPDATE device_availability
+             SET came_back_online_at = NOW(),
+                 duration_seconds = EXTRACT(EPOCH FROM (NOW() - went_offline_at))::INTEGER
+             WHERE device_id = $1 AND came_back_online_at IS NULL`,
+            [device.id]
+          ).catch(() => {});
+        }
       }
 
       this.io?.emit('device:updated', { deviceId: device.id });
@@ -516,12 +688,36 @@ export class PollerService {
     }
   }
 
+  private async processConfigSnapJob(data: PollJob): Promise<void> {
+    const device = await this.getDevice(data.deviceId);
+    if (!device) return;
+
+    // Config snapshots capture `/export` over SSH. Only attempt this automatically
+    // when SSH credentials are actually configured — otherwise we'd repeatedly try
+    // (and fail) SSH auth using the API credentials, flooding the device logs on
+    // devices where SSH was never set up. Manual "Capture snapshot" is unaffected.
+    if (!device.ssh_username || !device.ssh_password_encrypted) return;
+
+    const collector = new DeviceCollector(device);
+    try {
+      await collector.connect();
+      await collector.snapshotConfig('scheduled');
+    } catch (err) {
+      console.error(`[Poller] Config snapshot failed for ${device.name}:`, (err as Error).message);
+    } finally {
+      collector.disconnect();
+    }
+  }
+
   private async processSlowJob(data: PollJob): Promise<void> {
     if (data.type === 'spectral') {
       return this.processSpectralJob(data);
     }
     if (data.type === 'apscan') {
       return this.processApScanJob(data);
+    }
+    if (data.type === 'configsnap') {
+      return this.processConfigSnapJob(data);
     }
 
     const device = await this.getDevice(data.deviceId);
@@ -608,9 +804,16 @@ export class PollerService {
         deviceId,
         deviceName: device?.name,
       }).catch(() => {});
+      // Open a new availability outage row
+      query(
+        `INSERT INTO device_availability (device_id, went_offline_at) VALUES ($1, NOW())`,
+        [deviceId]
+      ).catch(() => {});
     }
     // Mark all clients for this device inactive — updateClients() never ran because connect() failed.
     await query(`UPDATE clients SET active = FALSE WHERE device_id = $1`, [deviceId]);
+    // Clear stale neighbor links — the device can't re-sync to clean them up itself.
+    await query(`DELETE FROM topology_links WHERE from_device_id = $1`, [deviceId]);
     // Write updated global deduped count and a per-device zero so history is continuous.
     if (device) {
       const writeApi = getWriteApi();
@@ -656,9 +859,10 @@ export class PollerService {
         const installedVersion = (updateInfo['installed-version'] ?? '').trim();
         const statusText = (updateInfo['status'] ?? '').toLowerCase();
 
-        const hasUpdate =
+        const hasUpdate = Boolean(
           statusText.includes('available') ||
-          (latestVersion && installedVersion && latestVersion !== installedVersion);
+          (latestVersion && installedVersion && latestVersion !== installedVersion)
+        );
 
         // Read current flag before updating so we can detect first-discovery
         const current = await query<{ firmware_update_available: boolean }>(
@@ -692,6 +896,34 @@ export class PollerService {
           }
         } else if (wasAvailable) {
           // Update was installed — clear the flag and notify the UI
+          this.io?.emit('device:updated', { deviceId: device.id });
+        }
+
+        // RouterBOOT check — reuse the existing connection
+        const rbInfo = await collector.checkRouterboardUpgrade().catch(() => ({ upgradeAvailable: false, upgradeFirmware: '', currentFirmware: '' }));
+        const rbCurrentRows = await query<{ routerboard_upgrade_available: boolean }>(
+          `SELECT routerboard_upgrade_available FROM devices WHERE id = $1`,
+          [device.id]
+        );
+        const rbWasAvailable = rbCurrentRows[0]?.routerboard_upgrade_available ?? false;
+        await query(
+          `UPDATE devices SET routerboard_upgrade_available = $1, upgrade_firmware_version = $2, updated_at = NOW() WHERE id = $3`,
+          [rbInfo.upgradeAvailable, rbInfo.upgradeFirmware || null, device.id]
+        );
+        if (rbInfo.upgradeAvailable) {
+          this.io?.emit('device:updated', { deviceId: device.id });
+          if (!rbWasAvailable) {
+            const rbMsg = rbInfo.upgradeFirmware
+              ? `${device.name} has a RouterBOOT upgrade available: ${rbInfo.upgradeFirmware}`
+              : `${device.name} has a RouterBOOT upgrade available`;
+            alertService.dispatch('firmware_update_available', rbMsg, {
+              deviceId: device.id,
+              deviceName: device.name,
+              details: rbInfo.upgradeFirmware ? `Current: ${rbInfo.currentFirmware}  →  Upgrade: ${rbInfo.upgradeFirmware}` : undefined,
+            }).catch(() => {});
+            console.log(`[Poller] RouterBOOT upgrade detected for ${device.name}: ${rbInfo.currentFirmware} → ${rbInfo.upgradeFirmware}`);
+          }
+        } else if (rbWasAvailable) {
           this.io?.emit('device:updated', { deviceId: device.id });
         }
       } catch (err) {

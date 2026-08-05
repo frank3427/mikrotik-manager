@@ -4,6 +4,18 @@ import { query } from '../config/database';
 import { requireAuth, requireAdmin, requireWrite } from '../middleware/auth';
 import { PollerService } from '../services/PollerService';
 import { getQueryApi, bucket } from '../config/influxdb';
+import { fingerprintClient, DEVICE_CATEGORIES, DeviceCategory } from '../utils/clientFingerprint';
+
+// Effective category: the user's override wins; otherwise the fingerprint.
+function withCategory<T extends Record<string, unknown>>(row: T): T & { device_category: string; auto_category: string } {
+  const auto = fingerprintClient({
+    vendor: row['vendor'] as string | null,
+    hostname: row['hostname'] as string | null,
+    custom_name: row['custom_name'] as string | null,
+  });
+  const custom = (row['custom_category'] as string | null) || null;
+  return { ...row, device_category: custom ?? auto, auto_category: auto };
+}
 
 const router = Router();
 router.use(requireAuth);
@@ -13,7 +25,27 @@ export function setPollerService(p: PollerService): void { pollerService = p; }
 
 // GET /api/clients
 router.get('/', async (req: Request, res: Response) => {
-  const { deviceId, active, search, client_type, limit = '100', offset = '0' } = req.query;
+  const { deviceId, active, search, client_type, limit = '100', offset = '0', sort, dir } = req.query;
+
+  // Whitelist sortable columns → safe SQL expressions on the outer (deduped)
+  // result. Sorting must run server-side across the whole dataset, not just the
+  // current page, or column sorts appear to do nothing when a page is uniform.
+  const SORT_EXPR: Record<string, string> = {
+    hostname: `LOWER(COALESCE(NULLIF(deduped.custom_name, ''), deduped.hostname, ''))`,
+    vendor: `LOWER(COALESCE(deduped.vendor, ''))`,
+    // Regex-guard the inet cast so non-IP/empty values can't error; sorts numerically.
+    ip_address: `CASE WHEN deduped.ip_address ~ '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$' THEN deduped.ip_address::inet END`,
+    client_type: `deduped.client_type`,
+    interface_name: `LOWER(COALESCE(deduped.interface_name, ''))`,
+    vlan_id: `deduped.vlan_id`,
+    device_name: `LOWER(COALESCE(deduped.device_name, ''))`,
+    traffic_today_bytes: `traffic_today_bytes`,
+    last_seen: `deduped.last_seen`,
+  };
+  const sortExpr = SORT_EXPR[String(sort)] ?? SORT_EXPR.last_seen;
+  const sortDir = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  // Stable, predictable: chosen column, then mac as a deterministic tiebreaker.
+  const orderBy = `ORDER BY ${sortExpr} ${sortDir} NULLS LAST, deduped.mac_address ASC`;
 
   // Build WHERE clause shared by both queries
   const filters: string[] = [];
@@ -42,7 +74,10 @@ router.get('/', async (req: Request, res: Response) => {
   // Deduplicate by MAC address across devices: prefer active rows, then most recently seen.
   // The inner DISTINCT ON picks the best row per MAC; the outer query applies final sort + pagination.
   const sql = `
-    SELECT * FROM (
+    SELECT deduped.*,
+           -- float8 so node-pg returns a number (bigint would arrive as a string)
+           (COALESCE(ctd.upload_bytes, 0) + COALESCE(ctd.download_bytes, 0))::float8 AS traffic_today_bytes
+    FROM (
       SELECT DISTINCT ON (c.mac_address)
         c.*, d.name as device_name,
         wi.ssid as ssid
@@ -53,8 +88,10 @@ router.get('/', async (req: Request, res: Response) => {
       ${where}
       ORDER BY c.mac_address, (c.client_type = 'wireless') DESC, c.active DESC, c.last_seen DESC NULLS LAST
     ) deduped
-    ORDER BY last_seen DESC NULLS LAST
-    LIMIT $${idx++} OFFSET $${idx++}
+    LEFT JOIN client_traffic_daily ctd
+      ON ctd.mac_address = LOWER(deduped.mac_address) AND ctd.day = CURRENT_DATE
+    ${orderBy}
+    LIMIT $${idx++} OFFSET $${idx}
   `;
   const clients = await query(sql, [...filterParams, parseInt(String(limit), 10), parseInt(String(offset), 10)]);
 
@@ -64,7 +101,7 @@ router.get('/', async (req: Request, res: Response) => {
   );
 
   res.json({
-    clients,
+    clients: (clients as Record<string, unknown>[]).map(withCategory),
     total: parseInt(countResult[0]?.total || '0', 10),
   });
 });
@@ -108,7 +145,7 @@ router.get('/:mac', async (req: Request, res: Response) => {
   );
 
   if (!rows.length) return res.status(404).json({ error: 'Client not found' });
-  return res.json(rows[0]);
+  return res.json(withCategory(rows[0]));
 });
 
 // GET /api/clients/:mac/presence?range=2h|24h|7d — connectivity timeline from InfluxDB
@@ -184,7 +221,7 @@ router.get('/:mac/traffic', async (req: Request, res: Response) => {
       if (time && field && value != null) raw.push({ time, field, value });
     });
   } catch (err) {
-    console.error(`[clients/traffic] Flux error for ${mac}:`, err);
+    console.error(`[clients/traffic] Flux error for ${mac.replace(/[\r\n]/g, '_')}:`, err);
   }
 
   // Separate tx and rx series, sort by time, then compute non-negative deltas
@@ -242,7 +279,7 @@ router.get('/:mac/signal', async (req: Request, res: Response) => {
       if (time && value != null) points.push({ time, signal_strength: Math.round(value) });
     });
   } catch (err) {
-    console.error(`[clients/signal] Flux error for ${mac}:`, err);
+    console.error(`[clients/signal] Flux error for ${mac.replace(/[\r\n]/g, '_')}:`, err);
   }
 
   return res.json(points);
@@ -297,6 +334,24 @@ router.put('/:mac/hostname', requireWrite, async (req: Request, res: Response) =
   );
   if (!result.length) return res.status(404).json({ error: 'Client not found' });
   return res.json(result[0]);
+});
+
+// PUT /api/clients/:mac/category — override (or clear) the fingerprinted device category
+router.put('/:mac/category', requireWrite, async (req: Request, res: Response) => {
+  const { category } = req.body as { category?: string | null };
+  const mac = req.params.mac.toLowerCase();
+
+  const clear = category === null || category === undefined || category === '';
+  if (!clear && !DEVICE_CATEGORIES.includes(category as DeviceCategory)) {
+    return res.status(400).json({ error: `category must be one of: ${DEVICE_CATEGORIES.join(', ')} (or null to revert to automatic)` });
+  }
+
+  const result = await query(
+    `UPDATE clients SET custom_category = $1 WHERE LOWER(mac_address) = $2 RETURNING *`,
+    [clear ? null : category, mac]
+  );
+  if (!result.length) return res.status(404).json({ error: 'Client not found' });
+  return res.json(withCategory(result[0] as Record<string, unknown>));
 });
 
 // PUT /api/clients/:mac/notes — update the comment/notes field

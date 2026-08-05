@@ -1,7 +1,11 @@
-import { useState, useMemo } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
-import { Search, Wifi, Network, Users, X, Pencil, Trash2, ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import {
+  Search, Wifi, Network, Users, X, Pencil, Trash2, ChevronUp, ChevronDown, ChevronsUpDown,
+  ChevronLeft, ChevronRight, RefreshCw,
+} from 'lucide-react';
+import { CATEGORY_META } from '../utils/clientCategories';
 import { clientsApi } from '../services/api';
 import type { Client } from '../types';
 import { useCanWrite } from '../hooks/useCanWrite';
@@ -9,6 +13,81 @@ import { useSocket } from '../hooks/useSocket';
 import { formatDistanceToNow } from 'date-fns';
 import clsx from 'clsx';
 
+
+const REFRESH_OPTIONS = [
+  { label: 'Not Updating', value: null },
+  { label: '30 seconds',   value: 30_000 },
+  { label: '1 minute',     value: 60_000 },
+  { label: '3 minutes',    value: 180_000 },
+] as const;
+
+const STORAGE_KEY = 'clients-refresh-interval';
+
+const PAGE_SIZE_OPTIONS = [25, 50, 100, 200] as const;
+const PAGE_SIZE_KEY = 'clients-page-size';
+
+function readStoredPageSize(): number {
+  const n = Number(localStorage.getItem(PAGE_SIZE_KEY));
+  return (PAGE_SIZE_OPTIONS as readonly number[]).includes(n) ? n : 50;
+}
+
+// Build a compact list of page numbers (1-based) with ellipses, always keeping
+// the first, last, current page and its immediate neighbours visible.
+function getPageList(current0: number, totalPages: number): (number | 'ellipsis')[] {
+  const cur = current0 + 1;
+  const wanted = new Set<number>([1, totalPages]);
+  for (let i = cur - 1; i <= cur + 1; i++) {
+    if (i >= 1 && i <= totalPages) wanted.add(i);
+  }
+  const sorted = Array.from(wanted).sort((a, b) => a - b);
+  const out: (number | 'ellipsis')[] = [];
+  let prev = 0;
+  for (const p of sorted) {
+    if (prev && p - prev > 1) out.push('ellipsis');
+    out.push(p);
+    prev = p;
+  }
+  return out;
+}
+
+function CategoryIcon({ category }: { category?: string }) {
+  const meta = category && category !== 'unknown' ? CATEGORY_META[category] : undefined;
+  if (!meta) return null;
+  const Icon = meta.icon;
+  return (
+    <span title={meta.label} className="flex-shrink-0 text-gray-400 dark:text-slate-500">
+      <Icon className="w-3.5 h-3.5" />
+    </span>
+  );
+}
+
+function signalLabel(dbm: number): string {
+  if (dbm >= -55) return 'Excellent';
+  if (dbm >= -65) return 'Good';
+  if (dbm >= -75) return 'Fair';
+  return 'Poor';
+}
+
+function signalColor(dbm: number): string {
+  if (dbm >= -55) return 'text-green-600 dark:text-green-400';
+  if (dbm >= -65) return 'text-lime-600 dark:text-lime-400';
+  if (dbm >= -75) return 'text-yellow-600 dark:text-yellow-400';
+  return 'text-red-500 dark:text-red-400';
+}
+
+function formatDataBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function readStoredInterval(): number | null {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (raw === 'null') return null;
+  const n = Number(raw);
+  return REFRESH_OPTIONS.some((o) => o.value === n) ? n : 30_000;
+}
 
 function ClientModal({
   client,
@@ -109,24 +188,60 @@ export default function ClientsPage() {
   const canWrite = useCanWrite();
   const [search, setSearch] = useState('');
   const [showAll, setShowAll] = useState(false);
+  // Wired/wireless filter lives in the URL (?type=wireless) so the sidebar and
+  // the legacy /wireless/clients route can deep-link to a pre-filtered view.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const rawType = searchParams.get('type');
+  const typeFilter: 'wired' | 'wireless' | null =
+    rawType === 'wired' || rawType === 'wireless' ? rawType : null;
+  const setTypeFilter = (t: 'wired' | 'wireless' | null) => {
+    setSearchParams(prev => {
+      const next = new URLSearchParams(prev);
+      if (t) next.set('type', t); else next.delete('type');
+      return next;
+    }, { replace: true });
+    setPage(0);
+  };
+  const isWireless = typeFilter === 'wireless';
   const [page, setPage] = useState(0);
   const [editingClient, setEditingClient] = useState<Client | null>(null);
   const [sortCol, setSortCol] = useState<string>('last_seen');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
-  const PAGE_SIZE = 50;
+  const [refreshInterval, setRefreshInterval] = useState<number | null>(readStoredInterval);
+  const refreshIntervalRef = useRef(refreshInterval);
+  useEffect(() => { refreshIntervalRef.current = refreshInterval; }, [refreshInterval]);
+  const [pageSize, setPageSize] = useState(readStoredPageSize);
 
+  const handleIntervalChange = (val: number | null) => {
+    setRefreshInterval(val);
+    refreshIntervalRef.current = val;
+    localStorage.setItem(STORAGE_KEY, String(val));
+  };
+
+  const handlePageSizeChange = (n: number) => {
+    setPageSize(n);
+    setPage(0);
+    localStorage.setItem(PAGE_SIZE_KEY, String(n));
+  };
+
+  // Sorting is server-side (across the whole dataset, not just the current
+  // page), so changing the sort returns to page 1 and refetches.
   const toggleSort = (col: string) => {
     if (sortCol === col) setSortDir((d) => d === 'asc' ? 'desc' : 'asc');
     else { setSortCol(col); setSortDir('asc'); }
+    setPage(0);
   };
 
   const { data, isLoading } = useQuery({
-    queryKey: ['clients', { search, showAll, page }],
+    queryKey: ['clients', { search, showAll, typeFilter, page, pageSize, sortCol, sortDir }],
     queryFn: () =>
       clientsApi
-        .list({ search: search || undefined, active: showAll ? undefined : true, limit: PAGE_SIZE, offset: page * PAGE_SIZE })
+        .list({ search: search || undefined, active: showAll ? undefined : true, client_type: typeFilter ?? undefined, limit: pageSize, offset: page * pageSize, sort: sortCol, dir: sortDir })
         .then((r) => r.data),
-    refetchInterval: 30_000,
+    refetchInterval: refreshInterval ?? false,
+    // Keep the current rows on screen while a sort/page/search refetch is in
+    // flight so the table doesn't blank out and jump.
+    placeholderData: keepPreviousData,
   });
 
   const [purgeResult, setPurgeResult] = useState('');
@@ -140,34 +255,16 @@ export default function ClientsPage() {
   });
 
   useSocket({
-    'clients:updated': () => queryClient.invalidateQueries({ queryKey: ['clients'] }),
+    'clients:updated': () => {
+      if (refreshIntervalRef.current !== null) {
+        queryClient.invalidateQueries({ queryKey: ['clients'] });
+      }
+    },
   });
 
-  const rawClients = data?.clients ?? [];
+  // Server returns rows already sorted + paginated for the active sort column.
+  const clients = data?.clients ?? [];
   const total = data?.total ?? 0;
-
-  const clients = useMemo(() => {
-    const toIpNum = (ip: string) =>
-      (ip || '').split('.').reduce((n, o) => n * 256 + parseInt(o || '0', 10), 0);
-
-    return [...rawClients].sort((a, b) => {
-      let av: string | number, bv: string | number;
-      switch (sortCol) {
-        case 'hostname':       av = a.custom_name || a.hostname || ''; bv = b.custom_name || b.hostname || ''; break;
-        case 'vendor':         av = a.vendor || ''; bv = b.vendor || ''; break;
-        case 'ip_address':     av = toIpNum(a.ip_address || ''); bv = toIpNum(b.ip_address || ''); break;
-        case 'client_type':    av = a.client_type || ''; bv = b.client_type || ''; break;
-        case 'interface_name': av = a.interface_name || ''; bv = b.interface_name || ''; break;
-        case 'vlan_id':        av = a.vlan_id ?? -1; bv = b.vlan_id ?? -1; break;
-        case 'device_name':    av = a.device_name || ''; bv = b.device_name || ''; break;
-        case 'last_seen':      av = a.last_seen || ''; bv = b.last_seen || ''; break;
-        default:               av = ''; bv = '';
-      }
-      if (av === bv) return 0;
-      const cmp = av < bv ? -1 : 1;
-      return sortDir === 'asc' ? cmp : -cmp;
-    });
-  }, [rawClients, sortCol, sortDir]);
 
   return (
     <div className="space-y-4">
@@ -198,6 +295,27 @@ export default function ClientsPage() {
             onChange={(e) => { setSearch(e.target.value); setPage(0); }}
           />
         </div>
+        {/* Wired / wireless segmented filter */}
+        <div className="flex rounded-lg border border-gray-300 dark:border-slate-600 overflow-hidden">
+          {([
+            { key: null, label: 'All' },
+            { key: 'wired' as const, label: 'Wired' },
+            { key: 'wireless' as const, label: 'Wireless' },
+          ]).map(({ key, label }) => (
+            <button
+              key={label}
+              onClick={() => setTypeFilter(key)}
+              className={clsx(
+                'px-3 py-2 text-sm font-medium transition-colors',
+                typeFilter === key
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-white dark:bg-slate-800 text-gray-600 dark:text-slate-300 hover:bg-gray-50 dark:hover:bg-slate-700'
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
         <button
           onClick={() => { setShowAll((s) => !s); setPage(0); }}
           className={clsx(
@@ -227,6 +345,23 @@ export default function ClientsPage() {
         {purgeResult && (
           <span className="text-xs text-green-600 dark:text-green-400">{purgeResult}</span>
         )}
+        <div className="flex items-center gap-1.5 ml-auto">
+          <RefreshCw className="w-3.5 h-3.5 text-ink-4" />
+          <select
+            value={String(refreshInterval)}
+            onChange={(e) => {
+              const raw = e.target.value;
+              handleIntervalChange(raw === 'null' ? null : Number(raw));
+            }}
+            className="text-sm rounded-lg border border-line bg-surface-2 text-ink px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-accent"
+          >
+            {REFRESH_OPTIONS.map((o) => (
+              <option key={String(o.value)} value={String(o.value)}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {isLoading ? (
@@ -242,32 +377,47 @@ export default function ClientsPage() {
         <>
           <div className="card overflow-hidden">
             <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full text-sm table-fixed">
+              <colgroup>
+                {(isWireless
+                  ? ['20%', '11%', '11%', '11%', '9%', '6%', '12%', '9%', '11%']
+                  : ['22%', '12%', '13%', '11%', '7%', '13%', '10%', '12%']
+                ).map((w, i) => <col key={i} style={{ width: w }} />)}
+                {showAll && <col style={{ width: '6%' }} />}
+              </colgroup>
               <thead>
                 <tr className="border-b border-gray-200 dark:border-slate-700">
                   {([
                     { col: 'hostname',       label: 'Host / Vendor / MAC', align: 'left'  },
                     { col: 'ip_address',     label: 'IP Address',          align: 'left'  },
-                    { col: 'client_type',    label: 'Type',                align: 'left'  },
+                    // When filtered to wireless, the Type column is redundant —
+                    // show SSID + signal quality instead (not server-sortable).
+                    ...(isWireless
+                      ? [
+                          { col: 'ssid',            label: 'SSID',   align: 'left' as const, noSort: true },
+                          { col: 'signal_strength', label: 'Signal', align: 'left' as const, noSort: true },
+                        ]
+                      : [{ col: 'client_type', label: 'Type', align: 'left' as const }]),
                     { col: 'interface_name', label: 'Port',                align: 'left'  },
                     { col: 'vlan_id',        label: 'VLAN',                align: 'left'  },
                     { col: 'device_name',    label: 'Device',              align: 'left'  },
+                    { col: 'traffic_today_bytes', label: 'Data (today)',   align: 'left'  },
                     { col: 'last_seen',      label: 'Last Seen',           align: 'left'  },
-                  ] as { col: string; label: string; align: 'left' | 'right' }[]).map(({ col, label, align }) => (
+                  ] as { col: string; label: string; align: 'left' | 'right'; noSort?: boolean }[]).map(({ col, label, align, noSort }) => (
                     <th
                       key={col}
-                      className={clsx('table-header px-4 py-2.5 cursor-pointer select-none whitespace-nowrap', `text-${align}`)}
-                      onClick={() => toggleSort(col)}
+                      className={clsx('table-header px-4 py-2.5 select-none whitespace-nowrap', !noSort && 'cursor-pointer', `text-${align}`)}
+                      onClick={noSort ? undefined : () => toggleSort(col)}
                     >
                       <span className="inline-flex items-center gap-1">
                         {label}
-                        {sortCol === col ? (
+                        {!noSort && (sortCol === col ? (
                           sortDir === 'asc'
                             ? <ChevronUp className="w-3 h-3 text-blue-500" />
                             : <ChevronDown className="w-3 h-3 text-blue-500" />
                         ) : (
                           <ChevronsUpDown className="w-3 h-3 text-gray-300 dark:text-slate-600" />
-                        )}
+                        ))}
                       </span>
                     </th>
                   ))}
@@ -283,22 +433,23 @@ export default function ClientsPage() {
                     className="hover:bg-gray-50 dark:hover:bg-slate-700/30"
                   >
                     <td className="px-4 py-2.5">
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <CategoryIcon category={client.device_category} />
                         <button
                           onClick={() => navigate(`/clients/${encodeURIComponent(client.mac_address)}`)}
-                          className="font-medium text-blue-600 dark:text-blue-400 hover:underline text-left"
+                          className="font-medium text-blue-600 dark:text-blue-400 hover:underline text-left truncate"
                         >
                           {client.custom_name || client.hostname || (
                             <span className="text-gray-400 dark:text-slate-500 italic">No hostname</span>
                           )}
                         </button>
                         {client.custom_name && (
-                          <span className="text-xs text-blue-500 dark:text-blue-400 ml-1">custom</span>
+                          <span className="text-xs text-blue-500 dark:text-blue-400 ml-1 flex-shrink-0">custom</span>
                         )}
                         {canWrite && (
                           <button
                             onClick={(e) => { e.stopPropagation(); setEditingClient(client); }}
-                            className="p-0.5 rounded hover:bg-gray-100 dark:hover:bg-slate-700"
+                            className="p-0.5 rounded hover:bg-gray-100 dark:hover:bg-slate-700 flex-shrink-0"
                             title="Edit name"
                           >
                             <Pencil className="w-3 h-3 text-gray-300 dark:text-slate-600 hover:text-gray-500 dark:hover:text-slate-400" />
@@ -306,36 +457,54 @@ export default function ClientsPage() {
                         )}
                       </div>
                       {client.vendor && (
-                        <div className="text-xs text-gray-400 dark:text-slate-500">{client.vendor}</div>
+                        <div className="text-xs text-gray-400 dark:text-slate-500 truncate">{client.vendor}</div>
                       )}
-                      <div className="text-xs font-mono text-gray-400 dark:text-slate-500">
+                      <div className="text-xs font-mono text-gray-400 dark:text-slate-500 truncate">
                         {client.mac_address}
                       </div>
                     </td>
-                    <td className="px-4 py-2.5 font-mono text-gray-600 dark:text-slate-400">
+                    <td className="px-4 py-2.5 font-mono text-gray-600 dark:text-slate-400 truncate">
                       {client.ip_address || '—'}
                     </td>
-                    <td className="px-4 py-2.5">
-                      <span
-                        className={clsx(
-                          'inline-flex items-center gap-1 text-xs font-medium',
-                          client.client_type === 'wireless'
-                            ? 'text-purple-600 dark:text-purple-400'
-                            : 'text-blue-600 dark:text-blue-400'
-                        )}
-                      >
-                        {client.client_type === 'wireless' ? (
-                          <Wifi className="w-3 h-3" />
-                        ) : (
-                          <Network className="w-3 h-3" />
-                        )}
-                        {client.client_type}
-                        {client.signal_strength != null && (
-                          <span className="text-gray-400 ml-1">({client.signal_strength} dBm)</span>
-                        )}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2.5 font-mono text-xs text-gray-500 dark:text-slate-400">
+                    {isWireless ? (
+                      <>
+                        <td className="px-4 py-2.5 text-xs text-gray-600 dark:text-slate-400 truncate">
+                          {(client as Client & { ssid?: string }).ssid || '—'}
+                        </td>
+                        <td className="px-4 py-2.5 text-xs whitespace-nowrap">
+                          {client.signal_strength != null ? (
+                            <span className={clsx('font-medium', signalColor(client.signal_strength))}>
+                              {client.signal_strength} dBm
+                              <span className="ml-1 font-normal opacity-75">({signalLabel(client.signal_strength)})</span>
+                            </span>
+                          ) : (
+                            <span className="text-gray-400 dark:text-slate-500">—</span>
+                          )}
+                        </td>
+                      </>
+                    ) : (
+                      <td className="px-4 py-2.5">
+                        <span
+                          className={clsx(
+                            'inline-flex items-center gap-1 text-xs font-medium',
+                            client.client_type === 'wireless'
+                              ? 'text-purple-600 dark:text-purple-400'
+                              : 'text-blue-600 dark:text-blue-400'
+                          )}
+                        >
+                          {client.client_type === 'wireless' ? (
+                            <Wifi className="w-3 h-3" />
+                          ) : (
+                            <Network className="w-3 h-3" />
+                          )}
+                          {client.client_type}
+                          {client.signal_strength != null && (
+                            <span className="text-gray-400 ml-1">({client.signal_strength} dBm)</span>
+                          )}
+                        </span>
+                      </td>
+                    )}
+                    <td className="px-4 py-2.5 font-mono text-xs text-gray-500 dark:text-slate-400 truncate">
                       {client.interface_name || '—'}
                     </td>
                     <td className="px-4 py-2.5 text-xs text-gray-500 dark:text-slate-400">
@@ -343,8 +512,11 @@ export default function ClientsPage() {
                         ? <span className="px-1.5 py-0.5 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded font-mono">{client.vlan_id}</span>
                         : '—'}
                     </td>
-                    <td className="px-4 py-2.5 text-xs text-gray-500 dark:text-slate-400">
+                    <td className="px-4 py-2.5 text-xs text-gray-500 dark:text-slate-400 truncate">
                       {client.device_name || '—'}
+                    </td>
+                    <td className="px-4 py-2.5 text-xs text-gray-500 dark:text-slate-400 whitespace-nowrap">
+                      {client.traffic_today_bytes ? formatDataBytes(client.traffic_today_bytes) : '—'}
                     </td>
                     <td className="px-4 py-2.5 text-xs text-gray-400 dark:text-slate-500">
                       {client.last_seen
@@ -369,29 +541,71 @@ export default function ClientsPage() {
           </div>
 
           {/* Pagination */}
-          {total > PAGE_SIZE && (
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-gray-500 dark:text-slate-400">
-                Showing {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, total)} of {total}
-              </span>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setPage((p) => Math.max(0, p - 1))}
-                  disabled={page === 0}
-                  className="btn-secondary py-1"
-                >
-                  Previous
-                </button>
-                <button
-                  onClick={() => setPage((p) => p + 1)}
-                  disabled={(page + 1) * PAGE_SIZE >= total}
-                  className="btn-secondary py-1"
-                >
-                  Next
-                </button>
+          {total > 0 && (() => {
+            const totalPages = Math.max(1, Math.ceil(total / pageSize));
+            return (
+              <div className="flex flex-col sm:flex-row items-center justify-between gap-3 text-sm">
+                {/* Entries-per-page + range summary */}
+                <div className="flex items-center gap-2 text-gray-500 dark:text-slate-400">
+                  <span>Show</span>
+                  <select
+                    value={pageSize}
+                    onChange={(e) => handlePageSizeChange(Number(e.target.value))}
+                    className="text-sm rounded-lg border border-line bg-surface-2 text-ink px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-accent"
+                  >
+                    {PAGE_SIZE_OPTIONS.map((n) => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </select>
+                  <span>entries</span>
+                  <span className="ml-1 hidden sm:inline">
+                    ({page * pageSize + 1}–{Math.min((page + 1) * pageSize, total)} of {total})
+                  </span>
+                </div>
+
+                {/* Numbered page selection */}
+                {totalPages > 1 && (
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setPage((p) => Math.max(0, p - 1))}
+                      disabled={page === 0}
+                      aria-label="Previous page"
+                      className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+                    {getPageList(page, totalPages).map((item, i) =>
+                      item === 'ellipsis' ? (
+                        <span key={`e${i}`} className="px-1.5 text-gray-400 dark:text-slate-500 select-none">…</span>
+                      ) : (
+                        <button
+                          key={item}
+                          onClick={() => setPage(item - 1)}
+                          aria-current={item - 1 === page ? 'page' : undefined}
+                          className={clsx(
+                            'inline-flex items-center justify-center min-w-[2rem] h-8 px-2 rounded-lg text-sm font-medium transition-colors',
+                            item - 1 === page
+                              ? 'bg-blue-600 text-white shadow-sm'
+                              : 'text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700'
+                          )}
+                        >
+                          {item}
+                        </button>
+                      )
+                    )}
+                    <button
+                      onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                      disabled={page >= totalPages - 1}
+                      aria-label="Next page"
+                      className="inline-flex items-center justify-center w-8 h-8 rounded-lg text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
+            );
+          })()}
         </>
       )}
     </div>

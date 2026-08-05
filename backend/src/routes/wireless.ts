@@ -701,4 +701,186 @@ router.get('/:id/ap-scan-history', async (req: Request, res: Response) => {
   return res.json(scans);
 });
 
+// ─── RF Health (channel map, RSSI density, TX retries, connectivity) ──────────
+
+// Optional ?deviceId= scopes any of the RF endpoints to a single AP.
+function deviceScope(req: Request): number | null {
+  const raw = req.query.deviceId;
+  if (raw === undefined || raw === '') return null;
+  const id = parseInt(String(raw), 10);
+  return Number.isFinite(id) ? id : null;
+}
+
+// GET /api/wireless/rf/channels — active physical radios with band/frequency/width
+router.get('/rf/channels', async (req: Request, res: Response) => {
+  const deviceId = deviceScope(req);
+  const rows = await query(`
+    SELECT wi.device_id, d.name AS device_name, wi.name, wi.ssid,
+           wi.band, wi.frequency, wi.channel_width, wi.registered_clients
+    FROM wireless_interfaces wi
+    JOIN devices d ON d.id = wi.device_id
+    WHERE d.device_type = 'wireless_ap'
+      AND wi.disabled = FALSE
+      AND wi.frequency IS NOT NULL AND wi.frequency > 0
+      AND (wi.config_json->>'master-interface') IS NULL
+      ${deviceId ? 'AND wi.device_id = $1' : ''}
+    ORDER BY wi.frequency ASC, d.name ASC
+  `, deviceId ? [deviceId] : []);
+  res.json(rows);
+});
+
+// GET /api/wireless/rf/signals — active wireless clients' RSSI (for density view)
+router.get('/rf/signals', async (req: Request, res: Response) => {
+  const deviceId = deviceScope(req);
+  const rows = await query(`
+    SELECT c.mac_address, c.signal_strength, c.device_id, d.name AS device_name,
+           c.custom_name, c.hostname
+    FROM clients c
+    JOIN devices d ON d.id = c.device_id
+    WHERE c.active = TRUE
+      AND c.client_type = 'wireless'
+      AND c.signal_strength IS NOT NULL
+      AND c.signal_strength < 0
+      ${deviceId ? 'AND c.device_id = $1' : ''}
+    ORDER BY c.signal_strength DESC
+  `, deviceId ? [deviceId] : []);
+  res.json(rows);
+});
+
+// GET /api/wireless/rf/tx-quality?range=6h — latest per-radio TX retry % (from CCQ)
+router.get('/rf/tx-quality', async (req: Request, res: Response) => {
+  const deviceId = deviceScope(req);
+  const ranges: Record<string, string> = { '1h': '1h', '3h': '3h', '6h': '6h', '12h': '12h', '24h': '24h' };
+  const fluxRange = ranges[String(req.query.range || '6h')] || '6h';
+
+  const { getQueryApi } = await import('../config/influxdb');
+  const queryApi = getQueryApi();
+  const bucket = process.env.INFLUXDB_BUCKET || 'mikrotik';
+  const deviceFilter = deviceId ? `|> filter(fn: (r) => r["device_id"] == "${deviceId}")` : '';
+
+  const flux = `
+    from(bucket: "${bucket}")
+      |> range(start: -${fluxRange})
+      |> filter(fn: (r) => r["_measurement"] == "wireless_radio_quality")
+      |> filter(fn: (r) => r["_field"] == "tx_retry_pct")
+      ${deviceFilter}
+      |> group(columns: ["device_id", "device_name", "interface", "band"])
+      |> last()
+  `;
+
+  try {
+    const rows: { device_id: string; device_name?: string; interface: string; band: string; tx_retry_pct: number }[] = [];
+    await new Promise<void>((resolve, reject) => {
+      queryApi.queryRows(flux, {
+        next(row, tableMeta) {
+          const obj = tableMeta.toObject(row) as Record<string, unknown>;
+          rows.push({
+            device_id: String(obj['device_id'] || ''),
+            device_name: obj['device_name'] ? String(obj['device_name']) : undefined,
+            interface: String(obj['interface'] || ''),
+            band: String(obj['band'] || 'unknown'),
+            tx_retry_pct: obj['_value'] != null ? Number(obj['_value']) : 0,
+          });
+        },
+        error: reject,
+        complete: resolve,
+      });
+    });
+    return res.json(rows);
+  } catch (err) {
+    console.error('TX-quality InfluxDB error:', err);
+    return res.json([]);
+  }
+});
+
+// Classification of wireless/DHCP log lines into the connectivity funnel. These
+// are best-effort regexes over RouterOS log messages; the panel is explicitly
+// labelled as log-derived and approximate.
+const RE_ASSOC_OK   = /connected|associated/i;
+const RE_ASSOC_FAIL = /reject|deauth|disassoc|connection lost|connect failed/i;
+const RE_AUTH_FAIL  = /key exchange|handshake|authentication failed|auth failed|eap|radius.*(timeout|fail)/i;
+const RE_DHCP_OK    = /assigned|bound|leased|offering/i;
+const RE_DHCP_FAIL  = /no.*address|declined|nak|offer.*fail|pool.*exhaust/i;
+
+// GET /api/wireless/rf/connectivity?range=24h — Association/Auth/DHCP success funnel
+router.get('/rf/connectivity', async (req: Request, res: Response) => {
+  const deviceId = deviceScope(req);
+  const intervals: Record<string, string> = { '1h': '1 hour', '6h': '6 hours', '24h': '24 hours', '7d': '7 days' };
+  const interval = intervals[String(req.query.range || '24h')] || '24 hours';
+
+  const rows = await query<{ topic: string | null; message: string }>(`
+    SELECT topic, message FROM events
+    WHERE event_time > NOW() - INTERVAL '${interval}'
+      ${deviceId ? 'AND device_id = $1' : ''}
+      AND (topic ILIKE '%wireless%' OR topic ILIKE '%wifi%' OR topic ILIKE '%dhcp%')
+  `, deviceId ? [deviceId] : []);
+
+  let assocOk = 0, assocFail = 0, authFail = 0, dhcpOk = 0, dhcpFail = 0;
+  for (const r of rows) {
+    const topic = (r.topic || '').toLowerCase();
+    const msg = r.message || '';
+    const isDhcp = topic.includes('dhcp');
+    if (isDhcp) {
+      if (RE_DHCP_FAIL.test(msg)) dhcpFail++;
+      else if (RE_DHCP_OK.test(msg)) dhcpOk++;
+    } else {
+      // wireless / wifi
+      if (RE_AUTH_FAIL.test(msg)) authFail++;
+      else if (RE_ASSOC_FAIL.test(msg)) assocFail++;
+      else if (RE_ASSOC_OK.test(msg)) assocOk++;
+    }
+  }
+
+  const rate = (ok: number, fail: number): number | null =>
+    ok + fail > 0 ? Math.round((ok / (ok + fail)) * 1000) / 10 : null;
+
+  res.json({
+    range: String(req.query.range || '24h'),
+    log_derived: true,
+    stages: {
+      association:    { success: assocOk, failure: assocFail, pct: rate(assocOk, assocFail) },
+      // a successful association implies it passed the auth handshake
+      authentication: { success: assocOk, failure: authFail, pct: rate(assocOk, authFail) },
+      dhcp:           { success: dhcpOk,  failure: dhcpFail,  pct: rate(dhcpOk, dhcpFail) },
+    },
+  });
+});
+
+// ─── Rogue / neighbor AP detection ────────────────────────────────────────────
+
+// GET /api/wireless/rf/rogue — classify latest AP scans against our own SSIDs/BSSIDs
+router.get('/rf/rogue', async (_req: Request, res: Response) => {
+  const { classifyScans } = await import('../utils/rogueAp');
+
+  const [scans, radios, ifaceMacs] = await Promise.all([
+    query<{ device_id: number; device_name: string; scanned_at: string; data: unknown }>(`
+      SELECT DISTINCT ON (a.device_id) a.device_id, d.name AS device_name, a.scanned_at, a.data
+      FROM ap_scan_data a JOIN devices d ON d.id = a.device_id
+      ORDER BY a.device_id, a.scanned_at DESC`),
+    query<{ ssid: string | null; mac_address: string | null }>(
+      `SELECT ssid, mac_address FROM wireless_interfaces`),
+    query<{ mac_address: string }>(
+      `SELECT mac_address FROM interfaces WHERE mac_address IS NOT NULL`),
+  ]);
+
+  const ownSsids = new Set(radios.map(r => r.ssid || '').filter(Boolean));
+  const ownBssids = new Set([
+    ...radios.map(r => (r.mac_address || '').toLowerCase()).filter(Boolean),
+    ...ifaceMacs.map(r => r.mac_address.toLowerCase()),
+  ]);
+
+  const records = scans.map(s => ({
+    deviceName: s.device_name,
+    scannedAt: String(s.scanned_at),
+    networks: Array.isArray(s.data) ? s.data as import('../utils/rogueAp').ScannedNetwork[] : [],
+  }));
+
+  const { rogues, neighbors } = classifyScans(records, ownSsids, ownBssids);
+  res.json({
+    rogues, neighbors,
+    lastScanAt: scans.length ? scans.map(s => String(s.scanned_at)).sort().pop() : null,
+    scannedDevices: scans.length,
+  });
+});
+
 export default router;

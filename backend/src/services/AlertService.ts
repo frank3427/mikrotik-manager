@@ -12,7 +12,8 @@ export type AlertEventType =
   | 'high_memory'
   | 'cert_expiry'
   | 'device_discovered'
-  | 'firmware_update_available';
+  | 'firmware_update_available'
+  | 'config_drift';
 
 export interface AlertContext {
   deviceId?: number;
@@ -51,6 +52,7 @@ const EVENT_LABELS: Record<string, string> = {
   cert_expiry:              'Certificate Expiring Soon',
   device_discovered:        'New Device Discovered',
   firmware_update_available: 'Firmware Update Available',
+  config_drift:             'Configuration Changed',
 };
 
 const EVENT_EMOJI: Record<string, string> = {
@@ -63,6 +65,7 @@ const EVENT_EMOJI: Record<string, string> = {
   cert_expiry:              '🔐',
   device_discovered:        '🔍',
   firmware_update_available: '🔄',
+  config_drift:             '📝',
 };
 
 export class AlertService {
@@ -73,6 +76,19 @@ export class AlertService {
       const rule = await this.getRule(eventType);
       if (!rule?.enabled) return;
 
+      // Maintenance window suppression — skip if device is in a currently active window
+      if (ctx.deviceId != null) {
+        const inMaintenance = await query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM maintenance_windows
+           WHERE active = true AND $1 = ANY(device_ids) AND NOW() BETWEEN start_at AND end_at`,
+          [ctx.deviceId]
+        ).catch(() => [{ count: '0' }]);
+        if (parseInt(inMaintenance[0]?.count || '0', 10) > 0) {
+          console.log(`[AlertService] Suppressed ${eventType} for device ${ctx.deviceId} (maintenance window)`);
+          return;
+        }
+      }
+
       // Cooldown check
       const cooldownKey = ctx.cooldownKey ?? `${eventType}:${ctx.deviceId ?? 'global'}`;
       const cooldownMs = (rule.cooldown_min ?? 15) * 60 * 1000;
@@ -80,6 +96,17 @@ export class AlertService {
       const until = cooldownUntil.get(cooldownKey) ?? 0;
       if (now < until) return;
       cooldownUntil.set(cooldownKey, now + cooldownMs);
+
+      // Outbound webhooks fan out on the same (rule-gated, cooldown-respecting)
+      // event stream, independent of whether any alert channels are configured.
+      void import('./WebhookService').then(({ webhookService }) =>
+        webhookService.dispatch(eventType, {
+          message,
+          device_id: ctx.deviceId ?? null,
+          device_name: ctx.deviceName ?? null,
+          details: ctx.details ?? null,
+        })
+      ).catch(() => {});
 
       // Get enabled channels
       const channels = await query<AlertChannel>(

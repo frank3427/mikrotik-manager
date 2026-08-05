@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Wifi, Network, Router, Layers, Activity,
-  Power, Save, Clock, ChevronRight, AlertCircle, Pencil, X,
+  Power, Save, Clock, ChevronRight, AlertCircle, Pencil, X, Gauge, Check,
 } from 'lucide-react';
 import { useCanWrite } from '../hooks/useCanWrite';
 import {
@@ -11,7 +11,8 @@ import {
   BarChart, Bar, Cell, ReferenceLine,
 } from 'recharts';
 import { format, formatDistanceToNow, parseISO } from 'date-fns';
-import { clientsApi } from '../services/api';
+import { clientsApi, trafficApi, devicesApi } from '../services/api';
+import { CATEGORY_META, SELECTABLE_CATEGORIES } from '../utils/clientCategories';
 import type { ClientDetail } from '../services/api';
 import type { SignalPoint } from '../services/api';
 import clsx from 'clsx';
@@ -244,6 +245,64 @@ function DetailRow({ label, children }: { label: string; children: React.ReactNo
   );
 }
 
+// Quick per-client bandwidth cap: creates a RouterOS simple queue on the
+// client's device targeting its IP. Mirrors the Queues tab but one-click.
+function LimitBandwidth({ deviceId, ip, name }: { deviceId: number; ip: string; name: string }) {
+  const [open, setOpen] = useState(false);
+  const [up, setUp] = useState('10M');
+  const [down, setDown] = useState('50M');
+  const [status, setStatus] = useState<'idle' | 'saving' | 'done' | 'error'>('idle');
+  const [error, setError] = useState('');
+
+  const apply = async () => {
+    setStatus('saving'); setError('');
+    try {
+      await devicesApi.addQueue(deviceId, {
+        name: `mm-${name}-${ip}`.slice(0, 60).replace(/[^a-zA-Z0-9._-]/g, '_'),
+        target: ip,
+        max_limit: `${up || '0'}/${down || '0'}`,
+        comment: `Limit for ${name} (MikroTik Manager)`,
+      });
+      setStatus('done'); setTimeout(() => { setStatus('idle'); setOpen(false); }, 2500);
+    } catch (e) {
+      setStatus('error');
+      setError((e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Failed to create queue');
+    }
+  };
+
+  return (
+    <div className="pt-1">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs font-medium text-gray-700 dark:text-slate-300">Bandwidth limit</span>
+      </div>
+      {!open ? (
+        <button onClick={() => setOpen(true)}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-200 dark:hover:bg-emerald-900/50 transition-colors">
+          <Gauge className="w-3.5 h-3.5" /> Limit this client
+        </button>
+      ) : (
+        <div className="space-y-2 border border-emerald-200 dark:border-emerald-800 rounded-lg p-2.5">
+          <div className="grid grid-cols-2 gap-2">
+            <label className="text-[10px] text-gray-500 dark:text-slate-400">Upload
+              <input className="input font-mono mt-0.5 py-1 text-xs" value={up} onChange={e => setUp(e.target.value)} placeholder="10M" /></label>
+            <label className="text-[10px] text-gray-500 dark:text-slate-400">Download
+              <input className="input font-mono mt-0.5 py-1 text-xs" value={down} onChange={e => setDown(e.target.value)} placeholder="50M" /></label>
+          </div>
+          {error && <p className="text-[10px] text-red-500">{error}</p>}
+          <div className="flex items-center gap-2">
+            <button onClick={apply} disabled={status === 'saving'}
+              className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50">
+              {status === 'done' ? <><Check className="w-3 h-3" /> Applied</> : status === 'saving' ? 'Applying…' : 'Apply limit'}
+            </button>
+            <button onClick={() => { setOpen(false); setStatus('idle'); setError(''); }} className="text-xs text-gray-500 hover:text-gray-700 dark:hover:text-slate-300">Cancel</button>
+          </div>
+          <p className="text-[10px] text-gray-400 dark:text-slate-500">Creates a simple queue on the device for <span className="font-mono">{ip}</span>. Manage it later under the device&apos;s Bandwidth tab.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrite: boolean }) {
   const qc = useQueryClient();
   const [notes, setNotes] = useState(client.comment || '');
@@ -268,6 +327,15 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['client-detail', client.mac_address] });
       setNotesChanged(false);
+    },
+  });
+
+  const categoryMutation = useMutation({
+    mutationFn: (category: string | null) => clientsApi.updateCategory(client.mac_address, category),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['client-detail', client.mac_address] });
+      qc.invalidateQueries({ queryKey: ['clients'] });
+      qc.invalidateQueries({ queryKey: ['wireless-clients-page'] });
     },
   });
 
@@ -373,6 +441,36 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
           <DetailRow label="Vendor">{client.vendor}</DetailRow>
         )}
 
+        {/* Device category — auto-fingerprinted, user-overridable */}
+        <DetailRow label="Device type">
+          <div className="flex items-center gap-2 min-w-0">
+            {canWrite ? (
+              <select
+                className="input py-1 text-sm w-auto max-w-[220px]"
+                value={client.custom_category ?? ''}
+                onChange={(e) => categoryMutation.mutate(e.target.value === '' ? null : e.target.value)}
+                disabled={categoryMutation.isPending}
+              >
+                <option value="">
+                  Automatic — {CATEGORY_META[client.auto_category ?? 'unknown']?.label ?? 'Unknown'}
+                </option>
+                {SELECTABLE_CATEGORIES.filter(c => c !== 'unknown').map(c => (
+                  <option key={c} value={c}>{CATEGORY_META[c].label}</option>
+                ))}
+              </select>
+            ) : (
+              <span>{CATEGORY_META[client.device_category ?? 'unknown']?.label ?? 'Unknown'}</span>
+            )}
+            {client.custom_category && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 flex-shrink-0"
+                title={`Auto-detected as: ${CATEGORY_META[client.auto_category ?? 'unknown']?.label ?? 'Unknown'}`}>
+                manual
+              </span>
+            )}
+            {categoryMutation.isPending && <span className="text-xs text-gray-400">saving…</span>}
+          </div>
+        </DetailRow>
+
         <DetailRow label="Type">
           <span className={clsx(
             'capitalize',
@@ -442,6 +540,11 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
             Sends a UDP broadcast magic packet to wake this client.
           </p>
         </div>
+      )}
+
+      {/* Limit bandwidth — creates a simple queue on the client's device targeting its IP */}
+      {canWrite && client.ip_address && client.device_id && (
+        <LimitBandwidth deviceId={client.device_id} ip={client.ip_address} name={client.custom_name || client.hostname || client.mac_address} />
       )}
 
       {/* Notes */}
@@ -576,6 +679,137 @@ function TrafficCard({ mac }: { mac: string }) {
             />
           </AreaChart>
         </ResponsiveContainer>
+      )}
+    </div>
+  );
+}
+
+// ─── App Traffic (NetFlow) ────────────────────────────────────────────────────
+
+const APP_COLORS = [
+  '#3b82f6', '#8b5cf6', '#10b981', '#f59e0b', '#ef4444', '#06b6d4',
+  '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#a855f7',
+];
+
+function AppTrafficCard({ mac }: { mac: string }) {
+  const [range, setRange] = useState<'2h' | '24h' | '7d'>('24h');
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['client-app-traffic', mac, range],
+    queryFn: () => trafficApi.client(mac, range).then(r => r.data),
+    refetchInterval: 60_000,
+  });
+
+  const series = data?.series ?? [];
+  const apps = data?.apps ?? [];
+
+  // NetFlow data only exists for clients on networks with export enabled. Latch
+  // on the first non-empty result so the card stays mounted once it has shown
+  // data — otherwise switching to a range with no traffic (e.g. an idle client
+  // over the last 2h) would unmount the whole card, range buttons and all.
+  // Setting state during render (guarded) is React's recommended way to derive
+  // sticky state without an effect.
+  const [hadData, setHadData] = useState(false);
+  if (!hadData && (series.length > 0 || apps.length > 0)) setHadData(true);
+  if (!isLoading && series.length === 0 && apps.length === 0 && !hadData) return null;
+
+  const ranges = [
+    { value: '2h', label: '2h' },
+    { value: '24h', label: '24h' },
+    { value: '7d', label: '7d' },
+  ] as const;
+
+  const chartData = series.map(p => ({
+    time: p.time,
+    Upload: p.upload,
+    Download: p.download,
+    label: format(parseISO(p.time), range === '7d' ? 'MMM d HH:mm' : 'HH:mm'),
+  }));
+
+  const totalAppBytes = apps.reduce((s, a) => s + a.bytes, 0);
+
+  return (
+    <div className="card p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-gray-800 dark:text-white flex items-center gap-2">
+          <Activity className="w-4 h-4 text-gray-400" />
+          App Traffic
+          <span className="text-xs font-normal text-gray-400 dark:text-slate-500">(NetFlow)</span>
+        </h2>
+        <div className="flex gap-1">
+          {ranges.map(r => (
+            <button
+              key={r.value}
+              onClick={() => setRange(r.value)}
+              className={clsx(
+                'px-2 py-1 text-xs rounded font-medium transition-colors',
+                range === r.value
+                  ? 'bg-blue-600 text-white'
+                  : 'text-gray-500 dark:text-slate-400 hover:bg-gray-100 dark:hover:bg-slate-700'
+              )}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {isLoading ? (
+        <div className="h-48 bg-gray-100 dark:bg-slate-700/40 rounded animate-pulse" />
+      ) : chartData.length === 0 && apps.length === 0 ? (
+        <div className="h-48 flex flex-col items-center justify-center gap-2 text-gray-400 dark:text-slate-500 text-xs bg-gray-50 dark:bg-slate-800/50 rounded">
+          <Activity className="w-6 h-6 opacity-30" />
+          No traffic data yet for this range
+        </div>
+      ) : (
+        <>
+          {chartData.length > 0 && (
+            <ResponsiveContainer width="100%" height={180}>
+              <AreaChart data={chartData} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" className="opacity-20" />
+                <XAxis
+                  dataKey="label"
+                  tick={{ fontSize: 10, fill: 'currentColor' }}
+                  className="text-gray-400 dark:text-slate-500"
+                  interval="preserveStartEnd"
+                />
+                <YAxis
+                  tickFormatter={(v) => formatBytes(v)}
+                  tick={{ fontSize: 10, fill: 'currentColor' }}
+                  className="text-gray-400 dark:text-slate-500"
+                  width={60}
+                />
+                <Tooltip
+                  formatter={(value: number) => [formatBytes(value), '']}
+                  contentStyle={{
+                    fontSize: '11px',
+                    backgroundColor: 'var(--tooltip-bg, #1e293b)',
+                    borderColor: 'var(--tooltip-border, #334155)',
+                    color: 'var(--tooltip-color, #e2e8f0)',
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: '11px' }} />
+                <Area type="monotone" dataKey="Download" stroke="#3b82f6" fill="#3b82f620" strokeWidth={1.5} dot={false} />
+                <Area type="monotone" dataKey="Upload" stroke="#8b5cf6" fill="#8b5cf620" strokeWidth={1.5} dot={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+          )}
+
+          {apps.length > 0 && (
+            <div className="space-y-1.5">
+              {apps.slice(0, 8).map((a, i) => (
+                <div key={a.app} className="flex items-center gap-2 text-xs">
+                  <span className="w-2 h-2 rounded-sm flex-shrink-0" style={{ backgroundColor: APP_COLORS[i % APP_COLORS.length] }} />
+                  <span className="text-gray-700 dark:text-slate-300 flex-1 truncate">{a.app}</span>
+                  <span className="text-gray-400 dark:text-slate-500">
+                    {totalAppBytes > 0 ? `${((a.bytes / totalAppBytes) * 100).toFixed(1)}%` : ''}
+                  </span>
+                  <span className="font-medium text-gray-900 dark:text-white w-16 text-right">{formatBytes(a.bytes)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -800,12 +1034,15 @@ export default function ClientDetailPage() {
       {/* Details on left; Traffic + Signal stacked on right */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
         <ClientDetailsCard client={client} canWrite={canWrite} />
-        {client.client_type === 'wireless' && (
-          <div className="space-y-4">
-            <TrafficCard mac={mac!} />
-            <SignalCard mac={mac!} />
-          </div>
-        )}
+        <div className="space-y-4">
+          <AppTrafficCard mac={client.mac_address} />
+          {client.client_type === 'wireless' && (
+            <>
+              <TrafficCard mac={mac!} />
+              <SignalCard mac={mac!} />
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

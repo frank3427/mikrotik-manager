@@ -2,14 +2,22 @@ import { useState, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Settings, Users, Key, Plus, Trash2, CheckCircle, AlertCircle, Pencil, X,
-  ShieldCheck, ShieldAlert, RefreshCw, Upload, Lock, Bell, Send,
+  ShieldCheck, ShieldAlert, RefreshCw, Upload, Lock, Bell, Send, KeyRound, ClipboardList, FileText, Zap, LogIn,
 } from 'lucide-react';
-import { settingsApi, authApi, certApi, alertsApi } from '../services/api';
+import { settingsApi, authApi, certApi, alertsApi, auditLogApi, tagsApi, maintenanceApi, configTemplatesApi } from '../services/api';
+import type { MaintenanceWindow, ConfigTemplate } from '../services/api';
 import type { CertInfo, AlertRule, AlertChannel } from '../services/api';
 import { useAuthStore } from '../store/authStore';
 import { useThemeStore } from '../store/themeStore';
 import type { User, UserRole } from '../types';
+import {
+  parseBackupCron, scheduleToCron, describeBackupSchedule, WEEKDAY_NAMES, ordinal,
+  type BackupFrequency,
+} from '../utils/backupSchedule';
 import clsx from 'clsx';
+import CredentialPresetsSettings from '../components/settings/CredentialPresetsSettings';
+import AutomationSettings from '../components/settings/AutomationSettings';
+import OidcSettings from '../components/settings/OidcSettings';
 
 const ROLE_META: Record<UserRole, { label: string; color: string; desc: string }> = {
   admin:    { label: 'Admin',    color: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',    desc: 'Full access including user management' },
@@ -41,7 +49,12 @@ export default function SettingsPage() {
   const { theme, setTheme } = useThemeStore();
   const isAdmin = user?.role === 'admin';
   const canWrite = user?.role !== 'viewer';
-  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'security' | 'certificate' | 'alerting'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sso' | 'credentials' | 'security' | 'certificate' | 'alerting' | 'audit' | 'tags' | 'maintenance' | 'templates' | 'automation'>('general');
+  const [auditSearch, setAuditSearch] = useState('');
+  const [auditPage, setAuditPage] = useState(1);
+  const [newTagName, setNewTagName] = useState('');
+  const [newTagColor, setNewTagColor] = useState('#6366f1');
+  const [mwForm, setMwForm] = useState({ name: '', start_at: '', end_at: '' });
 
   // ─── App settings ─────────────────────────────────────────────────────────
   const { data: settings = {} } = useQuery({
@@ -121,6 +134,60 @@ export default function SettingsPage() {
   const [pwError, setPwError] = useState('');
   const [pwSuccess, setPwSuccess] = useState('');
 
+  // ─── TOTP / 2FA ────────────────────────────────────────────────────────────
+  const [totpSetupData, setTotpSetupData] = useState<{ secret: string; uri: string; qr: string } | null>(null);
+  const [totpConfirmCode, setTotpConfirmCode] = useState('');
+  const [totpSetupPassword, setTotpSetupPassword] = useState('');
+  const [totpDisablePassword, setTotpDisablePassword] = useState('');
+  const [totpMsg, setTotpMsg] = useState('');
+  const [totpError, setTotpError] = useState('');
+
+  const { data: totpStatus, refetch: refetchTotpStatus } = useQuery({
+    queryKey: ['totp-status'],
+    queryFn: () => authApi.totpStatus().then((r) => r.data),
+    enabled: activeTab === 'security',
+  });
+
+  const startTotpSetupMutation = useMutation({
+    mutationFn: () => authApi.totpSetup(totpSetupPassword),
+    onSuccess: (res) => { setTotpSetupData(res.data); setTotpConfirmCode(''); setTotpSetupPassword(''); setTotpError(''); },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setTotpError(msg || 'Failed to start TOTP setup');
+    },
+  });
+
+  const confirmTotpMutation = useMutation({
+    mutationFn: () => authApi.totpConfirm(totpConfirmCode),
+    onSuccess: () => {
+      setTotpSetupData(null);
+      setTotpConfirmCode('');
+      setTotpMsg('Two-factor authentication enabled.');
+      setTotpError('');
+      refetchTotpStatus();
+      setTimeout(() => setTotpMsg(''), 4000);
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setTotpError(msg || 'Invalid code');
+    },
+  });
+
+  const disableTotpMutation = useMutation({
+    mutationFn: () => authApi.totpDisable(totpDisablePassword),
+    onSuccess: () => {
+      setTotpDisablePassword('');
+      setTotpMsg('Two-factor authentication disabled.');
+      setTotpError('');
+      refetchTotpStatus();
+      setTimeout(() => setTotpMsg(''), 4000);
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setTotpError(msg || 'Failed to disable TOTP');
+    },
+  });
+
   const changePasswordMutation = useMutation({
     mutationFn: () => authApi.changePassword(pwForm.current, pwForm.next),
     onSuccess: () => {
@@ -184,6 +251,129 @@ export default function SettingsPage() {
       reader.onerror = reject;
       reader.readAsText(file);
     });
+
+  // ─── Config Templates ──────────────────────────────────────────────────────
+  const [tplFormOpen, setTplFormOpen] = useState(false);
+  const [tplForm, setTplForm] = useState<{
+    name: string; description: string; applies_to_type: string;
+    dns_servers: string; ntp_servers: string; syslog_host: string;
+  }>({ name: '', description: '', applies_to_type: '', dns_servers: '', ntp_servers: '', syslog_host: '' });
+  const [tplApplyId, setTplApplyId] = useState<number | null>(null);
+  const [tplApplyDeviceIds, setTplApplyDeviceIds] = useState<number[]>([]);
+  const [tplApplyResults, setTplApplyResults] = useState<{ device_id: number; device_name: string; ok: boolean; error?: string }[] | null>(null);
+  const [tplError, setTplError] = useState('');
+
+  const { data: templates = [] } = useQuery({
+    queryKey: ['config-templates'],
+    queryFn: () => configTemplatesApi.list().then((r) => r.data),
+    enabled: activeTab === 'templates',
+  });
+
+  const { data: allDevicesList = [] } = useQuery({
+    queryKey: ['devices-list-for-templates'],
+    queryFn: () => import('../services/api').then(m => m.default.get<{ id: number; name: string }[]>('/devices').then(r => r.data)),
+    enabled: tplApplyId != null,
+  });
+
+  const createTemplateMutation = useMutation({
+    mutationFn: () => {
+      const tj: ConfigTemplate['template_json'] = {};
+      if (tplForm.dns_servers.trim()) tj.dns_servers = tplForm.dns_servers.split(',').map((s) => s.trim()).filter(Boolean);
+      if (tplForm.ntp_servers.trim()) tj.ntp_servers = tplForm.ntp_servers.split(',').map((s) => s.trim()).filter(Boolean);
+      if (tplForm.syslog_host.trim()) tj.syslog_host = tplForm.syslog_host.trim();
+      return configTemplatesApi.create({
+        name: tplForm.name.trim(),
+        description: tplForm.description.trim() || null,
+        applies_to_type: tplForm.applies_to_type || null,
+        template_json: tj,
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['config-templates'] });
+      setTplFormOpen(false);
+      setTplForm({ name: '', description: '', applies_to_type: '', dns_servers: '', ntp_servers: '', syslog_host: '' });
+      setTplError('');
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setTplError(msg || 'Failed to create template');
+    },
+  });
+
+  const deleteTemplateMutation = useMutation({
+    mutationFn: (id: number) => configTemplatesApi.delete(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['config-templates'] }),
+  });
+
+  const applyTemplateMutation = useMutation({
+    mutationFn: () => configTemplatesApi.apply(tplApplyId!, tplApplyDeviceIds),
+    onSuccess: (res) => {
+      setTplApplyResults(res.data.results);
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setTplError(msg || 'Failed to apply template');
+    },
+  });
+
+  // ─── Tags ─────────────────────────────────────────────────────────────────
+  const { data: tags = [] } = useQuery({
+    queryKey: ['tags'],
+    queryFn: () => tagsApi.list().then((r) => r.data),
+    enabled: activeTab === 'tags',
+  });
+
+  const createTagMutation = useMutation({
+    mutationFn: () => tagsApi.create(newTagName.trim(), newTagColor),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tags'] });
+      setNewTagName('');
+    },
+  });
+
+  const deleteTagMutation = useMutation({
+    mutationFn: (id: number) => tagsApi.delete(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['tags'] }),
+  });
+
+  // ─── Maintenance Windows ───────────────────────────────────────────────────
+  const { data: maintenanceWindows = [] } = useQuery({
+    queryKey: ['maintenance-windows'],
+    queryFn: () => maintenanceApi.list().then((r) => r.data),
+    enabled: activeTab === 'maintenance',
+  });
+
+  const createMwMutation = useMutation({
+    mutationFn: () => maintenanceApi.create({
+      name: mwForm.name.trim(),
+      device_ids: [],
+      start_at: mwForm.start_at,
+      end_at: mwForm.end_at,
+      recurring_cron: null,
+      active: true,
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['maintenance-windows'] });
+      setMwForm({ name: '', start_at: '', end_at: '' });
+    },
+  });
+
+  const deleteMwMutation = useMutation({
+    mutationFn: (id: number) => maintenanceApi.delete(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['maintenance-windows'] }),
+  });
+
+  const toggleMwMutation = useMutation({
+    mutationFn: ({ id, active }: { id: number; active: boolean }) => maintenanceApi.update(id, { active }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['maintenance-windows'] }),
+  });
+
+  // ─── Audit Log ────────────────────────────────────────────────────────────
+  const { data: auditData } = useQuery({
+    queryKey: ['audit-log', auditPage, auditSearch],
+    queryFn: () => auditLogApi.list({ page: auditPage, limit: 50, search: auditSearch || undefined }).then((r) => r.data),
+    enabled: activeTab === 'audit',
+  });
 
   // ─── Alerting ──────────────────────────────────────────────────────────────
   const { data: alertRules = [] } = useQuery({
@@ -276,33 +466,68 @@ export default function SettingsPage() {
   const setCfg = (key: string, val: unknown) =>
     setChForm((f) => ({ ...f, config: { ...f.config, [key]: val } }));
 
-  const tabs = [
-    { key: 'general' as const, label: 'General', icon: Settings },
-    { key: 'users' as const, label: 'Users & Roles', icon: Users },
-    { key: 'security' as const, label: 'My Password', icon: Key },
-    { key: 'certificate' as const, label: 'Certificate', icon: Lock },
-    { key: 'alerting' as const, label: 'Alerting', icon: Bell },
+  // Tabs are grouped by audience: platform administration, the signed-in
+  // user's own account, and fleet-facing operational configuration.
+  const tabGroups = [
+    {
+      label: 'Platform',
+      tabs: [
+        { key: 'general' as const, label: 'General', icon: Settings },
+        { key: 'users' as const, label: 'Users & Roles', icon: Users },
+        ...(isAdmin ? [{ key: 'sso' as const, label: 'SSO / OIDC', icon: LogIn }] : []),
+        { key: 'certificate' as const, label: 'Certificate', icon: Lock },
+        ...(isAdmin ? [{ key: 'audit' as const, label: 'Audit Log', icon: ClipboardList }] : []),
+      ],
+    },
+    {
+      label: 'My Account',
+      tabs: [
+        { key: 'security' as const, label: 'My Password', icon: Key },
+      ],
+    },
+    {
+      label: 'Fleet',
+      tabs: [
+        { key: 'credentials' as const, label: 'Device Credentials', icon: KeyRound },
+        { key: 'alerting' as const, label: 'Alerting', icon: Bell },
+        { key: 'automation' as const, label: 'Automation', icon: Zap },
+        ...(isAdmin ? [
+          { key: 'templates' as const, label: 'Config Templates', icon: FileText },
+          { key: 'tags' as const, label: 'Tags', icon: ShieldCheck },
+          { key: 'maintenance' as const, label: 'Maintenance', icon: ShieldAlert },
+        ] : []),
+      ],
+    },
   ];
 
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-bold text-gray-900 dark:text-white">Settings</h1>
 
-      <div className="flex gap-1 border-b border-gray-200 dark:border-slate-700">
-        {tabs.map((tab) => (
-          <button
-            key={tab.key}
-            onClick={() => setActiveTab(tab.key)}
-            className={clsx(
-              'px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px flex items-center gap-2',
-              activeTab === tab.key
-                ? 'border-blue-600 text-blue-600 dark:text-blue-400'
-                : 'border-transparent text-gray-500 dark:text-slate-400 hover:text-gray-700 dark:hover:text-slate-300'
-            )}
-          >
-            <tab.icon className="w-4 h-4" />
-            {tab.label}
-          </button>
+      <div className="flex flex-wrap gap-x-6 gap-y-2 border-b border-gray-200 dark:border-slate-700">
+        {tabGroups.map((group, gi) => (
+          <div key={group.label} className={clsx(gi > 0 && 'sm:border-l sm:border-gray-200 sm:dark:border-slate-700 sm:pl-6')}>
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-slate-500 select-none pt-1">
+              {group.label}
+            </div>
+            <div className="flex gap-1">
+              {group.tabs.map((tab) => (
+                <button
+                  key={tab.key}
+                  onClick={() => setActiveTab(tab.key)}
+                  className={clsx(
+                    'px-3 py-2 text-sm font-medium border-b-2 transition-colors -mb-px flex items-center gap-2 whitespace-nowrap',
+                    activeTab === tab.key
+                      ? 'border-blue-600 text-blue-600 dark:text-blue-400'
+                      : 'border-transparent text-gray-500 dark:text-slate-400 hover:text-gray-700 dark:hover:text-slate-300'
+                  )}
+                >
+                  <tab.icon className="w-4 h-4" />
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
         ))}
       </div>
 
@@ -364,6 +589,38 @@ export default function SettingsPage() {
             </div>
           </div>
 
+          {/* Login Rate Limit */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Login Rate Limiting</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
+              Limits login attempts per IP address to protect against brute-force attacks.
+            </p>
+            <div className="space-y-3">
+              {[
+                { key: 'login_rate_limit_max', label: 'Max attempts', unit: 'attempts' },
+                { key: 'login_rate_limit_window_sec', label: 'Time window', unit: 'sec' },
+              ].map(({ key, label, unit }) => (
+                <div key={key} className="flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-medium text-gray-700 dark:text-slate-300">{label}</div>
+                    <div className="text-xs text-gray-400">{unit}</div>
+                  </div>
+                  <input
+                    type="number"
+                    className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
+                    value={settings[key] as number ?? ''}
+                    onChange={(e) =>
+                      updateSettingsMutation.mutate({ [key]: parseInt(e.target.value) })
+                    }
+                    min="1"
+                    step="1"
+                    disabled={!isAdmin}
+                  />
+                </div>
+              ))}
+            </div>
+          </div>
+
           {/* MAC Scan */}
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-1">MAC Scan</h3>
@@ -410,6 +667,64 @@ export default function SettingsPage() {
             </div>
           </div>
 
+          {/* Configuration Snapshots */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Configuration Snapshots</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
+              Periodically captures each device&apos;s <code className="font-mono">/export</code> for the Config History / drift detection feature.
+              This runs <strong>over SSH</strong>, so it only executes on devices that have <strong>SSH credentials configured</strong> — devices without them are skipped (no connection is attempted).
+            </p>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Enable config snapshots</div>
+                <button
+                  onClick={() => isAdmin && updateSettingsMutation.mutate({ config_snapshot_enabled: settings['config_snapshot_enabled'] === false })}
+                  disabled={!isAdmin}
+                  className={clsx(
+                    'relative inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200',
+                    isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
+                    settings['config_snapshot_enabled'] !== false ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
+                  )}
+                >
+                  <span className={clsx(
+                    'inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200',
+                    settings['config_snapshot_enabled'] !== false ? 'translate-x-5' : 'translate-x-0'
+                  )} />
+                </button>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Snapshot interval</div>
+                  <div className="text-xs text-gray-400">minutes</div>
+                </div>
+                <input
+                  type="number"
+                  className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
+                  value={settings['config_snapshot_interval_min'] as number ?? 60}
+                  onChange={(e) => updateSettingsMutation.mutate({ config_snapshot_interval_min: parseInt(e.target.value) })}
+                  min="15"
+                  step="15"
+                  disabled={!isAdmin || settings['config_snapshot_enabled'] === false}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Retention</div>
+                  <div className="text-xs text-gray-400">snapshots kept per device</div>
+                </div>
+                <input
+                  type="number"
+                  className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
+                  value={settings['config_snapshot_retention'] as number ?? 30}
+                  onChange={(e) => updateSettingsMutation.mutate({ config_snapshot_retention: parseInt(e.target.value) })}
+                  min="1"
+                  step="1"
+                  disabled={!isAdmin || settings['config_snapshot_enabled'] === false}
+                />
+              </div>
+            </div>
+          </div>
+
           {/* Reverse DNS */}
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Reverse DNS Lookup</h3>
@@ -441,6 +756,8 @@ export default function SettingsPage() {
               {[
                 { key: 'retention_events_days', label: 'Events retention', desc: 'Auto-delete event log entries older than this many days' },
                 { key: 'retention_clients_days', label: 'Client retention', desc: 'Auto-delete inactive client records not seen within this many days' },
+                { key: 'netflow_retention_days', label: 'Traffic detail retention', desc: 'Auto-delete per-client NetFlow time-series data older than this many days' },
+                { key: 'netflow_daily_retention_days', label: 'Traffic daily rollup retention', desc: 'Auto-delete per-client daily traffic totals older than this many days' },
               ].map(({ key, label, desc }) => (
                 <div key={key} className="flex items-center justify-between gap-4">
                   <div>
@@ -461,6 +778,119 @@ export default function SettingsPage() {
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Scheduled Backups */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Scheduled Backups</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
+              Automatically backs up all online devices on a schedule via SSH export.
+              Backups appear in the Backups section with type <code className="font-mono">scheduled</code>.
+            </p>
+            {(() => {
+              const enabled = !!settings['backup_schedule_enabled'];
+              const sched = parseBackupCron(settings['backup_schedule_cron'] as string);
+              const controlsDisabled = !isAdmin || !enabled;
+              const apply = (next: typeof sched) =>
+                updateSettingsMutation.mutate({ backup_schedule_cron: scheduleToCron(next) });
+              return (
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Enable scheduled backups</div>
+                    <button
+                      onClick={() => isAdmin && updateSettingsMutation.mutate({ backup_schedule_enabled: !enabled })}
+                      disabled={!isAdmin}
+                      className={clsx(
+                        'relative inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200',
+                        isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
+                        enabled ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
+                      )}
+                    >
+                      <span className={clsx(
+                        'inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200',
+                        enabled ? 'translate-x-5' : 'translate-x-0'
+                      )} />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    {/* Frequency */}
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1">Frequency</label>
+                      <select
+                        className="input w-full text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                        value={sched.frequency}
+                        disabled={controlsDisabled}
+                        onChange={(e) => apply({ ...sched, frequency: e.target.value as BackupFrequency })}
+                      >
+                        <option value="daily">Daily</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                      </select>
+                    </div>
+
+                    {/* Day selector — weekly or monthly */}
+                    {sched.frequency === 'weekly' && (
+                      <div>
+                        <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1">Day of week</label>
+                        <select
+                          className="input w-full text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                          value={sched.weekday}
+                          disabled={controlsDisabled}
+                          onChange={(e) => apply({ ...sched, weekday: parseInt(e.target.value, 10) })}
+                        >
+                          {WEEKDAY_NAMES.map((name, i) => (
+                            <option key={i} value={i}>{name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    {sched.frequency === 'monthly' && (
+                      <div>
+                        <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1">Day of month</label>
+                        <select
+                          className="input w-full text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                          value={sched.dayOfMonth}
+                          disabled={controlsDisabled}
+                          onChange={(e) => apply({ ...sched, dayOfMonth: parseInt(e.target.value, 10) })}
+                        >
+                          {Array.from({ length: 28 }, (_, i) => i + 1).map((d) => (
+                            <option key={d} value={d}>{ordinal(d)}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {/* Time of day */}
+                    <div>
+                      <label className="block text-xs font-medium text-gray-500 dark:text-slate-400 mb-1">Time</label>
+                      <input
+                        type="time"
+                        className="input w-full text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                        value={`${String(sched.hour).padStart(2, '0')}:${String(sched.minute).padStart(2, '0')}`}
+                        disabled={controlsDisabled}
+                        onChange={(e) => {
+                          const [h, m] = e.target.value.split(':').map((n) => parseInt(n, 10));
+                          if (Number.isNaN(h) || Number.isNaN(m)) return;
+                          apply({ ...sched, hour: h, minute: m });
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  <p className={clsx('text-xs', enabled ? 'text-gray-500 dark:text-slate-400' : 'text-gray-400 dark:text-slate-600')}>
+                    {enabled
+                      ? <>Runs <span className="font-medium text-gray-700 dark:text-slate-300">{describeBackupSchedule(sched).toLowerCase()}</span>, server time.</>
+                      : 'Enable to choose a backup schedule.'}
+                  </p>
+                  {sched.frequency === 'monthly' && (
+                    <p className="text-xs text-gray-400 dark:text-slate-500">
+                      Days are limited to 1–28 so the backup runs every month, including February.
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}
@@ -503,9 +933,17 @@ export default function SettingsPage() {
                 {(users as User[]).map((u) => (
                   <tr key={u.id} className="hover:bg-gray-50 dark:hover:bg-slate-700/30">
                     <td className="px-4 py-2.5 font-medium text-gray-900 dark:text-white">
-                      {u.username}
-                      {u.id === user?.id && (
-                        <span className="ml-2 text-xs text-blue-500">(you)</span>
+                      <div className="flex items-center gap-2">
+                        {u.username}
+                        {u.id === user?.id && (
+                          <span className="text-xs text-blue-500">(you)</span>
+                        )}
+                        {u.auth_provider === 'oidc' && (
+                          <span className="text-[10px] font-bold uppercase px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">SSO</span>
+                        )}
+                      </div>
+                      {u.email && (
+                        <div className="text-xs text-gray-400 dark:text-slate-500 font-normal">{u.email}</div>
                       )}
                     </td>
                     <td className="px-4 py-2.5">
@@ -618,9 +1056,14 @@ export default function SettingsPage() {
         </div>
       )}
 
+      {/* ── Device Credential Presets ── */}
+      {activeTab === 'credentials' && (
+        <CredentialPresetsSettings isAdmin={isAdmin} />
+      )}
+
       {/* ── My Password ── */}
       {activeTab === 'security' && (
-        <div className="max-w-md">
+        <div className="max-w-md space-y-4">
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-4">Change My Password</h3>
             <div className="space-y-3">
@@ -682,6 +1125,118 @@ export default function SettingsPage() {
                 Change Password
               </button>
             </div>
+          </div>
+
+          {/* ── TOTP / 2FA ── */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1 flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-blue-500" />
+              Two-Factor Authentication
+            </h3>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+              Add an extra layer of security with a TOTP authenticator app (Google Authenticator, Authy, etc.)
+            </p>
+
+            {totpMsg && (
+              <div className="flex items-center gap-2 text-sm text-green-500 mb-3">
+                <CheckCircle className="w-4 h-4" /> {totpMsg}
+              </div>
+            )}
+            {totpError && (
+              <div className="flex items-center gap-2 text-sm text-red-500 mb-3">
+                <AlertCircle className="w-4 h-4" /> {totpError}
+              </div>
+            )}
+
+            {totpStatus?.totp_enabled ? (
+              /* Already enabled — show disable form */
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 text-sm text-green-600 dark:text-green-400 font-medium">
+                  <ShieldCheck className="w-4 h-4" /> 2FA is currently enabled
+                </div>
+                <div>
+                  <label className="label">Enter your password to disable 2FA</label>
+                  <input
+                    type="password"
+                    className="input"
+                    value={totpDisablePassword}
+                    onChange={(e) => setTotpDisablePassword(e.target.value)}
+                    autoComplete="current-password"
+                  />
+                </div>
+                <button
+                  onClick={() => disableTotpMutation.mutate()}
+                  disabled={!totpDisablePassword || disableTotpMutation.isPending}
+                  className="btn-danger"
+                >
+                  Disable 2FA
+                </button>
+              </div>
+            ) : totpSetupData ? (
+              /* Setup in progress — show QR + confirm step */
+              <div className="space-y-4">
+                <p className="text-sm text-gray-600 dark:text-gray-300">
+                  Scan this QR code with your authenticator app, then enter the 6-digit code to confirm.
+                </p>
+                <div className="flex justify-center">
+                  <img src={totpSetupData.qr} alt="TOTP QR code" className="w-44 h-44 rounded-lg border border-gray-200 dark:border-slate-700" />
+                </div>
+                <details className="text-xs text-gray-500 dark:text-gray-400">
+                  <summary className="cursor-pointer select-none">Can&apos;t scan? Enter secret manually</summary>
+                  <code className="mt-1 block font-mono break-all">{totpSetupData.secret}</code>
+                </details>
+                <div>
+                  <label className="label">6-digit verification code</label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    className="input text-center tracking-widest font-mono text-lg"
+                    value={totpConfirmCode}
+                    onChange={(e) => setTotpConfirmCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    placeholder="000000"
+                    autoComplete="one-time-code"
+                  />
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => confirmTotpMutation.mutate()}
+                    disabled={totpConfirmCode.length !== 6 || confirmTotpMutation.isPending}
+                    className="btn-primary"
+                  >
+                    Enable 2FA
+                  </button>
+                  <button
+                    onClick={() => { setTotpSetupData(null); setTotpConfirmCode(''); setTotpError(''); }}
+                    className="btn-secondary"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              /* Not enabled, not in setup */
+              <div className="space-y-3">
+                <div>
+                  <label className="label">Confirm your password to set up 2FA</label>
+                  <input
+                    type="password"
+                    className="input max-w-xs"
+                    value={totpSetupPassword}
+                    onChange={(e) => setTotpSetupPassword(e.target.value)}
+                    autoComplete="current-password"
+                  />
+                </div>
+              <button
+                onClick={() => startTotpSetupMutation.mutate()}
+                disabled={!totpSetupPassword || startTotpSetupMutation.isPending}
+                className="btn-primary"
+              >
+                <ShieldCheck className="w-4 h-4" />
+                Set up 2FA
+              </button>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1325,6 +1880,418 @@ export default function SettingsPage() {
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+      {/* ── Automation (API tokens, webhooks, scheduled reports) ── */}
+      {activeTab === 'automation' && (
+        <AutomationSettings isAdmin={isAdmin} />
+      )}
+      {activeTab === 'sso' && (
+        <OidcSettings isAdmin={isAdmin} />
+      )}
+      {/* ── Config Templates ── */}
+      {activeTab === 'templates' && (
+        <div className="space-y-4">
+          <div className="card p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h3 className="font-semibold text-gray-900 dark:text-white">Configuration Templates</h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                  Define reusable config sets (DNS, NTP, Syslog) and push them to multiple devices at once.
+                </p>
+              </div>
+              <button onClick={() => { setTplFormOpen(true); setTplError(''); }} className="btn-primary text-sm">
+                <Plus className="w-4 h-4" /> New Template
+              </button>
+            </div>
+
+            {tplError && (
+              <div className="flex items-center gap-2 text-sm text-red-500 mb-3">
+                <AlertCircle className="w-4 h-4" /> {tplError}
+              </div>
+            )}
+
+            {/* Create form */}
+            {tplFormOpen && (
+              <div className="border border-blue-200 dark:border-blue-800 rounded-lg p-4 mb-4 space-y-3 bg-blue-50/30 dark:bg-blue-900/10">
+                <h4 className="text-sm font-semibold text-gray-800 dark:text-white">New Template</h4>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="label">Name</label>
+                    <input className="input" value={tplForm.name} onChange={(e) => setTplForm((f) => ({ ...f, name: e.target.value }))} placeholder="Standard Office Config" />
+                  </div>
+                  <div>
+                    <label className="label">Device Type (optional)</label>
+                    <select className="input" value={tplForm.applies_to_type} onChange={(e) => setTplForm((f) => ({ ...f, applies_to_type: e.target.value }))}>
+                      <option value="">All devices</option>
+                      <option value="router">Router</option>
+                      <option value="switch">Switch</option>
+                      <option value="wireless">Wireless AP</option>
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="label">Description (optional)</label>
+                  <input className="input" value={tplForm.description} onChange={(e) => setTplForm((f) => ({ ...f, description: e.target.value }))} placeholder="Standard DNS and NTP for main office" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="label">DNS Servers (comma-separated)</label>
+                    <input className="input" value={tplForm.dns_servers} onChange={(e) => setTplForm((f) => ({ ...f, dns_servers: e.target.value }))} placeholder="8.8.8.8, 1.1.1.1" />
+                  </div>
+                  <div>
+                    <label className="label">NTP Servers (comma-separated)</label>
+                    <input className="input" value={tplForm.ntp_servers} onChange={(e) => setTplForm((f) => ({ ...f, ntp_servers: e.target.value }))} placeholder="pool.ntp.org" />
+                  </div>
+                </div>
+                <div>
+                  <label className="label">Syslog Host (optional)</label>
+                  <input className="input" value={tplForm.syslog_host} onChange={(e) => setTplForm((f) => ({ ...f, syslog_host: e.target.value }))} placeholder="192.168.1.100" />
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => createTemplateMutation.mutate()} disabled={!tplForm.name.trim() || createTemplateMutation.isPending} className="btn-primary text-sm">
+                    Create Template
+                  </button>
+                  <button onClick={() => { setTplFormOpen(false); setTplError(''); }} className="btn-secondary text-sm">Cancel</button>
+                </div>
+              </div>
+            )}
+
+            {/* Template list */}
+            {templates.length === 0 ? (
+              <p className="text-sm text-gray-500 dark:text-slate-400">No templates yet. Create one to get started.</p>
+            ) : (
+              <div className="space-y-2">
+                {templates.map((tpl) => (
+                  <div key={tpl.id} className="border border-gray-200 dark:border-slate-700 rounded-lg p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-medium text-sm text-gray-900 dark:text-white">{tpl.name}</span>
+                          {tpl.applies_to_type && (
+                            <span className="text-xs px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">
+                              {tpl.applies_to_type}
+                            </span>
+                          )}
+                        </div>
+                        {tpl.description && <p className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">{tpl.description}</p>}
+                        <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-gray-500 dark:text-slate-400">
+                          {tpl.template_json.dns_servers?.length ? <span>DNS: {tpl.template_json.dns_servers.join(', ')}</span> : null}
+                          {tpl.template_json.ntp_servers?.length ? <span>NTP: {tpl.template_json.ntp_servers.join(', ')}</span> : null}
+                          {tpl.template_json.syslog_host ? <span>Syslog: {tpl.template_json.syslog_host}</span> : null}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <button
+                          onClick={() => { setTplApplyId(tpl.id); setTplApplyDeviceIds([]); setTplApplyResults(null); setTplError(''); }}
+                          className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors flex items-center gap-1"
+                        >
+                          <Send className="w-3 h-3" /> Apply
+                        </button>
+                        <button onClick={() => deleteTemplateMutation.mutate(tpl.id)} className="text-gray-400 hover:text-red-500 transition-colors">
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Apply panel */}
+                    {tplApplyId === tpl.id && (
+                      <div className="mt-3 pt-3 border-t border-gray-200 dark:border-slate-700 space-y-2">
+                        <p className="text-xs font-medium text-gray-700 dark:text-slate-300">Select devices to apply this template to:</p>
+                        <div className="max-h-40 overflow-y-auto space-y-1">
+                          {allDevicesList.map((d) => (
+                            <label key={d.id} className="flex items-center gap-2 text-sm cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={tplApplyDeviceIds.includes(d.id)}
+                                onChange={(e) => setTplApplyDeviceIds((ids) =>
+                                  e.target.checked ? [...ids, d.id] : ids.filter((x) => x !== d.id)
+                                )}
+                              />
+                              <span className="text-gray-800 dark:text-slate-200">{d.name}</span>
+                            </label>
+                          ))}
+                        </div>
+                        {tplApplyResults && (
+                          <div className="space-y-1 mt-2">
+                            {tplApplyResults.map((r) => (
+                              <div key={r.device_id} className={`text-xs flex items-center gap-1.5 ${r.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
+                                {r.ok ? <CheckCircle className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
+                                {r.device_name}: {r.ok ? 'Applied successfully' : r.error}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => applyTemplateMutation.mutate()}
+                            disabled={tplApplyDeviceIds.length === 0 || applyTemplateMutation.isPending}
+                            className="btn-primary text-xs"
+                          >
+                            {applyTemplateMutation.isPending ? 'Applying...' : `Apply to ${tplApplyDeviceIds.length} device${tplApplyDeviceIds.length !== 1 ? 's' : ''}`}
+                          </button>
+                          <button onClick={() => { setTplApplyId(null); setTplApplyResults(null); }} className="btn-secondary text-xs">Cancel</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Tags ── */}
+      {activeTab === 'tags' && (
+        <div className="space-y-4">
+          <div className="card p-5">
+            <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">Device Tags</h3>
+            {isAdmin && (
+              <div className="flex items-center gap-2 mb-4">
+                <input
+                  type="color"
+                  value={newTagColor}
+                  onChange={(e) => setNewTagColor(e.target.value)}
+                  className="w-8 h-8 rounded cursor-pointer border border-gray-300 dark:border-slate-600 p-0.5"
+                />
+                <input
+                  type="text"
+                  placeholder="Tag name…"
+                  value={newTagName}
+                  onChange={(e) => setNewTagName(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && newTagName.trim() && createTagMutation.mutate()}
+                  className="input-field flex-1 text-sm"
+                />
+                <button
+                  onClick={() => createTagMutation.mutate()}
+                  disabled={!newTagName.trim() || createTagMutation.isPending}
+                  className="btn-primary text-sm px-3 py-1.5"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
+              </div>
+            )}
+            <div className="space-y-2">
+              {tags.map((tag) => (
+                <div key={tag.id} className="flex items-center justify-between p-3 rounded-lg" style={{ background: 'var(--surface-2)' }}>
+                  <div className="flex items-center gap-3">
+                    <div className="w-4 h-4 rounded-full" style={{ background: tag.color }} />
+                    <span className="text-sm font-medium text-gray-900 dark:text-white">{tag.name}</span>
+                    <span className="text-xs text-gray-400 dark:text-slate-500">{tag.device_count} device{tag.device_count !== 1 ? 's' : ''}</span>
+                  </div>
+                  {isAdmin && (
+                    <button
+                      onClick={() => deleteTagMutation.mutate(tag.id)}
+                      className="p-1 rounded text-gray-400 hover:text-red-500 transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              ))}
+              {tags.length === 0 && (
+                <p className="text-sm text-gray-400 dark:text-slate-500 text-center py-4">No tags created yet</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Maintenance Windows ── */}
+      {activeTab === 'maintenance' && (
+        <div className="space-y-4">
+          <div className="card p-5">
+            <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-1">Maintenance Windows</h3>
+            <p className="text-xs text-gray-500 dark:text-slate-400 mb-4">
+              Alerts are suppressed for devices during active maintenance windows.
+            </p>
+
+            {isAdmin && (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-4">
+                <input
+                  type="text"
+                  placeholder="Window name…"
+                  value={mwForm.name}
+                  onChange={(e) => setMwForm(f => ({ ...f, name: e.target.value }))}
+                  className="input-field text-sm"
+                />
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs text-gray-500 dark:text-slate-400">Start</label>
+                  <input
+                    type="datetime-local"
+                    value={mwForm.start_at}
+                    onChange={(e) => setMwForm(f => ({ ...f, start_at: e.target.value }))}
+                    className="input-field text-sm"
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs text-gray-500 dark:text-slate-400">End</label>
+                  <input
+                    type="datetime-local"
+                    value={mwForm.end_at}
+                    onChange={(e) => setMwForm(f => ({ ...f, end_at: e.target.value }))}
+                    className="input-field text-sm"
+                  />
+                </div>
+                <button
+                  onClick={() => createMwMutation.mutate()}
+                  disabled={!mwForm.name.trim() || !mwForm.start_at || !mwForm.end_at || createMwMutation.isPending}
+                  className="btn-primary text-sm sm:col-span-3 justify-center flex items-center gap-2"
+                >
+                  <Plus className="w-4 h-4" />
+                  Create Window
+                </button>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              {(maintenanceWindows as MaintenanceWindow[]).map((mw) => {
+                const now = new Date();
+                const start = new Date(mw.start_at);
+                const end = new Date(mw.end_at);
+                const isActive = mw.active && now >= start && now <= end;
+                const isPast = now > end;
+                return (
+                  <div key={mw.id} className={clsx(
+                    'flex items-center justify-between p-3 rounded-lg',
+                    isActive ? 'border border-yellow-400 dark:border-yellow-600' : ''
+                  )} style={{ background: 'var(--surface-2)' }}>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium text-gray-900 dark:text-white">{mw.name}</span>
+                        {isActive && <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400">Active</span>}
+                        {isPast && <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-slate-700 dark:text-slate-400">Expired</span>}
+                        {!mw.active && <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-400 dark:bg-slate-700 dark:text-slate-500">Disabled</span>}
+                      </div>
+                      <div className="text-xs text-gray-400 dark:text-slate-500 mt-0.5">
+                        {new Date(mw.start_at).toLocaleString()} – {new Date(mw.end_at).toLocaleString()}
+                        {mw.device_ids.length > 0 && ` · ${mw.device_ids.length} device(s)`}
+                      </div>
+                    </div>
+                    {isAdmin && (
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => toggleMwMutation.mutate({ id: mw.id, active: !mw.active })}
+                          className="text-xs px-2 py-1 rounded border border-gray-300 dark:border-slate-600 text-gray-500 dark:text-slate-400 hover:text-gray-700 dark:hover:text-slate-300"
+                        >
+                          {mw.active ? 'Disable' : 'Enable'}
+                        </button>
+                        <button
+                          onClick={() => deleteMwMutation.mutate(mw.id)}
+                          className="p-1 rounded text-gray-400 hover:text-red-500 transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {(maintenanceWindows as MaintenanceWindow[]).length === 0 && (
+                <p className="text-sm text-gray-400 dark:text-slate-500 text-center py-4">No maintenance windows created</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Audit Log ── */}
+      {activeTab === 'audit' && (
+        <div className="space-y-4">
+          <div className="card p-5">
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-white flex items-center gap-2">
+                <ClipboardList className="w-4 h-4 text-blue-500" />
+                Audit Log
+              </h3>
+              <input
+                type="text"
+                placeholder="Search user, path, IP…"
+                value={auditSearch}
+                onChange={(e) => { setAuditSearch(e.target.value); setAuditPage(1); }}
+                className="input-field w-64 text-sm"
+              />
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-gray-500 dark:text-slate-400 border-b border-gray-200 dark:border-slate-700">
+                    <th className="pb-2 pr-4">Time</th>
+                    <th className="pb-2 pr-4">User</th>
+                    <th className="pb-2 pr-4">Action</th>
+                    <th className="pb-2 pr-4">Entity</th>
+                    <th className="pb-2 pr-4">Status</th>
+                    <th className="pb-2">IP</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(auditData?.rows ?? []).map((row) => (
+                    <tr key={row.id} className="border-b border-gray-100 dark:border-slate-700/50">
+                      <td className="py-2 pr-4 font-mono text-xs text-gray-400 whitespace-nowrap">
+                        {new Date(row.created_at).toLocaleString()}
+                      </td>
+                      <td className="py-2 pr-4 font-medium">{row.username ?? '—'}</td>
+                      <td className="py-2 pr-4 font-mono text-xs">
+                        <span className={clsx(
+                          'px-1.5 py-0.5 rounded text-xs font-semibold mr-2',
+                          row.method === 'DELETE' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' :
+                          row.method === 'POST' ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' :
+                          'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'
+                        )}>
+                          {row.method}
+                        </span>
+                        <span className="text-gray-500 dark:text-slate-400 truncate max-w-[200px] inline-block align-bottom" title={row.path}>{row.path}</span>
+                      </td>
+                      <td className="py-2 pr-4 text-gray-500 dark:text-slate-400">
+                        {row.entity_type ? (row.entity_id ? `${row.entity_type}#${row.entity_id}` : row.entity_type) : '—'}
+                      </td>
+                      <td className="py-2 pr-4">
+                        <span className={clsx(
+                          'px-1.5 py-0.5 rounded text-xs font-semibold',
+                          (row.status_code ?? 200) < 300 ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' :
+                          (row.status_code ?? 200) < 500 ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' :
+                          'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+                        )}>
+                          {row.status_code ?? '—'}
+                        </span>
+                      </td>
+                      <td className="py-2 font-mono text-xs text-gray-400">{row.ip_address ?? '—'}</td>
+                    </tr>
+                  ))}
+                  {(auditData?.rows ?? []).length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-gray-400 dark:text-slate-500">
+                        No audit log entries yet
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            {(auditData?.total ?? 0) > 50 && (
+              <div className="flex items-center justify-between mt-4 text-sm text-gray-500 dark:text-slate-400">
+                <span>{auditData?.total} total entries</span>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
+                    disabled={auditPage <= 1}
+                    className="btn-secondary text-xs px-3 py-1 disabled:opacity-50"
+                  >
+                    Prev
+                  </button>
+                  <span className="px-2 py-1">Page {auditPage}</span>
+                  <button
+                    onClick={() => setAuditPage((p) => p + 1)}
+                    disabled={auditPage * 50 >= (auditData?.total ?? 0)}
+                    className="btn-secondary text-xs px-3 py-1 disabled:opacity-50"
+                  >
+                    Next
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
