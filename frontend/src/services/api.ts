@@ -174,7 +174,171 @@ export interface SecurityCheck {
   title: string;
   detail: string;
   serviceId?: string;
+  /** Operator judged this inapplicable — still shown, but excluded from the score. */
+  suppressed?: boolean;
+  suppressed_scope?: 'device' | 'fleet';
+  suppressed_reason?: string | null;
 }
+
+export interface SecuritySuppression {
+  id: number;
+  check_id: string;
+  device_id: number | null;
+  device_name: string | null;
+  reason: string | null;
+  created_by: string | null;
+  created_at: string;
+}
+
+/**
+ * A configuration RouterOS accepted but that does not work. Produced by the
+ * standing Config Health audit, which encodes MikroTik's documented Layer2
+ * misconfigurations plus the latent lockout cases.
+ */
+export interface ConfigFinding {
+  rule: string;
+  severity: 'critical' | 'warning' | 'info';
+  title: string;
+  detail: string;
+  remediation: string | null;
+  doc_url: string | null;
+  objects: string[];
+  first_seen: string | null;
+  last_seen: string | null;
+}
+
+export interface ConfigHealthResponse {
+  findings: ConfigFinding[];
+  checked_at: string | null;
+}
+
+
+// ─── LTE / cellular ───────────────────────────────────────────────────────────
+
+/** One aggregated carrier as the modem reported it. */
+export interface LteBandInfo {
+  band: number;
+  bandwidthMhz: number | null;
+  earfcn: number | null;
+  phyCellId: number | null;
+  raw: string;
+}
+
+export interface LteInterface {
+  interface_name: string;
+  status: string | null;
+  data_class: string | null;
+  modem_model: string | null;
+  modem_revision: string | null;
+  operator: string | null;
+  cell_id: string | null;
+  enb_id: string | null;
+  sector_id: string | null;
+  phy_cell_id: string | null;
+  session_uptime_s: string | number | null;
+  primary_band: LteBandInfo | null;
+  ca_bands: LteBandInfo[];
+  rssi: number | null;
+  rsrp: number | null;
+  rsrq: number | null;
+  sinr: number | null;
+  cqi: number | null;
+  rank_indicator: number | null;
+  mcs: number | null;
+  dl_modulation: string | null;
+  quality: 'excellent' | 'good' | 'fair' | 'poor' | 'unknown' | null;
+  /** Configured allow-list; empty means the modem picks freely. */
+  allowed_bands: number[];
+  /** Primary plus every aggregated carrier. */
+  total_bandwidth_mhz: number;
+  /**
+   * Set when the uplink is anchored to a narrower carrier than the downlink is
+   * aggregating — the reason operators lock bands, and invisible in RouterOS.
+   */
+  uplink_anchor: {
+    primaryMhz: number; primaryBand: number;
+    widestMhz: number; widestBand: number;
+  } | null;
+  network_mode: string | null;
+  apn_profiles: string | null;
+  allow_roaming: boolean | null;
+  updated_at: string;
+  /** Bands actually seen serving this device — the evidence behind a band lock. */
+  observed_bands: { band: number; observations: number; last_seen: string }[];
+}
+
+export interface LteHistoryEvent {
+  interface_name: string;
+  at: string;
+  kind: 'session-reset' | 'handover' | 'band-change';
+  detail: string | null;
+  cell_id: string | null;
+  enb_id: string | null;
+  bands: string | null;
+  rsrp: number | null;
+  sinr: number | null;
+}
+
+export interface LteMetricPoint {
+  time: string;
+  interface: string;
+  rsrp?: number;
+  rsrq?: number;
+  sinr?: number;
+  rssi?: number;
+  cqi?: number;
+  carriers?: number;
+}
+
+export const lteApi = {
+  state: (deviceId: number) =>
+    api.get<{ interfaces: LteInterface[] }>(`/devices/${deviceId}/lte`),
+  history: (deviceId: number, range = '24h') =>
+    api.get<{ events: LteHistoryEvent[] }>(`/devices/${deviceId}/lte/history`, { params: { range } }),
+  metrics: (deviceId: number, range = '6h', iface?: string) =>
+    api.get<{ metrics: LteMetricPoint[] }>(`/devices/${deviceId}/lte/metrics`, {
+      params: { range, ...(iface ? { iface } : {}) },
+    }),
+};
+
+
+// ─── Poller health (#114) ─────────────────────────────────────────────────────
+
+export interface PollerQueue {
+  name: string; waiting?: number; active?: number; delayed?: number;
+  failed?: number; completed?: number; paused?: number; error?: string;
+}
+
+export interface PollerHealth {
+  status: 'ok' | 'draining' | 'saturated';
+  queues: PollerQueue[];
+  workers: { concurrency: number; job_timeout_ms: number; poll_interval_ms: number };
+  capacity: {
+    devices: number;
+    avg_fast_poll_ms: number | null;
+    p90_fast_poll_ms: number | null;
+    arrival_per_sec: number;
+    service_per_sec: number | null;
+    /** Below 1.0 the backlog grows every cycle. */
+    headroom: number | null;
+    backlog: number;
+    /** null when the backlog is not shrinking at the current rate. */
+    drain_eta_sec: number | null;
+  };
+  retention: { max_age_sec: number; max_count: number; stale_pending_ms: Record<string, number> };
+  stale_devices: {
+    id: number; name: string; status: string; kind: string;
+    last_attempt_at: string | null; last_success_at: string | null;
+    last_duration_ms: number | null; last_error: string | null;
+    attempts: number; failures: number; seconds_since_success: number | null;
+  }[];
+}
+
+export const pollerApi = {
+  health: () => api.get<PollerHealth>('/system/poller'),
+  drain: () => api.post<{ drained: Record<string, number>; total: number; message: string }>(
+    '/system/poller/drain'),
+};
 
 export const devicesApi = {
   list: () => api.get<Device[]>('/devices'),
@@ -217,7 +381,7 @@ export const devicesApi = {
   deleteFirewallRule: (id: number, ruleId: string) =>
     api.delete(`/devices/${id}/firewall/${encodeURIComponent(ruleId)}`),
   getResources: (id: number) => api.get<Record<string, string>>(`/devices/${id}/resources`),
-  configurePortVlan: (id: number, name: string, data: PortVlanConfig) =>
+  configurePortVlan: (id: number, name: string, data: PortVlanConfig & { confirm_lockout?: boolean }) =>
     api.put(`/devices/${id}/ports/${encodeURIComponent(name)}/vlan`, data),
   getSystemConfig: (id: number) => api.get<SystemConfig>(`/devices/${id}/system-config`),
   updateSystemConfig: (id: number, data: Partial<{
@@ -229,30 +393,44 @@ export const devicesApi = {
     dns_allow_remote: boolean;
   }>) => api.put(`/devices/${id}/system-config`, data),
   getIpAddresses: (id: number) => api.get<IpAddress[]>(`/devices/${id}/ip-addresses`),
-  addIpAddress: (id: number, data: { address: string; interface: string }) =>
+  addIpAddress: (id: number, data: { address: string; interface: string; confirm_lockout?: boolean }) =>
     api.post<IpAddress[]>(`/devices/${id}/ip-addresses`, data),
-  removeIpAddress: (id: number, addrId: string) =>
-    api.delete(`/devices/${id}/ip-addresses/${encodeURIComponent(addrId)}`),
+  removeIpAddress: (id: number, addrId: string, confirmLockout = false) =>
+    api.delete(`/devices/${id}/ip-addresses/${encodeURIComponent(addrId)}`,
+      confirmLockout ? { data: { confirm_lockout: true } } : undefined),
   checkUpdate: (id: number) =>
     api.post<Record<string, string>>(`/devices/${id}/check-update`),
   checkRouterboard: (id: number) =>
     api.post<{ currentFirmware: string; upgradeFirmware: string; upgradeAvailable: boolean }>(`/devices/${id}/check-routerboard`),
-  installRouterboard: (id: number) => api.post(`/devices/${id}/install-routerboard`),
+  installRouterboard: (id: number) =>
+    api.post<{
+      started: boolean; current_firmware: string | null;
+      target_firmware?: string; message: string;
+    }>(`/devices/${id}/install-routerboard`),
   getHardware: (id: number) =>
     api.get<{ health: Record<string, string>[]; disks: Record<string, string>[] }>(`/devices/${id}/hardware`),
-  installUpdate: (id: number) => api.post(`/devices/${id}/install-update`),
+  /** `started: false` means the device was already current — not a failure. */
+  installUpdate: (id: number) =>
+    api.post<{
+      started: boolean; installed_version: string | null;
+      target_version?: string; message: string;
+    }>(`/devices/${id}/install-update`),
   getClock: (id: number) => api.get<{ date: string; time: string; timezone: string }>(`/devices/${id}/clock`),
   setClock: (id: number, data: { date?: string; time?: string; timezone?: string }) =>
     api.put(`/devices/${id}/clock`, data),
-  addRoute: (id: number, data: { dst_address: string; gateway: string; distance?: number; comment?: string }) =>
+  addRoute: (id: number, data: { dst_address: string; gateway: string; distance?: number; comment?: string; confirm_lockout?: boolean }) =>
     api.post(`/devices/${id}/routing`, data),
-  deleteRoute: (id: number, routeId: string) =>
-    api.delete(`/devices/${id}/routing/${encodeURIComponent(routeId)}`),
-  addVlan: (id: number, data: { bridge: string; vlan_id: number; tagged_ports?: string[]; untagged_ports?: string[] }) =>
+  deleteRoute: (id: number, routeId: string, confirmLockout = false) =>
+    api.delete(`/devices/${id}/routing/${encodeURIComponent(routeId)}`,
+      confirmLockout ? { data: { confirm_lockout: true } } : undefined),
+  // confirm_lockout overrides a predicted-lockout refusal (HTTP 409) after the user
+  // has seen and accepted the verdict.
+  addVlan: (id: number, data: { bridge: string; vlan_id: number; tagged_ports?: string[]; untagged_ports?: string[]; confirm_lockout?: boolean }) =>
     api.post(`/devices/${id}/vlans`, data),
-  updateVlan: (id: number, vlanDbId: number, data: { tagged_ports: string[]; untagged_ports: string[] }) =>
+  updateVlan: (id: number, vlanDbId: number, data: { tagged_ports: string[]; untagged_ports: string[]; confirm_lockout?: boolean }) =>
     api.put(`/devices/${id}/vlans/${vlanDbId}`, data),
-  deleteVlan: (id: number, vlanDbId: number) => api.delete(`/devices/${id}/vlans/${vlanDbId}`),
+  deleteVlan: (id: number, vlanDbId: number, confirmLockout = false) =>
+    api.delete(`/devices/${id}/vlans/${vlanDbId}`, confirmLockout ? { data: { confirm_lockout: true } } : undefined),
   copyVlans: (id: number, operations: Array<{ action: 'add' | 'update'; vlan_id: number; bridge: string; tagged_ports: string[]; untagged_ports: string[] }>) =>
     api.post<{ results: Array<{ vlan_id: number; action: string; success: boolean; error?: string }>; vlans: Vlan[] }>(`/devices/${id}/vlans/copy`, { operations }),
   reboot: (id: number) => api.post<{ message: string }>(`/devices/${id}/reboot`),
@@ -263,15 +441,18 @@ export const devicesApi = {
   createBond: (id: number, data: {
     name: string; mode: string; slaves: string[];
     lacp_rate?: string; transmit_hash_policy?: string; mtu?: number; min_links?: number;
+    confirm_lockout?: boolean;
   }) => api.post(`/devices/${id}/bonds`, data),
   updateBond: (id: number, bondName: string, data: {
     mode: string; slaves: string[];
     lacp_rate?: string; transmit_hash_policy?: string; mtu?: number; min_links?: number;
   }) => api.put(`/devices/${id}/bonds/${encodeURIComponent(bondName)}`, data),
-  deleteBond: (id: number, bondName: string) =>
-    api.delete(`/devices/${id}/bonds/${encodeURIComponent(bondName)}`),
-  setBridgeVlanFiltering: (id: number, bridgeName: string, enabled: boolean) =>
-    api.put(`/devices/${id}/bridge/${encodeURIComponent(bridgeName)}/vlan-filtering`, { enabled }),
+  deleteBond: (id: number, bondName: string, confirmLockout = false) =>
+    api.delete(`/devices/${id}/bonds/${encodeURIComponent(bondName)}`,
+      confirmLockout ? { data: { confirm_lockout: true } } : undefined),
+  setBridgeVlanFiltering: (id: number, bridgeName: string, enabled: boolean, confirmLockout = false) =>
+    api.put(`/devices/${id}/bridge/${encodeURIComponent(bridgeName)}/vlan-filtering`,
+      { enabled, ...(confirmLockout ? { confirm_lockout: true } : {}) }),
   getNat: (id: number) => api.get<Record<string, string>[]>(`/devices/${id}/nat`),
   addNatRule: (id: number, data: Record<string, unknown>) =>
     api.post<Record<string, string>[]>(`/devices/${id}/nat`, data),
@@ -307,10 +488,22 @@ export const devicesApi = {
     api.delete(`/devices/${id}/queues/${encodeURIComponent(queueId)}`),
   // IP services + security posture
   getServices: (id: number) => api.get<Record<string, string>[]>(`/devices/${id}/services`),
-  setServiceDisabled: (id: number, serviceId: string, disabled: boolean) =>
-    api.put<Record<string, string>[]>(`/devices/${id}/services/${encodeURIComponent(serviceId)}`, { disabled }),
+  setServiceDisabled: (id: number, serviceId: string, disabled: boolean, confirmLockout = false) =>
+    api.put<Record<string, string>[]>(`/devices/${id}/services/${encodeURIComponent(serviceId)}`,
+      { disabled, ...(confirmLockout ? { confirm_lockout: true } : {}) }),
+  listSecuritySuppressions: () =>
+    api.get<SecuritySuppression[]>('/devices/security/suppressions'),
+  suppressSecurityCheck: (check_id: string, device_id: number | null, reason?: string) =>
+    api.post('/devices/security/suppressions', { check_id, device_id, reason }),
+  unsuppressSecurityCheck: (id: number) =>
+    api.delete(`/devices/security/suppressions/${id}`),
   getSecurityPosture: (id: number) =>
     api.get<{ score: number; checks: SecurityCheck[] }>(`/devices/${id}/security-posture`),
+  // Config Health — cached findings load instantly; the scan re-reads the device.
+  getConfigHealth: (id: number) =>
+    api.get<ConfigHealthResponse>(`/devices/${id}/config-health`),
+  scanConfigHealth: (id: number) =>
+    api.post<ConfigHealthResponse>(`/devices/${id}/config-health/scan`),
   patchLocation: (id: number, data: {
     location_address?: string | null;
     location_lat?: number | null;
@@ -377,12 +570,61 @@ export interface PresencePoint { time: string; online: number; }
 export interface TrafficPoint2 { time: string; tx_bytes: number; rx_bytes: number; }
 export interface SignalPoint { time: string; signal_strength: number; }
 
+export interface RoamEvent {
+  kind: 'connected' | 'roamed' | 'disconnected' | 'dhcp-assigned' | 'dhcp-released';
+  at: string;
+  mac: string;
+  interfaceName: string | null;
+  ssid: string | null;
+  signal: number | null;
+  toInterface: string | null;
+  toSsid: string | null;
+  reason: string | null;
+  ip: string | null;
+  hostname: string | null;
+  deviceName: string | null;
+}
+
+export interface RoamHop {
+  at: string; from: string | null; to: string;
+  signalBefore: number | null; signalAfter: number | null;
+}
+
+export interface RoamSession {
+  startedAt: string;
+  endedAt: string | null;
+  durationSec: number | null;
+  ssid: string | null;
+  ip: string | null;
+  hostname: string | null;
+  path: string[];
+  hops: RoamHop[];
+  disconnectReason: string | null;
+  signalMin: number | null;
+  signalMax: number | null;
+  roamsPerHour: number | null;
+  events: RoamEvent[];
+}
+
+export interface RoamingHistory {
+  mac: string;
+  range: string;
+  sessions: RoamSession[];
+  totalRoams: number;
+  flappingSessions: number;
+  radios: { name: string; count: number }[];
+}
+
 export const clientsApi = {
   list: (params?: {
     deviceId?: number;
     active?: boolean;
     search?: string;
     client_type?: string;
+    vlan_id?: number;
+    /** Inclusive lower / exclusive upper dBm bound, matching the density buckets. */
+    signal_min?: number;
+    signal_max?: number;
     limit?: number;
     offset?: number;
     sort?: string;
@@ -390,6 +632,8 @@ export const clientsApi = {
   }) =>
     api.get<{ clients: Client[]; total: number }>('/clients', { params }),
   get: (mac: string) => api.get<ClientDetail>(`/clients/${mac}`),
+  getRoaming: (mac: string, range = '24h') =>
+    api.get<RoamingHistory>(`/clients/${mac}/roaming`, { params: { range } }),
   getPresence: (mac: string, range = '24h') =>
     api.get<PresencePoint[]>(`/clients/${mac}/presence`, { params: { range } }),
   getTraffic: (mac: string, range = '24h') =>
@@ -434,6 +678,7 @@ export const systemApi = {
 
 // ─── Events ───────────────────────────────────────────────────────────────────
 export const eventsApi = {
+  topics: () => api.get<{ topic: string; count: number }[]>('/events/topics'),
   list: (params?: {
     deviceId?: number;
     severity?: string;
@@ -536,7 +781,7 @@ export interface FirmwareDeviceRow {
 }
 export interface FirmwareRollout {
   id: number; name: string; status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-  halt_on_failure: boolean; pre_backup: boolean;
+  halt_on_failure: boolean; pre_backup: boolean; routerboot_after: boolean;
   scheduled_at: string | null; started_at: string | null; finished_at: string | null; created_at: string;
   device_count?: number; success_count?: number; failed_count?: number;
 }
@@ -555,7 +800,7 @@ export const firmwareApi = {
     api.post<{ results: { name: string; ok: boolean; installed?: string; latest?: string; available?: boolean; error?: string }[] }>(
       '/firmware/check-all', undefined, { timeout: 180_000 }),
   createRollout: (data: {
-    name: string; halt_on_failure: boolean; pre_backup: boolean;
+    name: string; halt_on_failure: boolean; pre_backup: boolean; routerboot_after?: boolean;
     scheduled_at?: string | null; start?: boolean;
     devices: { device_id: number; wave: number }[];
   }) => api.post<{ id: number }>('/firmware/rollouts', data),
@@ -576,6 +821,8 @@ export interface OpsAttentionItem {
   body: string;
   action: string;
   path: string;
+  /** Stable identity used to dismiss an item that is otherwise recomputed. */
+  fingerprint?: string;
 }
 export interface OpsCapacityRow { id: number; name: string; cpu: number; mem_pct: number }
 export interface OpsActivityItem {
@@ -587,6 +834,8 @@ export interface OpsActivityItem {
 }
 export interface OpsInsights {
   attention: OpsAttentionItem[];
+  /** How many items are currently hidden by a dismissal. */
+  dismissedCount?: number;
   capacity: OpsCapacityRow[];
   activity: OpsActivityItem[];
 }
@@ -594,6 +843,13 @@ export interface OpsActionResult { total: number; results: { name: string; ok: b
 
 export const operationsApi = {
   insights: () => api.get<OpsInsights>('/operations/insights'),
+  dismissInsight: (fingerprint: string, hours: number, category?: string, title?: string) =>
+    api.post('/operations/insights/dismiss', { fingerprint, hours, category, title }),
+  listDismissed: () =>
+    api.get<{ fingerprint: string; category: string | null; title: string | null; expires_at: string }[]>(
+      '/operations/insights/dismissed'),
+  undismissInsight: (fingerprint: string) =>
+    api.delete(`/operations/insights/dismiss/${encodeURIComponent(fingerprint)}`),
   backupAll: () => api.post<OpsActionResult>('/operations/backup-all', undefined, { timeout: 180_000 }),
   syncAll: () => api.post<OpsActionResult>('/operations/sync-all', undefined, { timeout: 180_000 }),
 };
@@ -789,7 +1045,7 @@ export interface AlertRule {
 export interface AlertChannel {
   id: number;
   name: string;
-  type: 'email' | 'slack' | 'discord' | 'telegram';
+  type: 'email' | 'slack' | 'discord' | 'telegram' | 'ntfy';
   enabled: boolean;
   config: Record<string, unknown>;
   created_at: string;
@@ -854,9 +1110,92 @@ export const certApi = {
 };
 
 // ─── Wireless ─────────────────────────────────────────────────────────────────
+/**
+ * A CAPsMAN controller and the access points it provisions. Read-only: the
+ * configuration lives on the controller and pushing an edit would reach every bound
+ * AP at once, so that is deliberately not exposed yet (issue #94).
+ */
+export interface CapsmanRadio {
+  radio_mac: string;
+  interface_name: string | null;
+  local: boolean;
+  hw_type: string | null;
+  /** Operating channel from /interface/wifi/monitor, not the supported-channel list. */
+  current_channel: string | null;
+  state: string | null;
+  /** SSID the controller provisioned onto this radio; the CAP itself does not know it. */
+  ssid: string | null;
+  registered_peers: number | null;
+  authorized_peers: number | null;
+  tx_power: number | null;
+  remote_cap_name: string | null;
+  matched_device_id: number | null;
+  matched_device_name: string | null;
+  matched_device_status: string | null;
+}
+
+export interface CapsmanAccessPoint {
+  device_id: number | null;
+  device_name: string;
+  radios: CapsmanRadio[];
+  /** Clients as the controller sees them; a CAP's own table is empty under central forwarding. */
+  client_count: number;
+}
+
+export interface CapsmanConfiguration {
+  name: string;
+  ssid: string | null;
+  mode: string | null;
+  band: string | null;
+  security: string | null;
+  authentication_types: string | null;
+  /** Provisioning rules that apply this configuration. */
+  rules: CapsmanProvisioning[];
+}
+
+export interface CapsmanProvisioning {
+  ros_id: string;
+  action: string | null;
+  master_configuration: string | null;
+  slave_configurations: string | null;
+  radio_mac: string | null;
+  comment: string | null;
+  disabled: boolean;
+}
+
+export interface CapsmanSsid {
+  device_id: number;
+  device_name: string;
+  name: string;
+  /** Radio this interface sits on, used to join live channel and client counts. */
+  radio_mac: string | null;
+  ssid: string | null;
+  band: string | null;
+  frequency: number | null;
+  disabled: boolean;
+  running: boolean;
+  registered_clients: number | null;
+}
+
+export interface CapsmanController {
+  id: number;
+  name: string;
+  ip_address: string;
+  model: string | null;
+  status: string;
+  wifi_role: string | null;
+  client_count: number;
+  access_points: CapsmanAccessPoint[];
+  configurations: CapsmanConfiguration[];
+  provisioning: CapsmanProvisioning[];
+  ssids: CapsmanSsid[];
+}
+
 export const wirelessApi = {
   // Section overview
   list: () => api.get('/wireless'),
+  // CAPsMAN controllers with the APs they provision (read-only)
+  capsman: () => api.get<{ controllers: CapsmanController[] }>('/wireless/capsman'),
 
   // Multi-AP SSID deployment
   bulkCreateInterfaces: (data: { apIds: number[] } & Record<string, unknown>) =>
@@ -915,7 +1254,10 @@ export const wirelessApi = {
 
   // RF Health (fleet-wide, or scoped to one AP via deviceId)
   getChannelUsage: (deviceId?: number) =>
-    api.get<import('../types').RfChannelRow[]>('/wireless/rf/channels', { params: { deviceId } }),
+    api.get<import('../types').RfChannelUsage>('/wireless/rf/channels', { params: { deviceId } }),
+  getRfCapabilities: () =>
+    api.get<{ packages: Record<string, number>; legacyRadios: number; txRetriesAvailable: boolean }>(
+      '/wireless/rf/capabilities'),
   getClientSignals: (deviceId?: number) =>
     api.get<import('../types').RfSignalRow[]>('/wireless/rf/signals', { params: { deviceId } }),
   getTxQuality: (deviceId?: number, range = '6h') =>

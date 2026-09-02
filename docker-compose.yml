@@ -37,6 +37,13 @@ services:
       CORS_ORIGIN: ${CORS_ORIGIN:-https://localhost,http://localhost,https://127.0.0.1,http://127.0.0.1}
       PORT: 3001
       NETFLOW_BIND_PORT: 2055
+      # Poller tuning. These were documented in .env.example but never passed
+      # through, so setting them had no effect on the container at all.
+      POLLER_CONCURRENCY: ${POLLER_CONCURRENCY:-12}
+      POLLER_JOB_TIMEOUT_MS: ${POLLER_JOB_TIMEOUT_MS:-45000}
+      POLLER_INTERVAL_MS: ${POLLER_INTERVAL_MS:-30000}
+      POLLER_JOB_RETENTION_SEC: ${POLLER_JOB_RETENTION_SEC:-3600}
+      POLLER_JOB_RETENTION_COUNT: ${POLLER_JOB_RETENTION_COUNT:-5000}
     ports:
       # NetFlow/IPFIX collector — UDP goes straight to the backend (nginx not involved).
       # Host port must match the netflow_collector_port app setting (default 2055).
@@ -85,7 +92,21 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes
+    # A memory ceiling so a runaway producer can never take the host down, with
+    # eviction disabled.
+    #
+    # volatile-lru looks tempting — it would evict only keys with an expiry, and
+    # BullMQ's job hashes have none. But its *control* keys do: job locks and
+    # per-queue stalled-check markers both carry TTLs, and losing one causes
+    # duplicate processing or a stalled-job storm. BullMQ warns about this on
+    # connect, and it is right. noeviction means Redis refuses writes when full
+    # rather than quietly corrupting queue state: the host stays up, and the
+    # failure is loud. Retention limits and the stale-pending sweep are what keep
+    # us away from the ceiling in the first place.
+    command: >
+      redis-server --appendonly yes
+      --maxmemory ${REDIS_MAXMEMORY:-512mb}
+      --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     restart: unless-stopped

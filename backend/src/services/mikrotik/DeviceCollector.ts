@@ -6,6 +6,16 @@ import { Point } from '@influxdata/influxdb-client';
 import { decrypt } from '../../utils/crypto';
 import { lookupVendor } from '../../utils/oui';
 import { buildServerArpMap } from '../../utils/serverArp';
+import { aggregateBridgeVlans, portVlanMembership, expandVlanIds } from '../../utils/vlan';
+import {
+  classifyWifiRole, isCapsmanManaged, parseCapsmanStatus, parseCapStatus,
+  normalizeRadios, macIndexKeys, parseRadioMonitor, resolveDatapath,
+  clientsPerRadio, buildMacIndex, matchRadiosToDevices,
+  type WifiRole,
+} from './capsman';
+import {
+  parseLteMonitor, overallQuality, detectChanges, type LteStatus,
+} from '../../utils/lte';
 import { BackupService } from '../BackupService';
 import { alertService } from '../AlertService';
 
@@ -108,10 +118,29 @@ export class DeviceCollector {
     if (this.device.device_type === 'switch') {
       await this.collectPoePower();
     }
+    if ((this.device as unknown as { has_lte?: boolean }).has_lte) {
+      await this.collectLte();
+    }
     await this.updateDeviceStatus('online');
   }
 
   // ─── Slow poll (every 5 min) ───────────────────────────────────────────────
+
+  /**
+   * Should wireless data be collected from this device?
+   *
+   * `device_type` alone is wrong for CAPsMAN: a dedicated controller is usually
+   * classified as a router, has no radios of its own, and yet owns the wireless
+   * configuration of the entire fleet. Probing every device once and remembering
+   * the answer costs one call on first sight and nothing afterwards, which beats
+   * both probing forever and never noticing a controller.
+   */
+  private shouldCollectWireless(): boolean {
+    if (this.device.device_type === 'wireless_ap') return true;
+    const role = (this.device as unknown as { wifi_role?: string | null }).wifi_role;
+    if (role == null) return true;                 // never determined — probe once
+    return role !== 'none' && role !== 'standalone';
+  }
 
   async collectSlow(): Promise<void> {
     await this.collectInterfaces();
@@ -119,9 +148,11 @@ export class DeviceCollector {
     await this.collectVlans();
     await this.collectSystemInfo();
     await this.collectStp();
-    if (this.device.device_type === 'wireless_ap') {
+    await this.collectLte();
+    if (this.shouldCollectWireless()) {
       await this.collectWirelessInterfaces();
       await this.collectSecurityProfiles();
+      await this.collectCapsman();
     }
   }
 
@@ -143,12 +174,14 @@ export class DeviceCollector {
     await this.updateClients();
     await this.collectEvents();
     await this.collectNeighbors();
+    await this.collectLte();
     // Wireless data belongs in a full resync too — without this, a manual sync
     // never refreshed radios/SSIDs (or pruned ones deleted on the device), so
     // the UI could only catch up on the 5-minute slow poll.
-    if (this.device.device_type === 'wireless_ap') {
+    if (this.shouldCollectWireless()) {
       await this.collectWirelessInterfaces();
       await this.collectSecurityProfiles();
+      await this.collectCapsman();
     }
     await this.saveFullConfig();
     await this.updateDeviceStatus('online');
@@ -178,6 +211,16 @@ export class DeviceCollector {
           serial_number = COALESCE($3, serial_number),
           firmware_version = COALESCE($4, firmware_version),
           ros_version = COALESCE($5, ros_version),
+          -- An update that has landed is no longer pending. The dedicated
+          -- firmware check only runs once a day, so without this a device stays
+          -- flagged "update available" for up to 24 hours after it has already
+          -- been upgraded — including when someone upgrades it outside the
+          -- platform entirely. The version read here is the authority.
+          firmware_update_available = CASE
+            WHEN NULLIF($5,'') IS NOT NULL AND latest_ros_version IS NOT NULL
+                 AND NULLIF($5,'') = latest_ros_version THEN FALSE
+            ELSE firmware_update_available
+          END,
           updated_at = NOW()
         WHERE id = $6`,
         [identityName, model, serial, firmware, rosVersion, this.device.id]
@@ -309,11 +352,18 @@ export class DeviceCollector {
         const mtu = !isNaN(rawMtu) && rawMtu > 0 ? rawMtu : null;
 
         try {
+          // Only bridges have vlan-filtering; null everywhere else keeps the column
+          // meaningful for queries rather than defaulting to a misleading false.
+          const vlanFiltering = resolvedType === 'bridge'
+            ? enrichedIface['vlan-filtering'] === 'true'
+            : null;
+
           await query(
-            `INSERT INTO interfaces (device_id, name, type, mac_address, mtu, running, disabled, comment, speed, config_json, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+            `INSERT INTO interfaces (device_id, name, type, mac_address, mtu, running, disabled, comment, speed, vlan_filtering, config_json, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
              ON CONFLICT (device_id, name) DO UPDATE SET
-               type=$3, mac_address=$4, mtu=$5, running=$6, disabled=$7, comment=$8, speed=$9, config_json=$10, updated_at=NOW()`,
+               type=$3, mac_address=$4, mtu=$5, running=$6, disabled=$7, comment=$8, speed=$9,
+               vlan_filtering=$10, config_json=$11, updated_at=NOW()`,
             [
               this.device.id,
               name,
@@ -324,6 +374,7 @@ export class DeviceCollector {
               enrichedIface['disabled'] === 'true',
               enrichedIface['comment'] || null,
               enrichedIface['speed'] || null,
+              vlanFiltering,
               JSON.stringify(enrichedIface),
             ]
           );
@@ -372,56 +423,104 @@ export class DeviceCollector {
 
   async collectVlans(): Promise<void> {
     try {
-      // Bridge VLAN table (CRS switches / bridge-based switching)
-      const bridgeVlans = await this.client
-        .execute('/interface/bridge/vlan/print', { detail: '' })
-        .catch(() => []);
+      // Bridge VLAN table (CRS switches / bridge-based switching).
+      //
+      // Both fetches are tracked for success separately: a stale cache beats a
+      // wrongly-empty one, so pruning only happens when we know the device
+      // actually reported an authoritative list.
+      let bridgeVlans: Record<string, string>[] = [];
+      let bridgeVlansOk = true;
+      try {
+        bridgeVlans = await this.client.execute('/interface/bridge/vlan/print', { detail: '' });
+      } catch {
+        bridgeVlansOk = false;
+      }
 
-      for (const vlan of bridgeVlans) {
-        const vlanId = parseInt(vlan['vlan-ids'] || '0', 10);
-        if (!vlanId) continue;
+      const agg = aggregateBridgeVlans(bridgeVlans);
 
+      for (const v of agg) {
         await query(
-          `INSERT INTO vlans (device_id, vlan_id, name, bridge, tagged_ports, untagged_ports, config_json)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)
-           ON CONFLICT (device_id, vlan_id) DO UPDATE SET
-             name=$3, bridge=$4, tagged_ports=$5, untagged_ports=$6, config_json=$7`,
+          `INSERT INTO vlans (device_id, vlan_id, name, bridge, vlan_ids, tagged_ports, untagged_ports, config_json, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+           ON CONFLICT (device_id, bridge, vlan_id) DO UPDATE SET
+             name=$3, vlan_ids=$5, tagged_ports=$6, untagged_ports=$7, config_json=$8, updated_at=NOW()`,
           [
             this.device.id,
-            vlanId,
-            vlan['comment'] || `VLAN ${vlanId}`,
-            vlan['bridge'] || null,
-            this.parseList(vlan['tagged']),
-            this.parseList(vlan['untagged']),
-            JSON.stringify(vlan),
+            v.vlanId,
+            v.name || `VLAN ${v.vlanId}`,
+            v.bridge,
+            v.spec,
+            v.tagged,
+            v.untagged,
+            JSON.stringify(v.rows.length === 1 ? v.rows[0] : v.rows),
           ]
         );
       }
+      const seenVlans = agg.map((v) => ({ bridge: v.bridge, vlanId: v.vlanId }));
 
-      // Also collect bridge port PVIDs
-      const bridgePorts = await this.client
-        .execute('/interface/bridge/port/print', { detail: '' })
-        .catch(() => []);
+      if (bridgeVlansOk) {
+        // Drop VLANs deleted on the device. Comparing composite keys needs two
+        // parallel arrays because Postgres has no tuple-array membership test.
+        await query(
+          `DELETE FROM vlans
+           WHERE device_id = $1
+             AND NOT (bridge || ':' || vlan_id::text = ANY($2::text[]))`,
+          [this.device.id, seenVlans.map((v) => `${v.bridge}:${v.vlanId}`)]
+        );
+      }
 
+      // Per-port membership, derived from the same VLAN table so the port editor
+      // can tell a trunk from an access port.
+      let bridgePorts: Record<string, string>[] = [];
+      let bridgePortsOk = true;
+      try {
+        bridgePorts = await this.client.execute('/interface/bridge/port/print', { detail: '' });
+      } catch {
+        bridgePortsOk = false;
+      }
+
+      const membership = portVlanMembership(bridgeVlans);
+
+      const seenPorts: string[] = [];
       for (const port of bridgePorts) {
         const pvid = parseInt(port['pvid'] || '1', 10);
         const bridge = port['bridge'] || '';
         const portName = port['interface'] || '';
         if (!portName || !bridge) continue;
+        seenPorts.push(`${bridge}:${portName}`);
+
+        const m = membership.get(portName) ?? { tagged: [], untagged: [] };
+        const taggedIds = m.tagged.map(String);
+        const untaggedIds = m.untagged.map(String);
+        const allIds = [...new Set([...m.tagged, ...m.untagged])].sort((a, b) => a - b).map(String);
 
         await query(
-          `INSERT INTO bridge_vlan_entries (device_id, bridge, port, pvid, tagged, config_json, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,NOW())
+          `INSERT INTO bridge_vlan_entries
+             (device_id, bridge, port, pvid, tagged, vlan_ids, tagged_vlan_ids, untagged_vlan_ids, config_json, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
            ON CONFLICT (device_id, bridge, port) DO UPDATE SET
-             pvid=$4, tagged=$5, config_json=$6, updated_at=NOW()`,
+             pvid=$4, tagged=$5, vlan_ids=$6, tagged_vlan_ids=$7, untagged_vlan_ids=$8,
+             config_json=$9, updated_at=NOW()`,
           [
             this.device.id,
             bridge,
             portName,
             pvid,
-            false,
+            taggedIds.length > 0,
+            allIds,
+            taggedIds,
+            untaggedIds,
             JSON.stringify(port),
           ]
+        );
+      }
+
+      if (bridgePortsOk) {
+        await query(
+          `DELETE FROM bridge_vlan_entries
+           WHERE device_id = $1
+             AND NOT (bridge || ':' || port = ANY($2::text[]))`,
+          [this.device.id, seenPorts]
         );
       }
     } catch (err) {
@@ -1262,6 +1361,272 @@ export class DeviceCollector {
     );
   }
 
+  // ─── CAPsMAN ──────────────────────────────────────────────────────────────
+  /**
+   * Split this device's physical radios into ones we may configure locally and ones
+   * a CAPsMAN controller owns.
+   *
+   * Writing to a provisioned radio does not reliably take effect: the change is
+   * either rejected or silently replaced the next time the controller provisions the
+   * CAP, while the API reports success. Callers use this to skip those radios and
+   * say so rather than claim a change that will not survive.
+   */
+  async partitionRadios(): Promise<{ local: Record<string, string>[]; capsmanOwned: string[] }> {
+    const pkg = await this.detectWifiPackage();
+    if (pkg === 'none') return { local: [], capsmanOwned: [] };
+
+    const raw = pkg === 'wifi'
+      ? await this.client.execute('/interface/wifi/print', { detail: '' }).catch(() => [] as Record<string, string>[])
+      : await this.client.execute('/interface/wireless/print', { detail: '' }).catch(() => [] as Record<string, string>[]);
+
+    const physicals = raw.filter((r) => !r['master-interface'] && r['name']);
+    if (pkg !== 'wifi') return { local: physicals, capsmanOwned: [] };
+
+    const role = await this.detectWifiRole();
+    const owned = physicals.filter((r) => isCapsmanManaged(r, role));
+    return {
+      local: physicals.filter((r) => !isCapsmanManaged(r, role)),
+      capsmanOwned: owned.map((r) => r['name']).filter(Boolean),
+    };
+  }
+
+  /**
+   * Refuse a local edit to an interface a controller owns.
+   *
+   * RouterOS will not let a provisioned interface be changed or removed locally, and
+   * where it appears to accept one the controller undoes it. Failing here with an
+   * explanation beats reporting success for a change that never happened — which is
+   * what the delete path did, removing the cached row while the interface stayed.
+   */
+  async assertNotCapsmanManaged(interfaceName: string): Promise<void> {
+    const pkg = await this.detectWifiPackage();
+    if (pkg !== 'wifi') return;
+    const role = await this.detectWifiRole();
+    if (role !== 'cap' && role !== 'controller_cap') return;
+
+    const rows = await this.client.execute('/interface/wifi/print', { detail: '' })
+      .catch(() => [] as Record<string, string>[]);
+    const row = rows.find((r) => r['name'] === interfaceName);
+    if (!row || !isCapsmanManaged(row, role)) return;
+
+    const status = parseCapsmanStatus(row);
+    throw new Error(
+      `${interfaceName} is provisioned by CAPsMAN`
+      + (status?.controllerMac ? ` from controller ${status.controllerMac}` : '')
+      + `, so it cannot be changed on this device. Edit it in the controller's configuration `
+      + `instead — a local change would be discarded the next time the CAP is provisioned.`
+    );
+  }
+
+
+
+  private wifiRoleCache: WifiRole | null = null;
+
+  /**
+   * Is this device a CAPsMAN controller, a CAP, both, or neither?
+   *
+   * Read from the two feature toggles rather than inferred from missing data — an
+   * AP whose SSID is blank because the controller owns it looks identical to one
+   * that is simply unconfigured, and only this tells them apart.
+   */
+  async detectWifiRole(): Promise<WifiRole> {
+    if (this.wifiRoleCache !== null) return this.wifiRoleCache;
+    const pkg = await this.detectWifiPackage();
+    if (pkg !== 'wifi') {
+      // Legacy /caps-man is a separate API tree and is not covered yet; treat the
+      // old wireless package as standalone rather than guessing.
+      this.wifiRoleCache = pkg === 'none' ? 'none' : 'standalone';
+      return this.wifiRoleCache;
+    }
+
+    const [capsman, cap, ifaces] = await Promise.all([
+      this.client.execute('/interface/wifi/capsman/print').catch(() => null),
+      this.client.execute('/interface/wifi/cap/print').catch(() => null),
+      this.client.execute('/interface/wifi/print').catch(() => [] as Record<string, string>[]),
+    ]);
+    this.wifiRoleCache = classifyWifiRole(capsman, cap, ifaces.length > 0);
+    return this.wifiRoleCache;
+  }
+
+  /**
+   * Controller-side inventory: the radios it manages, the named configurations, and
+   * the provisioning rules binding them together.
+   *
+   * Remote radios are attributed to managed devices by MAC. That is a hardware
+   * identity and therefore globally unique, so unlike an address it cannot mean two
+   * different devices in two different segments — the failure that made topology
+   * unreliable before v0.20.1.
+   */
+  async collectCapsman(): Promise<void> {
+    try {
+      const role = await this.detectWifiRole();
+      if (role !== 'controller' && role !== 'controller_cap') {
+        // Not a controller: clear any inventory left from when it was one.
+        await query(`DELETE FROM capsman_radios WHERE controller_device_id = $1`, [this.device.id]);
+        await query(`DELETE FROM capsman_configurations WHERE controller_device_id = $1`, [this.device.id]);
+        await query(`DELETE FROM capsman_provisioning WHERE controller_device_id = $1`, [this.device.id]);
+        return;
+      }
+
+      const [radioRows, configRows, provRows, ifaceRows, regRows] = await Promise.all([
+        this.client.execute('/interface/wifi/radio/print').catch(() => null),
+        this.client.execute('/interface/wifi/configuration/print', { detail: '' }).catch(() => null),
+        this.client.execute('/interface/wifi/provisioning/print', { detail: '' }).catch(() => null),
+        // `detail` is required: master-interface, which links a virtual AP to its
+        // radio, is absent from the plain listing.
+        this.client.execute('/interface/wifi/print', { detail: '' }).catch(() => [] as Record<string, string>[]),
+        this.client.execute('/interface/wifi/registration-table/print').catch(() => [] as Record<string, string>[]),
+      ]);
+
+      // Clients register on the virtual AP, not the physical radio, so monitor's
+      // registered-peers reads zero on a busy access point. Count from the
+      // registration table and attribute each entry to its owning radio instead.
+      const clientCounts = clientsPerRadio(ifaceRows, regRows);
+
+      // Fleet-wide MAC → device index, including a five-octet prefix key because a
+      // radio MAC often differs from the interface MAC in the final octet only.
+      const macRows = await query<{ device_id: number; mac_address: string }>(
+        `SELECT device_id, mac_address FROM interfaces WHERE mac_address IS NOT NULL
+         UNION
+         SELECT device_id, mac_address FROM wireless_interfaces WHERE mac_address IS NOT NULL`
+      ).catch(() => []);
+      const macIndex = buildMacIndex(macRows);
+
+      if (radioRows !== null) {
+        const radios = normalizeRadios(radioRows);
+
+        // `current-channels` from /interface/wifi/radio lists every channel the
+        // radio *supports* — kilobytes of text on a multi-band radio — not the one
+        // it is on. Monitor reports the operating channel, and it carries the peer
+        // counts too, which under CAPsMAN only the controller knows: the CAP's own
+        // registration table is empty when traffic is processed centrally.
+        const live = new Map<string, ReturnType<typeof parseRadioMonitor>>();
+        await Promise.all(radios.map(async (radio) => {
+          const iface = radio.interfaceName;
+          if (!iface) return;
+          const mon = await this.client
+            .execute('/interface/wifi/monitor', { '.id': iface, once: '' })
+            .catch(() => [] as Record<string, string>[]);
+          live.set(iface, parseRadioMonitor(mon[0]));
+        }));
+
+        // The controller mirrors each CAP interface locally, which is also where the
+        // provisioned SSID is visible — the CAP's own row has none.
+        const ssidByRadioMac = new Map<string, string>();
+        for (const iface of ifaceRows) {
+          const mac = (iface['radio-mac'] || '').toUpperCase();
+          const ssid = iface['configuration.ssid'] || iface['ssid'];
+          if (mac && ssid && !ssidByRadioMac.has(mac)) ssidByRadioMac.set(mac, ssid);
+        }
+
+        const attributed = new Map(
+          matchRadiosToDevices(radios, macIndex, this.device.id)
+            .map((m) => [m.radio.radioMac ?? '', m.deviceId])
+        );
+
+        const seen: string[] = [];
+        for (const radio of radios) {
+          if (!radio.radioMac) continue;
+          seen.push(radio.radioMac);
+          const capInfo = parseCapStatus(radio.raw);
+          const st = radio.interfaceName ? live.get(radio.interfaceName) : undefined;
+          const matched = attributed.get(radio.radioMac) ?? null;
+
+          await query(
+            `INSERT INTO capsman_radios
+               (controller_device_id, radio_mac, interface_name, local, hw_type,
+                current_channel, remote_cap_name, matched_device_id, config_json,
+                state, registered_peers, authorized_peers, tx_power, ssid, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+             ON CONFLICT (controller_device_id, radio_mac) DO UPDATE SET
+               interface_name=$3, local=$4, hw_type=$5, current_channel=$6,
+               remote_cap_name=$7, matched_device_id=$8, config_json=$9,
+               state=$10, registered_peers=$11, authorized_peers=$12, tx_power=$13,
+               ssid=$14, updated_at=NOW()`,
+            [
+              this.device.id, radio.radioMac, radio.interfaceName, radio.local,
+              radio.hwType, st?.channel ?? null,
+              capInfo?.capMac ?? radio.raw['name'] ?? null,
+              matched, JSON.stringify(radio.raw),
+              st?.state ?? null,
+              clientCounts.get(radio.radioMac) ?? st?.registeredPeers ?? null,
+              st?.authorizedPeers ?? null, st?.txPower ?? null,
+              ssidByRadioMac.get(radio.radioMac) ?? null,
+            ]
+          );
+        }
+        await query(
+          `DELETE FROM capsman_radios WHERE controller_device_id = $1 AND NOT (radio_mac = ANY($2::text[]))`,
+          [this.device.id, seen]
+        );
+      }
+
+      if (configRows !== null) {
+        const seen: string[] = [];
+        for (const cfg of configRows) {
+          const name = cfg['name'];
+          if (!name) continue;
+          seen.push(name);
+          await query(
+            `INSERT INTO capsman_configurations
+               (controller_device_id, name, ssid, mode, band, security, authentication_types, config_json, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+             ON CONFLICT (controller_device_id, name) DO UPDATE SET
+               ssid=$3, mode=$4, band=$5, security=$6, authentication_types=$7,
+               config_json=$8, updated_at=NOW()`,
+            [
+              this.device.id, name,
+              cfg['ssid'] ?? null,
+              cfg['mode'] ?? null,
+              cfg['channel.band'] ?? cfg['band'] ?? null,
+              cfg['security'] ?? null,
+              cfg['security.authentication-types'] ?? null,
+              JSON.stringify(cfg),
+            ]
+          );
+        }
+        await query(
+          `DELETE FROM capsman_configurations WHERE controller_device_id = $1 AND NOT (name = ANY($2::text[]))`,
+          [this.device.id, seen]
+        );
+      }
+
+      if (provRows !== null) {
+        const seen: string[] = [];
+        for (const prov of provRows) {
+          const rosId = prov['.id'];
+          if (!rosId) continue;
+          seen.push(rosId);
+          await query(
+            `INSERT INTO capsman_provisioning
+               (controller_device_id, ros_id, action, master_configuration, slave_configurations,
+                radio_mac, comment, disabled, config_json, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+             ON CONFLICT (controller_device_id, ros_id) DO UPDATE SET
+               action=$3, master_configuration=$4, slave_configurations=$5, radio_mac=$6,
+               comment=$7, disabled=$8, config_json=$9, updated_at=NOW()`,
+            [
+              this.device.id, rosId,
+              prov['action'] ?? null,
+              prov['master-configuration'] ?? null,
+              prov['slave-configurations'] ?? null,
+              (prov['radio-mac'] || '').toUpperCase() || null,
+              prov['comment'] ?? null,
+              prov['disabled'] === 'true',
+              JSON.stringify(prov),
+            ]
+          );
+        }
+        await query(
+          `DELETE FROM capsman_provisioning WHERE controller_device_id = $1 AND NOT (ros_id = ANY($2::text[]))`,
+          [this.device.id, seen]
+        );
+      }
+    } catch (err) {
+      console.error(`[${this.device.name}] Failed to collect CAPsMAN data:`, (err as Error).message);
+    }
+  }
+
   // ─── Wifi package detection ───────────────────────────────────────────────
 
   private wifiPackageCache: 'wifi' | 'wireless' | 'none' | null = null;
@@ -1309,6 +1674,16 @@ export class DeviceCollector {
       const pkg = await this.detectWifiPackage();
       if (pkg === 'none') return;
 
+      // Recorded per device so the UI can explain a blank SSID as delegation to a
+      // controller rather than leaving it looking like an unconfigured radio.
+      const role = await this.detectWifiRole();
+      // The package is recorded alongside the role because TX-retry data only
+      // exists on the legacy 'wireless' driver, and a panel that can never have
+      // data on this fleet should not occupy space (issue #96).
+      await query(`UPDATE devices SET wifi_role = $2, wifi_package = $3 WHERE id = $1`,
+                  [this.device.id, role, pkg])
+        .catch(() => { /* advisory; never fail collection over it */ });
+
       // null = the fetch itself failed. Distinguished from an empty list (device
       // genuinely has no wireless interfaces) so a transient API error can never
       // be mistaken for "everything was deleted" during the prune below.
@@ -1340,32 +1715,46 @@ export class DeviceCollector {
       for (const wlan of wlans) {
         const name = wlan['name'];
         if (!name) continue;
+        // A CAP holds no local configuration for provisioned interfaces, so the
+        // status line is the only place an SSID or channel appears. Fall back to it
+        // rather than storing nulls that render as an empty, broken-looking AP.
+        const capsmanStatus = parseCapsmanStatus(wlan);
+        const managed = isCapsmanManaged(wlan, role);
         const master = wlan['master-interface'];
         const liveF = liveFreq[name] ?? (master ? liveFreq[master] : undefined);
         const liveW = liveWidth[name] ?? (master ? liveWidth[master] : undefined);
         const freq  = liveF ?? parseInt(wlan['frequency'] || '0', 10);
         const txPow = parseInt(wlan['tx-power'] || '0', 10);
         const gain  = parseInt(wlan['antenna-gain'] || '0', 10);
-        const bandStr = wlan['band'] || (liveF ? bandPrefix(liveF) : null);
+        // "channel: 5280/ax/eCee" — frequency first, then the PHY mode.
+        const statusFreq = parseInt((capsmanStatus?.channel ?? '').split('/')[0] || '', 10);
+        const effFreq = !isNaN(freq) && freq > 0
+          ? freq
+          : (!isNaN(statusFreq) && statusFreq > 0 ? statusFreq : freq);
+        const bandStr = wlan['band']
+          || (liveF ? bandPrefix(liveF) : null)
+          || (!isNaN(statusFreq) && statusFreq > 0 ? bandPrefix(statusFreq) : null);
         const widthStr = wlan['channel-width'] || liveW || null;
 
         await query(
           `INSERT INTO wireless_interfaces
             (device_id, name, ssid, mode, band, frequency, channel_width, tx_power,
              tx_power_mode, antenna_gain, country, installation, disabled, running,
-             mac_address, security_profile, config_json, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
+             mac_address, security_profile, config_json, managed_by_capsman, radio_mac,
+             capsman_controller_mac, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
            ON CONFLICT (device_id, name) DO UPDATE SET
              ssid=$3, mode=$4, band=$5, frequency=$6, channel_width=$7, tx_power=$8,
              tx_power_mode=$9, antenna_gain=$10, country=$11, installation=$12,
              disabled=$13, running=$14, mac_address=$15, security_profile=$16,
-             config_json=$17, updated_at=NOW()`,
+             config_json=$17, managed_by_capsman=$18, radio_mac=$19,
+             capsman_controller_mac=$20, updated_at=NOW()`,
           [
             this.device.id, name,
-            wlan['ssid'] || null,
-            wlan['mode'] || null,
+            wlan['ssid'] || capsmanStatus?.ssid || null,
+            wlan['mode'] || capsmanStatus?.mode || null,
             bandStr || null,
-            !isNaN(freq) && freq > 0 ? freq : null,
+            !isNaN(effFreq) && effFreq > 0 ? effFreq : null,
             widthStr,
             !isNaN(txPow) && txPow > 0 ? txPow : null,
             wlan['tx-power-mode'] || null,
@@ -1377,6 +1766,9 @@ export class DeviceCollector {
             wlan['mac-address'] || null,
             wlan['security-profile'] || null,
             JSON.stringify(wlan),
+            managed,
+            (wlan['radio-mac'] || '').toUpperCase() || null,
+            capsmanStatus?.controllerMac ?? null,
           ]
         );
       }
@@ -1674,22 +2066,55 @@ export class DeviceCollector {
     const pkg = await this.detectWifiPackage();
     if (pkg === 'none') return [];
 
-    const [rawIfaces, bridgePorts] = await Promise.all([
+    const [rawIfaces, bridgePorts, datapaths] = await Promise.all([
       pkg === 'wifi'
         ? this.client.execute('/interface/wifi/print').catch(() => [] as Record<string, string>[])
         : this.client.execute('/interface/wireless/print', { detail: '' }).catch(() => [] as Record<string, string>[]),
       this.getBridgePorts(),
+      pkg === 'wifi'
+        ? this.client.execute('/interface/wifi/datapath/print', { detail: '' }).catch(() => [] as Record<string, string>[])
+        : Promise.resolve([] as Record<string, string>[]),
     ]);
 
-    const ifaces = pkg === 'wifi'
+    const rawNormalized = pkg === 'wifi'
       ? rawIfaces.map(r => this.normalizeWifiInterface(r))
       : rawIfaces;
 
+    // This endpoint reads the device live rather than the cache, so the CAPsMAN
+    // annotation has to be applied here too — otherwise the Radios tab shows blank
+    // fields with no indication that a controller owns them.
+    const role = await this.detectWifiRole();
+    const ifaces = rawNormalized.map((iface, i) => {
+      const status = parseCapsmanStatus(rawIfaces[i] ?? iface);
+      const managed = isCapsmanManaged(rawIfaces[i] ?? iface, role);
+      if (!managed && !status) return iface;
+      return {
+        ...iface,
+        managed_by_capsman: 'true',
+        ...(status?.controllerMac ? { capsman_controller_mac: status.controllerMac } : {}),
+        ...(status?.ssid && !iface['ssid'] ? { ssid: status.ssid } : {}),
+        ...(status?.mode && !iface['mode'] ? { mode: status.mode } : {}),
+        ...(status?.channel ? { capsman_channel: status.channel } : {}),
+      };
+    });
+
     // Enrich each interface with its bridge port membership (if any)
     const portByIface = new Map(bridgePorts.map(p => [p['interface'], p]));
-    return ifaces.map(iface => {
+    return ifaces.map((iface, i) => {
       const port = portByIface.get(iface['name']);
-      if (!port) return iface;
+      if (!port) {
+        // A CAPsMAN-provisioned interface is not a local bridge port, so the port
+        // table has nothing for it and the UI would claim it has no network at all.
+        // The bridge and VLAN it actually lands on come from the datapath.
+        const dp = resolveDatapath(rawIfaces[i] ?? iface, datapaths);
+        if (!dp.bridge && !dp.vlanId) return iface;
+        return {
+          ...iface,
+          ...(dp.bridge ? { bridge: dp.bridge } : {}),
+          ...(dp.vlanId ? { 'bridge-pvid': dp.vlanId } : {}),
+          network_source: 'capsman-datapath',
+        };
+      }
       return {
         ...iface,
         bridge:           port['bridge'] || '',
@@ -2091,10 +2516,27 @@ export class DeviceCollector {
       const pkg = await this.detectWifiPackage();
       if (pkg === 'none') throw new Error('No wireless package detected on this device — cannot create a guest SSID');
       const raw = pkg === 'wifi'
-        ? await this.client.execute('/interface/wifi/print').catch(() => [] as Record<string, string>[])
-        : await this.client.execute('/interface/wireless/print').catch(() => [] as Record<string, string>[]);
-      const physicals = raw.filter(r => !r['master-interface'] && r['name']);
-      if (physicals.length === 0) throw new Error('No physical radios found to attach the guest SSID to');
+        ? await this.client.execute('/interface/wifi/print', { detail: '' }).catch(() => [] as Record<string, string>[])
+        : await this.client.execute('/interface/wireless/print', { detail: '' }).catch(() => [] as Record<string, string>[]);
+
+      const { local: physicals, capsmanOwned } = await this.partitionRadios();
+      if (physicals.length === 0 && capsmanOwned.length === 0) {
+        throw new Error('No physical radios found to attach the guest SSID to');
+      }
+      if (capsmanOwned.length > 0) {
+        const names = capsmanOwned.join(', ');
+        if (physicals.length === 0) {
+          throw new Error(
+            `Every radio on this device (${names}) is provisioned by CAPsMAN, so a guest SSID `
+            + `created here would be overwritten by the controller. Create the guest network on the `
+            + `CAPsMAN controller instead, so it is provisioned to the access points.`
+          );
+        }
+        warnings.push(
+          `Skipped ${names}: provisioned by CAPsMAN, so a locally created SSID would be `
+          + `overwritten by the controller. Add it to the controller's configuration instead.`
+        );
+      }
 
       const existingBySsid = raw.filter(r =>
         (r['ssid'] || r['configuration.ssid'] || '') === ssid.ssid && r['master-interface']);
@@ -2408,6 +2850,204 @@ export class DeviceCollector {
     }
   }
 
+  // ─── LTE / cellular → Postgres + InfluxDB ─────────────────────────────────
+
+  /**
+   * Collect cellular state from every LTE interface on the device.
+   *
+   * Called on the fast poll (for the signal series) and on the slow poll, where
+   * it also refreshes `devices.has_lte`. The device is only contacted when the
+   * interface table already shows an LTE interface, so the overwhelming majority
+   * of a wired fleet costs one local query and no API call at all.
+   *
+   * Field handling is deliberately forgiving. What a modem reports depends on
+   * its chipset rather than on RouterOS, so a missing value is an ordinary state
+   * and never a reason to abandon the rest of the row.
+   */
+  async collectLte(): Promise<void> {
+    try {
+      const lteInterfaces = await query<{ name: string }>(
+        `SELECT name FROM interfaces WHERE device_id = $1 AND type = 'lte'`,
+        [this.device.id],
+      );
+
+      if (lteInterfaces.length === 0) {
+        // Clear the flag if a modem was removed, so the fast poll stops looking.
+        if ((this.device as unknown as { has_lte?: boolean }).has_lte) {
+          await query(`UPDATE devices SET has_lte = FALSE WHERE id = $1`, [this.device.id]);
+          (this.device as unknown as { has_lte?: boolean }).has_lte = false;
+        }
+        return;
+      }
+
+      if (!(this.device as unknown as { has_lte?: boolean }).has_lte) {
+        await query(`UPDATE devices SET has_lte = TRUE WHERE id = $1`, [this.device.id]);
+        (this.device as unknown as { has_lte?: boolean }).has_lte = true;
+      }
+
+      const configs = await this.client
+        .execute('/interface/lte/print', { detail: '' })
+        .catch(() => [] as Record<string, string>[]);
+      const configByName = new Map(configs.filter(c => c['name']).map(c => [c['name'], c]));
+
+      const writeApi = getWriteApi();
+
+      for (const { name } of lteInterfaces) {
+        // `monitor` addresses the interface by name and must be told not to stream.
+        const rows = await this.client
+          .execute('/interface/lte/monitor', { numbers: name, once: '' })
+          .catch(() => [] as Record<string, string>[]);
+        if (rows.length === 0) continue;
+
+        const status = parseLteMonitor(rows[0]);
+        const config = configByName.get(name) || {};
+        const quality = overallQuality(status);
+
+        const previous = await this.previousLteStatus(name);
+        await this.recordLteChanges(name, previous, status);
+
+        await query(
+          `INSERT INTO lte_interfaces (
+             device_id, interface_name, status, data_class, modem_model, modem_revision,
+             operator, cell_id, enb_id, sector_id, phy_cell_id, session_uptime_s,
+             primary_band, ca_bands, rssi, rsrp, rsrq, sinr, cqi, rank_indicator, mcs,
+             dl_modulation, quality, allowed_bands, network_mode, apn_profiles,
+             allow_roaming, config_json, updated_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+                     $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,NOW())
+           ON CONFLICT (device_id, interface_name) DO UPDATE SET
+             status = EXCLUDED.status, data_class = EXCLUDED.data_class,
+             modem_model = EXCLUDED.modem_model, modem_revision = EXCLUDED.modem_revision,
+             operator = EXCLUDED.operator, cell_id = EXCLUDED.cell_id,
+             enb_id = EXCLUDED.enb_id, sector_id = EXCLUDED.sector_id,
+             phy_cell_id = EXCLUDED.phy_cell_id, session_uptime_s = EXCLUDED.session_uptime_s,
+             primary_band = EXCLUDED.primary_band, ca_bands = EXCLUDED.ca_bands,
+             rssi = EXCLUDED.rssi, rsrp = EXCLUDED.rsrp, rsrq = EXCLUDED.rsrq,
+             sinr = EXCLUDED.sinr, cqi = EXCLUDED.cqi,
+             rank_indicator = EXCLUDED.rank_indicator, mcs = EXCLUDED.mcs,
+             dl_modulation = EXCLUDED.dl_modulation, quality = EXCLUDED.quality,
+             allowed_bands = EXCLUDED.allowed_bands, network_mode = EXCLUDED.network_mode,
+             apn_profiles = EXCLUDED.apn_profiles, allow_roaming = EXCLUDED.allow_roaming,
+             config_json = EXCLUDED.config_json, updated_at = NOW()`,
+          [
+            this.device.id, name, status.status, status.dataClass, status.modemModel,
+            status.modemRevision, status.operator, status.cellId, status.enbId,
+            status.sectorId, status.phyCellId, status.sessionUptimeSeconds,
+            status.primaryBand ? JSON.stringify(status.primaryBand) : null,
+            JSON.stringify(status.caBands),
+            status.rssi, status.rsrp, status.rsrq, status.sinr, status.cqi,
+            status.ri, status.mcs, status.dlModulation, quality,
+            config['band'] || null, config['network-mode'] || null,
+            config['apn-profiles'] || null,
+            config['allow-roaming'] ? config['allow-roaming'] === 'yes' : null,
+            JSON.stringify({ ...rows[0], ...config }),
+          ],
+        );
+
+        await this.recordObservedBands(name, status);
+
+        // Signal series. Fields are written only when the modem reported them —
+        // a zero here would read as a signal no transmitter produces.
+        const point = new Point('lte_signal')
+          .tag('device_id', String(this.device.id))
+          .tag('device_name', this.device.name)
+          .tag('interface', name)
+          .tag('operator', status.operator || 'unknown')
+          .tag('band', status.primaryBand ? `B${status.primaryBand.band}` : 'unknown')
+          .timestamp(new Date());
+
+        let hasField = false;
+        const addField = (key: string, value: number | null, integer = false) => {
+          if (value == null) return;
+          if (integer) point.intField(key, Math.round(value));
+          else point.floatField(key, value);
+          hasField = true;
+        };
+        addField('rsrp', status.rsrp);
+        addField('rsrq', status.rsrq);
+        addField('sinr', status.sinr);
+        addField('rssi', status.rssi);
+        addField('cqi', status.cqi, true);
+        addField('rank', status.ri, true);
+        addField('mcs', status.mcs, true);
+        // Aggregated carriers, primary included — the shape of the link over time.
+        point.intField('carriers', status.caBands.length + (status.primaryBand ? 1 : 0));
+
+        if (hasField) writeApi.writePoint(point);
+      }
+    } catch (error) {
+      console.error(`LTE collection failed for ${this.device.name}:`, error);
+    }
+  }
+
+  /** Last stored state for an interface, for comparing consecutive polls. */
+  private async previousLteStatus(name: string): Promise<LteStatus | null> {
+    const row = await queryOne<{
+      cell_id: string | null; session_uptime_s: string | null;
+      primary_band: { band: number } | null; ca_bands: { band: number }[] | null;
+    }>(
+      `SELECT cell_id, session_uptime_s, primary_band, ca_bands
+         FROM lte_interfaces WHERE device_id = $1 AND interface_name = $2`,
+      [this.device.id, name],
+    );
+    if (!row) return null;
+
+    // Only the fields detectChanges compares need to be faithful here.
+    return {
+      status: null, dataClass: null, modemModel: null, modemRevision: null,
+      operator: null, cellId: row.cell_id, enbId: null, sectorId: null, phyCellId: null,
+      sessionUptimeSeconds: row.session_uptime_s == null ? null : Number(row.session_uptime_s),
+      primaryBand: row.primary_band
+        ? { band: row.primary_band.band, bandwidthMhz: null, earfcn: null, phyCellId: null, raw: '' }
+        : null,
+      caBands: (row.ca_bands || []).map(b => ({
+        band: b.band, bandwidthMhz: null, earfcn: null, phyCellId: null, raw: '',
+      })),
+      rssi: null, rsrp: null, rsrq: null, sinr: null,
+      cqi: null, ri: null, mcs: null, dlModulation: null,
+    };
+  }
+
+  /** Persist handovers, re-registrations and band changes seen between polls. */
+  private async recordLteChanges(
+    name: string, previous: LteStatus | null, next: LteStatus,
+  ): Promise<void> {
+    const bands = [next.primaryBand, ...next.caBands]
+      .filter(Boolean).map(b => b!.band).sort((a, b) => a - b).join(',');
+
+    for (const change of detectChanges(previous, next)) {
+      await query(
+        `INSERT INTO lte_cell_history
+           (device_id, interface_name, kind, detail, cell_id, enb_id, bands, rsrp, sinr)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [this.device.id, name, change.kind, change.detail,
+         next.cellId, next.enbId, bands || null, next.rsrp, next.sinr],
+      );
+    }
+  }
+
+  /**
+   * Remember which bands have actually served this device.
+   *
+   * This is the evidence a band lock is checked against later. Scanning is not a
+   * dependable alternative — it interrupts service and finds nothing at a site
+   * served by one base station — but a band already used here demonstrably works.
+   */
+  private async recordObservedBands(name: string, status: LteStatus): Promise<void> {
+    const bands = [...new Set(
+      [status.primaryBand, ...status.caBands].filter(Boolean).map(b => b!.band),
+    )];
+    for (const band of bands) {
+      await query(
+        `INSERT INTO lte_observed_bands (device_id, interface_name, band)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (device_id, interface_name, band) DO UPDATE SET
+           last_seen = NOW(), observations = lte_observed_bands.observations + 1`,
+        [this.device.id, name, band],
+      );
+    }
+  }
+
   // ─── Port VLAN config ─────────────────────────────────────────────────────
 
   async setPortVlanConfig(
@@ -2689,11 +3329,31 @@ export class DeviceCollector {
   }
 
   async removeBridgeVlan(bridge: string, vlanId: number): Promise<void> {
+    // Matching is done here rather than with a `?vlan-ids=` server-side filter:
+    // that filter compares the raw string, so it misses a row written as a range
+    // or list ("10-20") that nonetheless contains this VLAN — and missing it would
+    // fail silently, leaving the VLAN in place while reporting success.
     const entries = await this.client
-      .execute('/interface/bridge/vlan/print', {}, [`?bridge=${bridge}`, `?vlan-ids=${vlanId}`])
+      .execute('/interface/bridge/vlan/print', { detail: '' }, [`?bridge=${bridge}`])
       .catch(() => []);
-    for (const entry of entries) {
-      const id = (entry as Record<string, string>)['.id'];
+
+    const matches = (entries as Record<string, string>[]).filter((e) =>
+      expandVlanIds(e['vlan-ids']).includes(vlanId)
+    );
+
+    const multi = matches.find((e) => expandVlanIds(e['vlan-ids']).length > 1);
+    if (multi) {
+      throw new Error(
+        `VLAN ${vlanId} on ${bridge} is part of the multi-VLAN entry "${multi['vlan-ids']}". `
+        + `Removing it here would delete every VLAN in that entry, so it must be split on the device first.`
+      );
+    }
+
+    for (const entry of matches) {
+      // Dynamic rows cannot be removed; RouterOS rejects the attempt and the row
+      // reappears from the port PVID that created it.
+      if (entry['dynamic'] === 'true') continue;
+      const id = entry['.id'];
       if (id) await this.client.execute('/interface/bridge/vlan/remove', { numbers: id }).catch(() => {});
     }
   }
@@ -2773,7 +3433,8 @@ export class DeviceCollector {
         throw new Error(
           `Bond '${name}' was created, but adding it to bridge '${originalBridge}' failed: ` +
           `${(err as Error).message}. The member ports (${slaves.join(', ')}) are no longer bridged ` +
-          `and may not forward traffic — check the device.`
+          `and may not forward traffic — check the device.`,
+          { cause: err }
         );
       }
     }

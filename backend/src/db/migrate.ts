@@ -283,7 +283,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 CREATE TABLE IF NOT EXISTS alert_channels (
   id          SERIAL PRIMARY KEY,
   name        VARCHAR(100) NOT NULL,
-  type        VARCHAR(20)  NOT NULL CHECK (type IN ('email','slack','discord','telegram')),
+  type        VARCHAR(20)  NOT NULL CHECK (type IN ('email','slack','discord','telegram','ntfy')),
   enabled     BOOLEAN      NOT NULL DEFAULT true,
   config      JSONB        NOT NULL DEFAULT '{}',
   created_at  TIMESTAMPTZ  DEFAULT NOW(),
@@ -498,6 +498,197 @@ CREATE TABLE IF NOT EXISTS device_change_guards (
 CREATE INDEX IF NOT EXISTS idx_change_guards_device ON device_change_guards(device_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_change_guards_pending ON device_change_guards(status, expires_at);
 
+-- CAPsMAN support (github issue #94).
+--
+-- A CAPsMAN-managed AP holds none of its own wireless configuration, so reading
+-- /interface/wifi/print on it yields blank SSID/security/band. Recording the
+-- device's role, and marking which interfaces are provisioned rather than local,
+-- lets the UI say "managed by CAPsMAN" instead of showing an AP that looks broken.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS wifi_role VARCHAR(16);
+ALTER TABLE wireless_interfaces ADD COLUMN IF NOT EXISTS managed_by_capsman BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE wireless_interfaces ADD COLUMN IF NOT EXISTS radio_mac VARCHAR(17);
+ALTER TABLE wireless_interfaces ADD COLUMN IF NOT EXISTS capsman_controller_mac VARCHAR(17);
+
+-- Radios a controller manages, local and remote. matched_device_id is resolved by
+-- radio MAC against the fleet's interface MACs; it stays NULL for a CAP that is not
+-- itself a managed device, which is a legitimate state rather than an error.
+CREATE TABLE IF NOT EXISTS capsman_radios (
+  id                   SERIAL PRIMARY KEY,
+  controller_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  radio_mac            VARCHAR(17) NOT NULL,
+  interface_name       VARCHAR(64),
+  local                BOOLEAN NOT NULL DEFAULT FALSE,
+  hw_type              VARCHAR(64),
+  current_channel      TEXT,
+  remote_cap_name      VARCHAR(128),
+  matched_device_id    INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+  config_json          JSONB,
+  updated_at           TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(controller_device_id, radio_mac)
+);
+CREATE INDEX IF NOT EXISTS idx_capsman_radios_device ON capsman_radios(matched_device_id);
+
+-- Named configurations and the provisioning rules that bind them to radios. Both
+-- are read-only for now; editing them would push to every bound AP at once.
+CREATE TABLE IF NOT EXISTS capsman_configurations (
+  id                   SERIAL PRIMARY KEY,
+  controller_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  name                 VARCHAR(128) NOT NULL,
+  ssid                 VARCHAR(128),
+  mode                 VARCHAR(32),
+  band                 VARCHAR(64),
+  security             VARCHAR(128),
+  authentication_types VARCHAR(128),
+  config_json          JSONB,
+  updated_at           TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(controller_device_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS capsman_provisioning (
+  id                   SERIAL PRIMARY KEY,
+  controller_device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  ros_id               VARCHAR(32) NOT NULL,
+  action               VARCHAR(64),
+  master_configuration VARCHAR(128),
+  slave_configurations TEXT,
+  radio_mac            VARCHAR(17),
+  comment              TEXT,
+  disabled             BOOLEAN NOT NULL DEFAULT FALSE,
+  config_json          JSONB,
+  updated_at           TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(controller_device_id, ros_id)
+);
+
+-- CAPsMAN radio live state (issue #94 follow-up). current-channels from
+-- /interface/wifi/radio is the list of channels the radio *supports* — kilobytes of
+-- text — not the one it is operating on. The operating channel, link state, peer
+-- counts and TX power come from /interface/wifi/monitor instead.
+ALTER TABLE capsman_radios ADD COLUMN IF NOT EXISTS state VARCHAR(32);
+ALTER TABLE capsman_radios ADD COLUMN IF NOT EXISTS registered_peers INTEGER;
+ALTER TABLE capsman_radios ADD COLUMN IF NOT EXISTS authorized_peers INTEGER;
+ALTER TABLE capsman_radios ADD COLUMN IF NOT EXISTS tx_power INTEGER;
+-- Stored channel is now the operating channel; drop the capability lists already
+-- collected so no one is left looking at two kilobytes of text.
+UPDATE capsman_radios SET current_channel = NULL WHERE length(current_channel) > 64;
+
+-- A CAP holds no local configuration, so its interface rows carry no SSID. The
+-- controller does know it, on its own mirror of the CAP interface (#94).
+ALTER TABLE capsman_radios ADD COLUMN IF NOT EXISTS ssid VARCHAR(128);
+
+-- Security check suppressions (github issue #101).
+--
+-- A heuristic you disagree with and cannot dismiss discredits the whole posture
+-- score. Cleartext API is the example: on a fleet reachable only across WireGuard,
+-- TLS adds nothing to the threat model, and the warning is permanent noise.
+-- device_id NULL means fleet-wide; a row for a specific device silences it there
+-- only. Suppressed checks are still reported, marked and excluded from the score,
+-- so nothing becomes invisible.
+CREATE TABLE IF NOT EXISTS security_check_suppressions (
+  id          SERIAL PRIMARY KEY,
+  check_id    VARCHAR(64) NOT NULL,
+  device_id   INTEGER REFERENCES devices(id) ON DELETE CASCADE,
+  reason      TEXT,
+  created_by  VARCHAR(50),
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+-- Partial indexes because a UNIQUE constraint containing NULL does not dedupe.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_seccheck_supp_global
+  ON security_check_suppressions (check_id) WHERE device_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_seccheck_supp_device
+  ON security_check_suppressions (check_id, device_id) WHERE device_id IS NOT NULL;
+
+-- Which wireless stack a device runs: the RouterOS 7 'wifi' packages or the legacy
+-- 'wireless' one. Needed to answer a fleet-wide question — if nothing runs the
+-- legacy driver, the TX-retries panel can never have data and should not be shown
+-- (github issue #96).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS wifi_package VARCHAR(16);
+
+-- RouterBOOT as a follow-on step in a staged rollout (github issue #113).
+-- MikroTik's own guidance is to upgrade the bootloader after RouterOS, which until
+-- now meant visiting every device by hand — the exact task staged rollouts exist to
+-- remove.
+ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS routerboot_after BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Temporarily dismissed "Things to handle" items (github issue #102).
+--
+-- Insights are recomputed from live state on every request and have no natural id,
+-- so a dismissal is keyed on a fingerprint of what the item is about. Dismissals
+-- expire: the point is "not now", not "never" — an item that is genuinely handled
+-- stops being produced, and one that is not should come back and ask again.
+CREATE TABLE IF NOT EXISTS insight_dismissals (
+  fingerprint  VARCHAR(160) PRIMARY KEY,
+  category     VARCHAR(40),
+  title        TEXT,
+  dismissed_by VARCHAR(50),
+  dismissed_at TIMESTAMPTZ DEFAULT NOW(),
+  expires_at   TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_insight_dismissals_expiry ON insight_dismissals(expires_at);
+
+-- ntfy.sh notification channel (github issue #93). The channel type is a CHECK
+-- constraint rather than a lookup table, so widening it means replacing it.
+ALTER TABLE alert_channels DROP CONSTRAINT IF EXISTS alert_channels_type_check;
+ALTER TABLE alert_channels ADD CONSTRAINT alert_channels_type_check
+  CHECK (type IN ('email','slack','discord','telegram','ntfy'));
+
+-- Change Guard ledger: committed_at used to be stamped for every terminal status,
+-- so an abandoned or failed guard read as though the change had been kept. It now
+-- means what it says, and resolved_at records when the guard finished either way.
+ALTER TABLE device_change_guards ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+UPDATE device_change_guards
+   SET resolved_at = COALESCE(resolved_at, committed_at)
+ WHERE status <> 'pending' AND resolved_at IS NULL;
+UPDATE device_change_guards SET committed_at = NULL WHERE status <> 'committed';
+
+-- VLAN cache correctness.
+--
+-- The original key, UNIQUE(device_id, vlan_id), assumed a VID is unique per device.
+-- It is not: RouterOS keys the bridge VLAN table on (bridge, vlan-ids), so the same
+-- VID on two bridges collapsed onto one row and each poll overwrote the other. The
+-- collector also stored only the first VID of a spec like "10-20"; it now expands
+-- ranges into one row per VID and records the spec it came from in vlan_ids.
+ALTER TABLE vlans ADD COLUMN IF NOT EXISTS vlan_ids TEXT;
+ALTER TABLE vlans ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+UPDATE vlans SET bridge = '' WHERE bridge IS NULL;
+ALTER TABLE vlans ALTER COLUMN bridge SET DEFAULT '';
+ALTER TABLE vlans ALTER COLUMN bridge SET NOT NULL;
+ALTER TABLE vlans DROP CONSTRAINT IF EXISTS vlans_device_id_vlan_id_key;
+-- Collapse rows the old key could not distinguish, keeping the most recent.
+DELETE FROM vlans a USING vlans b
+  WHERE a.id < b.id AND a.device_id = b.device_id AND a.bridge = b.bridge AND a.vlan_id = b.vlan_id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vlans_device_bridge_vid ON vlans (device_id, bridge, vlan_id);
+
+-- Per-port VLAN membership. vlan_ids was declared but never written and tagged
+-- was hardcoded false, which left the port editor unable to tell a trunk from an
+-- access port. Both are now derived from the bridge VLAN table.
+ALTER TABLE bridge_vlan_entries ADD COLUMN IF NOT EXISTS tagged_vlan_ids TEXT[];
+ALTER TABLE bridge_vlan_entries ADD COLUMN IF NOT EXISTS untagged_vlan_ids TEXT[];
+
+-- Bridge VLAN filtering lived only inside interfaces.config_json, so nothing could
+-- query for it. Null for non-bridge interfaces.
+ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS vlan_filtering BOOLEAN;
+
+-- Config Health: standing audit findings, one row per (device, distinct problem).
+-- Rows are refreshed in place so first_seen shows how long a problem has existed,
+-- and findings absent from the latest scan are pruned.
+CREATE TABLE IF NOT EXISTS device_config_findings (
+  id           SERIAL PRIMARY KEY,
+  device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  rule         VARCHAR(64)  NOT NULL,
+  fingerprint  VARCHAR(160) NOT NULL,
+  severity     VARCHAR(16)  NOT NULL,
+  title        TEXT         NOT NULL,
+  detail       TEXT         NOT NULL,
+  remediation  TEXT,
+  doc_url      TEXT,
+  objects      TEXT[]       NOT NULL DEFAULT '{}',
+  first_seen   TIMESTAMPTZ  DEFAULT NOW(),
+  last_seen    TIMESTAMPTZ  DEFAULT NOW(),
+  UNIQUE(device_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_config_findings_device ON device_config_findings(device_id, severity);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS config_health_checked_at TIMESTAMPTZ;
+
 -- Wireless security profiles (WPA/WPA2/WPA3 config)
 CREATE TABLE IF NOT EXISTS wireless_security_profiles (
   id                    SERIAL PRIMARY KEY,
@@ -512,6 +703,115 @@ CREATE TABLE IF NOT EXISTS wireless_security_profiles (
   updated_at            TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(device_id, name)
 );
+
+-- LTE / cellular support (discussion #85).
+--
+-- has_lte is set during interface collection rather than inferred from
+-- device_type: a cellular modem turns up on routers, CPE and travel gear alike,
+-- and probing every device on every fast poll to find out costs more than
+-- remembering the answer.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS has_lte BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Latest state of each LTE interface. One row per interface, overwritten on each
+-- poll; the time series lives in InfluxDB and the movement history below.
+--
+-- Almost every column is nullable on purpose. What an LTE interface reports
+-- depends on the modem chipset rather than on RouterOS — the Quectel EG18-EA
+-- this was built against reports no registration-status, no pin-status and no
+-- tracking area, while others do — so absence is a normal state, not an error.
+CREATE TABLE IF NOT EXISTS lte_interfaces (
+  id                 SERIAL PRIMARY KEY,
+  device_id          INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  interface_name     VARCHAR(64) NOT NULL,
+  status             VARCHAR(32),
+  data_class         VARCHAR(32),
+  modem_model        VARCHAR(64),
+  modem_revision     VARCHAR(64),
+  operator           VARCHAR(64),
+  cell_id            VARCHAR(32),
+  enb_id             VARCHAR(32),
+  sector_id          VARCHAR(32),
+  phy_cell_id        VARCHAR(32),
+  session_uptime_s   BIGINT,
+  primary_band       JSONB,
+  ca_bands           JSONB NOT NULL DEFAULT '[]'::jsonb,
+  rssi               REAL,
+  rsrp               REAL,
+  rsrq               REAL,
+  sinr               REAL,
+  cqi                INTEGER,
+  rank_indicator     INTEGER,
+  mcs                INTEGER,
+  dl_modulation      VARCHAR(32),
+  quality            VARCHAR(16),
+  -- Configured allow-list from /interface/lte, e.g. "1,3,7". Empty means auto.
+  allowed_bands      VARCHAR(128),
+  network_mode       VARCHAR(64),
+  apn_profiles       VARCHAR(128),
+  allow_roaming      BOOLEAN,
+  config_json        JSONB,
+  updated_at         TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(device_id, interface_name)
+);
+
+-- Tower and band movement, reconstructed by comparing consecutive polls.
+--
+-- Scanning costs service to run and finds nothing at a site served by a single
+-- base station, and the modem may log nothing at all, so polling is the only
+-- vantage point that always exists. session-uptime
+-- running backwards means the modem re-registered; a changed cell id means it
+-- handed over. Neither can be recovered after the fact, so it is recorded live.
+CREATE TABLE IF NOT EXISTS lte_cell_history (
+  id             SERIAL PRIMARY KEY,
+  device_id      INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  interface_name VARCHAR(64) NOT NULL,
+  at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  kind           VARCHAR(24) NOT NULL,
+  detail         TEXT,
+  cell_id        VARCHAR(32),
+  enb_id         VARCHAR(32),
+  bands          VARCHAR(64),
+  rsrp           REAL,
+  sinr           REAL
+);
+CREATE INDEX IF NOT EXISTS idx_lte_cell_history_device
+  ON lte_cell_history(device_id, at DESC);
+
+-- Bands actually observed serving a device, which is what makes it possible to
+-- warn before a band lock. Scanning cannot answer "is this band available here?"
+-- dependably: it interrupts service, and comes back empty at exactly the remote
+-- sites that most need the warning. A band the modem has already used at this
+-- location demonstrably works there, and locking to one never once seen is how a
+-- device on a mast is lost.
+CREATE TABLE IF NOT EXISTS lte_observed_bands (
+  device_id      INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  interface_name VARCHAR(64) NOT NULL,
+  band           INTEGER NOT NULL,
+  first_seen     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  observations   INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (device_id, interface_name, band)
+);
+
+-- Per-device polling telemetry (#114).
+--
+-- last_attempt_at and last_success_at are deliberately separate columns rather
+-- than one "last polled" field. Their difference is the only thing that
+-- distinguishes a device the poller never reached from one it reached and got no
+-- answer from — a distinction the product could not previously make, which left
+-- operators unable to tell a monitoring failure from a device failure.
+CREATE TABLE IF NOT EXISTS device_poll_stats (
+  device_id        INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  kind             VARCHAR(16) NOT NULL,
+  last_attempt_at  TIMESTAMPTZ,
+  last_success_at  TIMESTAMPTZ,
+  last_duration_ms INTEGER,
+  last_error       TEXT,
+  attempts         BIGINT NOT NULL DEFAULT 0,
+  failures         BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (device_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_poll_stats_attempt ON device_poll_stats(last_attempt_at DESC);
 `;
 
 const DEFAULT_SETTINGS = [
@@ -547,6 +847,11 @@ const DEFAULT_SETTINGS = [
   { key: 'change_guard_enabled', value: true },
   { key: 'change_guard_mode', value: 'binary' },
   { key: 'change_guard_timeout_sec', value: 120 },
+  { key: 'config_health_enabled', value: true },
+  { key: 'config_health_interval_min', value: 60 },
+  // Geocoding and map tiles are third-party requests that also disclose device
+  // locations. Off-switch for isolated networks (issue #106).
+  { key: 'maps_enabled', value: true },
 ];
 
 export async function runMigrations(): Promise<void> {

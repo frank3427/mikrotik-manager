@@ -69,6 +69,9 @@ export interface Device {
   location_lng?: number;
   rack_name?: string;
   rack_slot?: string;
+  /** Detected wireless role: none | standalone | cap | controller | controller_cap. */
+  wifi_role?: string | null;
+  has_lte?: boolean;
   created_at: string;
   updated_at?: string;
   tags?: { id: number; name: string; color: string }[];
@@ -103,6 +106,8 @@ export interface Vlan {
   vlan_id: number;
   name?: string;
   bridge?: string;
+  /** Raw RouterOS spec this row came from; a range/list means the entry covers several VLANs. */
+  vlan_ids?: string | null;
   tagged_ports?: string[];
   untagged_ports?: string[];
 }
@@ -112,7 +117,11 @@ export interface BridgeVlanEntry {
   bridge: string;
   port: string;
   pvid?: number;
+  /** Every VLAN this port belongs to, tagged or untagged. */
   vlan_ids?: string[];
+  tagged_vlan_ids?: string[];
+  untagged_vlan_ids?: string[];
+  /** True when the port is a tagged member of at least one VLAN (i.e. a trunk). */
   tagged: boolean;
 }
 
@@ -328,6 +337,10 @@ export interface WirelessInterface {
   security_profile?: string;
   noise_floor?: number;
   registered_clients: number;
+  /** Configuration is owned by a CAPsMAN controller, not by this device. */
+  managed_by_capsman?: boolean;
+  radio_mac?: string | null;
+  capsman_controller_mac?: string | null;
   config_json?: Record<string, string>;
   updated_at?: string;
 }
@@ -388,6 +401,17 @@ export interface RogueApReport {
 
 // ─── RF Health ──────────────────────────────────────────────────────────────
 
+/** How one radio's spectrum relates to every other radio at the same location. */
+export type RfOverlapKind = 'clear' | 'co-channel' | 'partial';
+
+export interface RfClash {
+  kind: 'co-channel' | 'partial';
+  overlap_mhz: number;
+  device_name: string | null;
+  interface_name: string | null;
+  channel: number | null;
+}
+
 export interface RfChannelRow {
   device_id: number;
   device_name: string;
@@ -397,6 +421,36 @@ export interface RfChannelRow {
   frequency: number;
   channel_width?: string;
   registered_clients: number;
+  /** Spectrum actually occupied, computed and tested server-side. */
+  low_mhz: number;
+  high_mhz: number;
+  width_mhz: number;
+  channel: number | null;
+  overlap: RfOverlapKind;
+  clashes: RfClash[];
+  controller_device_id: number | null;
+  controller_name: string | null;
+}
+
+export interface RfLocation {
+  key: string;
+  name: string;
+  controller_device_id: number | null;
+  radios: number;
+  summary: { radios: number; clear: number; coChannel: number; partial: number };
+}
+
+export interface RfBandRange {
+  band: '2.4' | '5' | '6';
+  label: string;
+  startMhz: number;
+  endMhz: number;
+}
+
+export interface RfChannelUsage {
+  radios: RfChannelRow[];
+  locations: RfLocation[];
+  bands: RfBandRange[];
 }
 
 export interface RfSignalRow {

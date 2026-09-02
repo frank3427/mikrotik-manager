@@ -3,10 +3,12 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Settings, Users, Key, Plus, Trash2, CheckCircle, AlertCircle, Pencil, X,
   ShieldCheck, ShieldAlert, RefreshCw, Upload, Lock, Bell, Send, KeyRound, ClipboardList, FileText, Zap, LogIn,
+  Activity,
 } from 'lucide-react';
 import { settingsApi, authApi, certApi, alertsApi, auditLogApi, tagsApi, maintenanceApi, configTemplatesApi } from '../services/api';
 import type { MaintenanceWindow, ConfigTemplate } from '../services/api';
 import type { CertInfo, AlertRule, AlertChannel } from '../services/api';
+import PollerHealthCard from '../components/system/PollerHealthCard';
 import { useAuthStore } from '../store/authStore';
 import { useThemeStore } from '../store/themeStore';
 import type { User, UserRole } from '../types';
@@ -49,7 +51,7 @@ export default function SettingsPage() {
   const { theme, setTheme } = useThemeStore();
   const isAdmin = user?.role === 'admin';
   const canWrite = user?.role !== 'viewer';
-  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sso' | 'credentials' | 'security' | 'certificate' | 'alerting' | 'audit' | 'tags' | 'maintenance' | 'templates' | 'automation'>('general');
+  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sso' | 'credentials' | 'security' | 'certificate' | 'alerting' | 'audit' | 'tags' | 'maintenance' | 'templates' | 'automation' | 'poller'>('general');
   const [auditSearch, setAuditSearch] = useState('');
   const [auditPage, setAuditPage] = useState(1);
   const [newTagName, setNewTagName] = useState('');
@@ -477,6 +479,7 @@ export default function SettingsPage() {
         ...(isAdmin ? [{ key: 'sso' as const, label: 'SSO / OIDC', icon: LogIn }] : []),
         { key: 'certificate' as const, label: 'Certificate', icon: Lock },
         ...(isAdmin ? [{ key: 'audit' as const, label: 'Audit Log', icon: ClipboardList }] : []),
+        ...(isAdmin ? [{ key: 'poller' as const, label: 'Polling', icon: Activity }] : []),
       ],
     },
     {
@@ -750,6 +753,35 @@ export default function SettingsPage() {
             </div>
           </div>
 
+          {/* Maps & geocoding (issue #106) */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Maps &amp; Geocoding</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
+              Device location maps use OpenStreetMap for tiles and Nominatim to turn an address
+              into coordinates. Both are outbound requests to a third party, and the address you
+              enter is sent to them. Turn this off on isolated networks, or wherever device
+              locations should not leave your infrastructure — everything else keeps working, and
+              addresses are still recorded as text.
+            </p>
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Enable maps and address lookup</div>
+              <button
+                onClick={() => isAdmin && updateSettingsMutation.mutate({ maps_enabled: settings['maps_enabled'] === false })}
+                disabled={!isAdmin}
+                className={clsx(
+                  'relative inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200',
+                  isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
+                  settings['maps_enabled'] !== false ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
+                )}
+              >
+                <span className={clsx(
+                  'inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200',
+                  settings['maps_enabled'] !== false ? 'translate-x-5' : 'translate-x-0'
+                )} />
+              </button>
+            </div>
+          </div>
+
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-4">Data Retention</h3>
             <div className="space-y-3">
@@ -896,6 +928,12 @@ export default function SettingsPage() {
       )}
 
       {/* ── Users ── */}
+      {activeTab === 'poller' && (
+        <div className="card p-5">
+          <PollerHealthCard />
+        </div>
+      )}
+
       {activeTab === 'users' && (
         <div className="space-y-4">
           {/* Role legend */}
@@ -1750,8 +1788,8 @@ export default function SettingsPage() {
                 <div className="flex-1">
                   <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Type</label>
                   <select className="input w-full" value={chForm.type} onChange={(e) => setChForm((f) => ({ ...f, type: e.target.value as AlertChannel['type'], config: {} }))} disabled={chModal.mode === 'edit'}>
-                    {(['slack', 'discord', 'telegram', 'email'] as const).map((t) => (
-                      <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
+                    {(['slack', 'discord', 'telegram', 'ntfy', 'email'] as const).map((t) => (
+                      <option key={t} value={t}>{t === 'ntfy' ? 'ntfy' : t.charAt(0).toUpperCase() + t.slice(1)}</option>
                     ))}
                   </select>
                 </div>
@@ -1782,6 +1820,40 @@ export default function SettingsPage() {
                   <div>
                     <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Chat ID</label>
                     <input className="input w-full" value={cfgStr('chat_id')} onChange={(e) => setCfg('chat_id', e.target.value)} placeholder="-100123456789" />
+                  </div>
+                </>
+              ) : chForm.type === 'ntfy' ? (
+                <>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Server URL</label>
+                    <input className="input w-full font-mono text-xs" value={cfgStr('server_url')} onChange={(e) => setCfg('server_url', e.target.value)} placeholder="https://ntfy.sh" />
+                    <p className="mt-1 text-[11px] text-gray-500 dark:text-slate-400">Leave blank for the public ntfy.sh, or point at your own instance.</p>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Topic</label>
+                    <input className="input w-full font-mono text-xs" value={cfgStr('topic')} onChange={(e) => setCfg('topic', e.target.value)} placeholder="mikrotik-alerts" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Access Token</label>
+                    <input type="password" className="input w-full font-mono text-xs" value={cfgStr('token')} onChange={(e) => setCfg('token', e.target.value)} placeholder="tk_..." />
+                    <p className="mt-1 text-[11px] text-gray-500 dark:text-slate-400">
+                      Preferred over a username and password. Anyone who can publish to an unprotected topic can spoof your alerts.
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Username</label>
+                      <input className="input w-full" value={cfgStr('username')} onChange={(e) => setCfg('username', e.target.value)} placeholder="(optional)" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Password</label>
+                      <input type="password" className="input w-full" value={cfgStr('password')} onChange={(e) => setCfg('password', e.target.value)} placeholder="••••••••" />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Manager URL (optional)</label>
+                    <input className="input w-full font-mono text-xs" value={cfgStr('click_url')} onChange={(e) => setCfg('click_url', e.target.value)} placeholder="https://mikrotik.example.com" />
+                    <p className="mt-1 text-[11px] text-gray-500 dark:text-slate-400">Makes each notification tappable, opening the device it refers to.</p>
                   </div>
                 </>
               ) : (

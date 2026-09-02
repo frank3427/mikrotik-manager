@@ -5,6 +5,7 @@ import { requireAuth, requireAdmin, requireWrite } from '../middleware/auth';
 import { PollerService } from '../services/PollerService';
 import { getQueryApi, bucket } from '../config/influxdb';
 import { fingerprintClient, DEVICE_CATEGORIES, DeviceCategory } from '../utils/clientFingerprint';
+import { parseRoamLine, buildSessions, flappingSessions } from '../utils/roaming';
 
 // Effective category: the user's override wins; otherwise the fingerprint.
 function withCategory<T extends Record<string, unknown>>(row: T): T & { device_category: string; auto_category: string } {
@@ -23,9 +24,63 @@ router.use(requireAuth);
 let pollerService: PollerService | null = null;
 export function setPollerService(p: PollerService): void { pollerService = p; }
 
+/**
+ * GET /api/clients/:mac/roaming — reconstruct this client's wireless sessions.
+ *
+ * Built from log lines already collected into `events`, so it needs no new
+ * collection and works retroactively over whatever history exists. Roaming happens
+ * between polls, so the log is the only place it is visible at all (issue #105).
+ */
+router.get('/:mac/roaming', async (req: Request, res: Response) => {
+  const mac = String(req.params.mac).toUpperCase();
+  if (!/^[0-9A-F:]{17}$/.test(mac)) return res.status(400).json({ error: 'Invalid MAC address' });
+
+  const range = String(req.query.range || '24h');
+  const hours = range === '7d' ? 168 : range === '30d' ? 720 : range === '1h' ? 1 : 24;
+
+  // Time-bounded first so the scan stays small — most of an events table is login
+  // noise. Both message shapes are matched: wireless lines start with the MAC,
+  // DHCP lines carry it mid-string.
+  const rows = await query<{ event_time: string; message: string; device_name: string | null }>(
+    `SELECT e.event_time, e.message, d.name AS device_name
+     FROM events e
+     LEFT JOIN devices d ON d.id = e.device_id
+     WHERE e.event_time > NOW() - ($2 || ' hours')::interval
+       AND (e.message ILIKE $1 || '@%' OR e.message ILIKE '%for ' || $1 || '%')
+     ORDER BY e.event_time ASC
+     LIMIT 5000`,
+    [mac, String(hours)]
+  );
+
+  const events = rows
+    .map((r) => parseRoamLine(r.message, new Date(r.event_time).toISOString(), r.device_name))
+    .filter((e): e is NonNullable<typeof e> => e !== null && e.mac === mac);
+
+  const sessions = buildSessions(events);
+  const flapping = flappingSessions(sessions);
+
+  res.json({
+    mac,
+    range,
+    sessions: [...sessions].reverse(),          // newest first for display
+    totalRoams: sessions.reduce((n, s) => n + s.hops.length, 0),
+    flappingSessions: flapping.length,
+    /** Radios this client has been seen on, most-used first. */
+    radios: Object.entries(
+      sessions.flatMap((s) => s.path).reduce<Record<string, number>>((acc, i) => {
+        acc[i] = (acc[i] ?? 0) + 1;
+        return acc;
+      }, {})
+    ).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count })),
+  });
+});
+
 // GET /api/clients
 router.get('/', async (req: Request, res: Response) => {
-  const { deviceId, active, search, client_type, limit = '100', offset = '0', sort, dir } = req.query;
+  const {
+    deviceId, active, search, client_type, limit = '100', offset = '0', sort, dir,
+    vlan_id, signal_min, signal_max,
+  } = req.query;
 
   // Whitelist sortable columns → safe SQL expressions on the outer (deduped)
   // result. Sorting must run server-side across the whole dataset, not just the
@@ -47,11 +102,31 @@ router.get('/', async (req: Request, res: Response) => {
   // Stable, predictable: chosen column, then mac as a deterministic tiebreaker.
   const orderBy = `ORDER BY ${sortExpr} ${sortDir} NULLS LAST, deduped.mac_address ASC`;
 
-  // Build WHERE clause shared by both queries
+  // Filters split across the deduplication boundary, and the split is the whole
+  // point of this block.
+  //
+  // A MAC can carry several rows — one per device that has seen it — and the
+  // DISTINCT ON below reduces them to the single row the table displays. Which
+  // side a filter belongs on therefore depends on what it means:
+  //
+  //   * Filters that choose which *sightings* to consider (device, active) run
+  //     before, so they shape what deduplication has to pick from.
+  //   * Filters on values the table *shows* (type, VLAN, signal) run after, or
+  //     the filter and the column disagree.
+  //
+  // Both halves matter here. A wireless client's MAC is also learned by the
+  // switch its AP uplinks to, so it holds both a wireless and a wired row — on
+  // this fleet all 13 wireless clients do — and deduplication resolves that in
+  // favour of wireless. Filtering the raw rows returned every one of them under
+  // "wired" while the list showed them as wireless. Equally, a client seen by two
+  // APs at different strengths would appear in a signal band its displayed row is
+  // not in (#100).
   const filters: string[] = [];
+  const outerFilters: string[] = [];
   const filterParams: unknown[] = [];
   let idx = 1;
 
+  // ── Before deduplication: which sightings count ──
   if (deviceId) {
     filters.push(`c.device_id = $${idx++}`);
     filterParams.push(deviceId);
@@ -59,17 +134,40 @@ router.get('/', async (req: Request, res: Response) => {
   if (active === 'true') {
     filters.push(`c.active = TRUE`);
   }
-  if (client_type) {
-    filters.push(`c.client_type = $${idx++}`);
-    filterParams.push(client_type);
-  }
   if (search) {
     filters.push(`(c.mac_address ILIKE $${idx} OR c.custom_name ILIKE $${idx} OR c.hostname ILIKE $${idx} OR c.ip_address ILIKE $${idx} OR c.vendor ILIKE $${idx})`);
     filterParams.push(`%${search}%`);
     idx++;
   }
 
+  // ── After deduplication: must match the row on screen ──
+  if (client_type) {
+    outerFilters.push(`deduped.client_type = $${idx++}`);
+    filterParams.push(client_type);
+  }
+  if (vlan_id) {
+    outerFilters.push(`deduped.vlan_id = $${idx++}`);
+    filterParams.push(vlan_id);
+  }
+  // Signal range, so the AP-density chart can hand off the band the user clicked
+  // (issues #99, #100). Bounds are inclusive of min and exclusive of max, matching
+  // how the density buckets are drawn.
+  if (signal_min) {
+    outerFilters.push(`deduped.signal_strength >= $${idx++}`);
+    filterParams.push(Number(signal_min));
+  }
+  if (signal_max) {
+    outerFilters.push(`deduped.signal_strength < $${idx++}`);
+    filterParams.push(Number(signal_max));
+  }
+  // Category is deliberately absent. The effective category is the user's override
+  // where set, otherwise a fingerprint computed in JS from vendor and hostname
+  // (utils/clientFingerprint) — there is no column to filter on, and filtering after
+  // pagination would produce wrong counts. Persisting the fingerprint would fix it,
+  // at the cost of going stale whenever the rules change.
+
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  const outerWhere = outerFilters.length ? `WHERE ${outerFilters.join(' AND ')}` : '';
 
   // Deduplicate by MAC address across devices: prefer active rows, then most recently seen.
   // The inner DISTINCT ON picks the best row per MAC; the outer query applies final sort + pagination.
@@ -90,13 +188,20 @@ router.get('/', async (req: Request, res: Response) => {
     ) deduped
     LEFT JOIN client_traffic_daily ctd
       ON ctd.mac_address = LOWER(deduped.mac_address) AND ctd.day = CURRENT_DATE
+    ${outerWhere}
     ${orderBy}
     LIMIT $${idx++} OFFSET $${idx}
   `;
   const clients = await query(sql, [...filterParams, parseInt(String(limit), 10), parseInt(String(offset), 10)]);
 
   const countResult = await query<{ total: string }>(
-    `SELECT COUNT(DISTINCT c.mac_address) as total FROM clients c ${where}`,
+    `SELECT COUNT(*) as total FROM (
+       SELECT DISTINCT ON (c.mac_address) c.client_type, c.vlan_id, c.signal_strength
+       FROM clients c
+       ${where}
+       ORDER BY c.mac_address, (c.client_type = 'wireless') DESC, c.active DESC, c.last_seen DESC NULLS LAST
+     ) deduped
+     ${outerWhere}`,
     filterParams
   );
 

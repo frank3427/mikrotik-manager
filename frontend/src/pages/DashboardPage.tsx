@@ -16,7 +16,7 @@ import type { OpsAttentionItem, OpsCapacityRow, OpsActivityItem } from '../servi
 import TerminalModal from '../components/TerminalModal';
 import { useSocket } from '../hooks/useSocket';
 import { useCanWrite } from '../hooks/useCanWrite';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueryClient, useMutation } from '@tanstack/react-query';
 import { format, formatDistanceToNow } from 'date-fns';
 import type { Device, DeviceEvent } from '../types';
 import clsx from 'clsx';
@@ -608,8 +608,25 @@ function OperationsView({
     refetchInterval: 60_000,
   });
   const thingsToHandle: OpsAttentionItem[] = insights?.attention ?? [];
+  const dismissInsight = useMutation({
+    mutationFn: (v: { fingerprint: string; hours: number; category?: string; title?: string }) =>
+      operationsApi.dismissInsight(v.fingerprint, v.hours, v.category, v.title),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['ops-insights'] }),
+  });
   const capacity: OpsCapacityRow[] = insights?.capacity ?? [];
-  const activity: OpsActivityItem[] = insights?.activity ?? [];
+  const activityAll: OpsActivityItem[] = insights?.activity ?? [];
+  // The app's own write requests are audit-log noise from an operations point of
+  // view (issue #103). Remembered per browser, since it is a viewing preference.
+  const [showRequests, setShowRequests] = useState<boolean>(() => {
+    try { return localStorage.getItem('dash.showRequests') === '1'; } catch { return false; }
+  });
+  const toggleRequests = () => setShowRequests((v) => {
+    const next = !v;
+    try { localStorage.setItem('dash.showRequests', next ? '1' : '0'); } catch { /* private mode */ }
+    return next;
+  });
+  const activity = showRequests ? activityAll : activityAll.filter(a => a.kind !== 'audit');
+  const hiddenRequests = activityAll.length - activity.length;
 
   // Platform update availability (checked against GitHub, cached server-side)
   const { data: versionInfo } = useQuery({
@@ -732,6 +749,35 @@ function OperationsView({
         </div>
       </div>
 
+      {/* Quick actions — in the header strip, matching the other sections (issue #104) */}
+      <div className="flex flex-wrap items-center gap-2">
+        {actions.map(({ key, label, icon: Icon, color, run }) => {
+          const isBusy = busy === key;
+          return (
+            <button
+              key={key}
+              onClick={run}
+              disabled={!!busy}
+              className="text-[12px] rounded-[6px] px-3 py-[7px] flex items-center gap-2 transition-colors disabled:opacity-50"
+              style={{ background: 'var(--surface-2)', border: '1px solid var(--line)', color: 'var(--ink-2)' }}
+              onMouseEnter={(e) => { if (!busy) e.currentTarget.style.background = 'var(--surface-3)'; }}
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--surface-2)')}
+            >
+              {isBusy
+                ? <RefreshCw className="w-3.5 h-3.5 animate-spin" style={{ color }} />
+                : <Icon className="w-3.5 h-3.5" style={{ color }} />}
+              {label}
+            </button>
+          );
+        })}
+        {actionMsg && (
+          <span className="text-[11.5px] ml-1"
+                style={{ color: actionMsg.ok ? 'var(--good)' : 'var(--bad)' }}>
+            {actionMsg.text}
+          </span>
+        )}
+      </div>
+
       {/* Platform update available */}
       {versionInfo?.update_available && versionInfo.latest && (
         <div className="card flex items-center gap-3 px-5 py-[13px]" style={{ borderLeft: '3px solid var(--info)' }}>
@@ -758,10 +804,10 @@ function OperationsView({
         </div>
       )}
 
-      {/* Things to handle + Quick actions */}
-      <div className="grid gap-4" style={{ gridTemplateColumns: '1.3fr 1fr' }}>
-        {/* Things to handle */}
-        <div className="card" style={{ overflow: 'hidden' }}>
+      {/* Things to handle — genuinely full width. It previously sat as the only
+          child of a two-column grid left behind when quick actions moved to the
+          header (#104), so it rendered at 57% with an empty column beside it. */}
+      <div className="card" style={{ overflow: 'hidden' }}>
           <div
             className="flex items-center gap-[10px] px-5 py-[14px]"
             style={{ borderBottom: '1px solid var(--line)' }}
@@ -776,6 +822,10 @@ function OperationsView({
               {thingsToHandle.length} item{thingsToHandle.length !== 1 ? 's' : ''}
             </span>
           </div>
+          {/* A fleet with a real backlog can generate dozens of these. Capping the
+              list and scrolling keeps the card a fixed part of the page instead of
+              something that grows without bound and displaces everything below. */}
+          <div style={{ maxHeight: 'min(52vh, 460px)', overflowY: 'auto' }}>
           {thingsToHandle.length > 0 ? thingsToHandle.map((item, i) => (
             <div
               key={i}
@@ -790,15 +840,39 @@ function OperationsView({
                 <div className="text-[13.5px] font-medium mb-[3px]" style={{ color: 'var(--ink)' }}>{item.title}</div>
                 <div className="text-[12.5px] leading-relaxed" style={{ color: 'var(--ink-2)' }}>{item.body}</div>
               </div>
-              <button
-                onClick={() => navigate(item.path)}
-                className="text-[11.5px] rounded-[5px] px-3 py-[6px] flex-shrink-0 transition-colors"
-                style={{ background: 'transparent', border: '1px solid var(--line)', color: 'var(--ink-2)' }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--surface-3)')}
-                onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-              >
-                {item.action} →
-              </button>
+              {/* Both buttons share the grid's third column. Placed as siblings
+                  they made four children in a three-column grid, which wrapped
+                  Snooze onto an implicit second row inside the 3px severity
+                  column — where it rendered as an unreadable sliver. */}
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={() => navigate(item.path)}
+                  className="text-[11.5px] rounded-[5px] px-3 py-[6px] whitespace-nowrap transition-colors"
+                  style={{ background: 'transparent', border: '1px solid var(--line)', color: 'var(--ink-2)' }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--surface-3)')}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                >
+                  {item.action} →
+                </button>
+                {/* "Not now" rather than "never": an item that is genuinely resolved
+                    stops being generated, so a dismissal is time-boxed (#102). */}
+                {item.fingerprint && (
+                  <button
+                    onClick={() => dismissInsight.mutate({
+                      fingerprint: item.fingerprint!, hours: 24,
+                      category: item.category, title: item.title,
+                    })}
+                    disabled={dismissInsight.isPending}
+                    title="Hide this for 24 hours. It returns if it is still true."
+                    className="text-[11.5px] rounded-[5px] px-2 py-[6px] whitespace-nowrap transition-colors disabled:opacity-50"
+                    style={{ background: 'transparent', border: '1px solid var(--line)', color: 'var(--ink-3)' }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--surface-3)')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    Snooze
+                  </button>
+                )}
+              </div>
             </div>
           )) : (
             <div className="flex items-center justify-center gap-2 py-8" style={{ color: 'var(--ink-3)' }}>
@@ -806,48 +880,12 @@ function OperationsView({
               <span className="text-[13px]">Nothing needs attention</span>
             </div>
           )}
-        </div>
-
-        {/* Quick actions */}
-        <div className="card" style={{ padding: '18px 20px' }}>
-          <div className="text-[13px] font-semibold mb-3" style={{ color: 'var(--ink)' }}>Quick actions</div>
-          <div className="grid gap-2" style={{ gridTemplateColumns: '1fr 1fr' }}>
-            {actions.map(({ key, label, sub, icon: Icon, color, run }) => {
-              const isBusy = busy === key;
-              return (
-                <button
-                  key={key}
-                  onClick={run}
-                  disabled={!!busy}
-                  className="text-left rounded-[6px] px-[14px] py-[12px] transition-colors disabled:opacity-60"
-                  style={{ background: 'var(--surface-2)', border: '1px solid var(--line)' }}
-                  onMouseEnter={(e) => { if (!busy) e.currentTarget.style.background = 'var(--surface-3)'; }}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--surface-2)')}
-                >
-                  <div className="flex items-center gap-2 mb-[3px]">
-                    {isBusy
-                      ? <RefreshCw className="w-3.5 h-3.5 flex-shrink-0 animate-spin" style={{ color }} />
-                      : <Icon className="w-3.5 h-3.5 flex-shrink-0" style={{ color }} />}
-                    <span className="text-[12.5px] font-semibold" style={{ color }}>{label}</span>
-                  </div>
-                  <div className="text-[11px]" style={{ color: 'var(--ink-3)' }}>{isBusy ? 'Working…' : sub}</div>
-                </button>
-              );
-            })}
           </div>
-          {actionMsg && (
-            <div
-              className="mt-3 flex items-center gap-2 text-[12px] rounded-[6px] px-3 py-2"
-              style={{
-                background: actionMsg.ok ? 'var(--good-bg, rgba(34,197,94,0.1))' : 'var(--bad-bg, rgba(239,68,68,0.1))',
-                color: actionMsg.ok ? 'var(--good)' : 'var(--bad)',
-              }}
-            >
-              {actionMsg.ok ? <CheckCircle2 className="w-3.5 h-3.5 flex-shrink-0" /> : <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />}
-              {actionMsg.text}
-            </div>
-          )}
-        </div>
+        {(insights?.dismissedCount ?? 0) > 0 && (
+          <div className="px-5 py-2 text-[11.5px]" style={{ color: 'var(--ink-3)', borderTop: '1px solid var(--line-soft)' }}>
+            {insights!.dismissedCount} snoozed — they return automatically if still true.
+          </div>
+        )}
       </div>
 
       {/* Capacity + Security rollup */}
@@ -930,6 +968,16 @@ function OperationsView({
         <div className="flex items-center gap-2 px-5 py-[14px]" style={{ borderBottom: '1px solid var(--line)' }}>
           <Clock className="w-4 h-4" style={{ color: 'var(--accent)' }} />
           <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Recent activity</span>
+          <button
+            onClick={toggleRequests}
+            className="ml-auto text-[11px]"
+            style={{ color: 'var(--ink-3)' }}
+            title={showRequests ? 'Hide requests made through this app' : 'Include requests made through this app'}
+          >
+            {showRequests
+              ? 'Hide app requests'
+              : `Show app requests${hiddenRequests > 0 ? ` (${hiddenRequests})` : ''}`}
+          </button>
         </div>
         {activity.length === 0 ? (
           <div className="py-8 text-center text-[13px]" style={{ color: 'var(--ink-3)' }}>No recent activity.</div>

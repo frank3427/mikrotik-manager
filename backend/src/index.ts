@@ -18,6 +18,7 @@ import { redis } from './config/redis';
 import { runMigrations } from './db/migrate';
 import { errorHandler } from './middleware/errorHandler';
 import { PollerService } from './services/PollerService';
+import { setSharedPollerService } from './services/pollerRef';
 import {
   setBulkAddPollerService,
   startBulkAddWorker,
@@ -61,7 +62,7 @@ import wirelessRoutes from './routes/wireless';
 import networkServicesRoutes from './routes/networkServices';
 import trafficAnalyticsRoutes from './routes/trafficAnalytics';
 import credentialPresetsRoutes from './routes/credentialPresets';
-import systemRoutes from './routes/system';
+import systemRoutes, { setPollerService as setSystemPoller } from './routes/system';
 import { auditMiddleware } from './middleware/auditMiddleware';
 
 // ─── Secret hygiene ───────────────────────────────────────────────────────────
@@ -373,10 +374,24 @@ async function start(): Promise<void> {
   const pollerService = new PollerService();
   pollerService.setSocketServer(io);
   setDevicesPoller(pollerService);
+  setSystemPoller(pollerService);
+  setSharedPollerService(pollerService);
   setBulkAddPollerService(pollerService);
   setTopologyPoller(pollerService);
   setClientsPoller(pollerService);
   await pollerService.start();
+
+  // Trim job history left over from before retention limits existed. Runs in the
+  // background: an installation with millions of retained jobs would otherwise
+  // hold up startup, and nothing depends on it having finished.
+  void pollerService.cleanupJobHistory().catch((e) =>
+    console.error('[Poller] Job history cleanup failed:', e));
+
+  // Pending work accumulated before dedup existed is dropped too, not just
+  // finished-job history. An upgrade that leaves hundreds of thousands of stale
+  // polls queued has not actually fixed anything the operator can see (#114).
+  void pollerService.dropStalePending().catch((e) =>
+    console.error('[Poller] Stale-pending sweep failed:', e));
   await startBulkAddWorker();
 
   // NetFlow/IPFIX collector (binds its UDP socket only when netflow_enabled)
