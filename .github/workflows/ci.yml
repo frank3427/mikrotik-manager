@@ -2,25 +2,44 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
+
+# Read-only token: CI only checks out and tests (outside review O2).
+permissions:
+  contents: read
 
 jobs:
+  # Cheap, and guards a file no maintainer runs. The published deployment file is
+  # generated from docker-compose.yml; when they were maintained separately the
+  # published one silently lost the NetFlow port, every poller tunable and the
+  # Redis memory ceiling, and it took an outside report to notice (#121).
+  compose:
+    name: Deployment files in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '26'
+      - name: Check docker-compose.ghcr.yml is current
+        run: node scripts/generate-ghcr-compose.mjs --check
+
   frontend:
-    name: Frontend — Lint, Type-check & Build
+    name: Frontend — Lint, Type-check, Test & Build
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: frontend
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: '20'
+          node-version: '26'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -33,23 +52,41 @@ jobs:
       - name: Type-check
         run: npx tsc --noEmit
 
+      - name: Tests
+        run: npm test
+
       - name: Build
         run: npm run build
 
   backend:
-    name: Backend — Lint, Type-check & Build
+    name: Backend — Lint, Type-check, Test & Build
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: backend
+    # A throwaway Postgres for the platform-backup round-trip test, the same
+    # image the stack runs (pinned to the same digest as docker-compose.yml).
+    services:
+      postgres:
+        image: postgres:15-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
+        env:
+          POSTGRES_PASSWORD: e2e
+          POSTGRES_DB: mtm_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: '20'
+          node-version: '26'
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
 
@@ -62,6 +99,16 @@ jobs:
       - name: Type-check
         run: npx tsc --noEmit
 
+      # The crypto, secrets, auth and Change Guard tests. They used to run only
+      # in the local preflight, so main could break them without CI noticing.
+      # PG_E2E_URL turns on the tests against the service database above: the
+      # platform-backup round trip (backup, compare, restore, restore under a
+      # new key) and site groups and access (#306), each in its own database.
+      - name: Tests
+        run: npm test
+        env:
+          PG_E2E_URL: postgres://postgres:e2e@localhost:5432/mtm_e2e
+
       - name: Build
         run: npm run build
 
@@ -70,12 +117,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: '20'
+          node-version: '26'
 
       # Audit production dependencies only (dev/build tooling isn't in the shipped
       # image: the backend installs with --omit=dev and the frontend ships a static

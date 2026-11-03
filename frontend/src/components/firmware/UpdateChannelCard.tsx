@@ -1,0 +1,225 @@
+import { useIsFleetAdmin } from '../../hooks/useCanWrite';
+import { useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Radio, Loader2 } from 'lucide-react';
+import { firmwareApi, settingsApi, type FirmwareDeviceRow } from '../../services/api';
+import DevicePicker from '../common/DevicePicker';
+
+/**
+ * RouterOS update channel: a fleet default, plus overrides for a tag or a
+ * single device (#162).
+ *
+ * Tags are the groups here, the same as in Bulk Commands and the rollout wave
+ * picker, so a per-group channel needs no separate concept. Changes take effect
+ * at each device's next update check, which also records the channel the
+ * device reports back.
+ */
+
+const CHANNELS = ['stable', 'long-term', 'testing', 'development'];
+
+interface Props {
+  devices: FirmwareDeviceRow[];
+  canWrite: boolean;
+}
+
+export default function UpdateChannelCard({ devices, canWrite }: Props) {
+  const isFleetAdmin = useIsFleetAdmin();
+  const qc = useQueryClient();
+  const [target, setTarget] = useState('');
+  // A tag, or one device chosen from a searchable list (#304).
+  const [targetKind, setTargetKind] = useState<'tag' | 'dev'>('dev');
+  const [channel, setChannel] = useState<string>('stable');
+  const [message, setMessage] = useState('');
+
+  const { data: settings } = useQuery({
+    queryKey: ['app-settings'],
+    queryFn: () => settingsApi.get().then((r) => r.data),
+    staleTime: 300_000,
+  });
+  const fleet = typeof settings?.['firmware_update_channel'] === 'string'
+    ? (settings['firmware_update_channel'] as string) : '';
+
+  const tags = useMemo(() => {
+    const m = new Map<number, { id: number; name: string; ids: number[] }>();
+    for (const d of devices) for (const t of d.tags ?? []) {
+      const e = m.get(t.id) ?? { id: t.id, name: t.name, ids: [] };
+      e.ids.push(d.id);
+      m.set(t.id, e);
+    }
+    return [...m.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [devices]);
+
+  const reported = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const d of devices) {
+      const k = d.reported_update_channel || 'not yet checked';
+      m.set(k, (m.get(k) ?? 0) + 1);
+    }
+    return [...m.entries()];
+  }, [devices]);
+  // Listed, not just counted: "2 with an override" gave no way to see which
+  // devices, or to clear them short of picking each one again (#162).
+  const overridden = useMemo(
+    () => devices.filter((d) => d.update_channel).sort((a, b) => a.name.trim().localeCompare(b.name.trim())),
+    [devices]
+  );
+
+  const saveFleet = useMutation({
+    mutationFn: (v: string) => settingsApi.update({ firmware_update_channel: v || null }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['app-settings'] });
+      qc.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
+  const targetIds = (): number[] => {
+    if (target.startsWith('tag:')) return tags.find((t) => `tag:${t.id}` === target)?.ids ?? [];
+    if (target.startsWith('dev:')) return [Number(target.slice(4))];
+    return [];
+  };
+
+  const applyOverride = useMutation({
+    mutationFn: () => firmwareApi.setChannel(targetIds(), channel === 'fleet' ? null : channel),
+    onSuccess: (r) => {
+      setMessage(`${r.data.updated} device${r.data.updated === 1 ? '' : 's'} updated. Applies at the next update check.`);
+      qc.invalidateQueries({ queryKey: ['fw-overview'] });
+    },
+    onError: () => setMessage('Could not save the override.'),
+  });
+
+  const clearOverrides = useMutation({
+    mutationFn: (ids: number[]) => firmwareApi.setChannel(ids, null),
+    onSuccess: (r) => {
+      setMessage(
+        `Override cleared on ${r.data.updated} device${r.data.updated === 1 ? '' : 's'}. ` +
+        (fleet ? 'They follow the fleet default again.' : 'With no fleet default set, they stay on the channel they are on now.')
+      );
+      qc.invalidateQueries({ queryKey: ['fw-overview'] });
+    },
+    onError: () => setMessage('Could not clear the override.'),
+  });
+
+  return (
+    <div className="card p-5 space-y-4">
+      <div className="flex items-center gap-2">
+        <Radio className="w-4 h-4 text-blue-500" />
+        <h3 className="text-sm font-semibold text-gray-900 dark:text-white">Update channel</h3>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <label className="text-sm">
+          <span className="text-gray-700 dark:text-slate-300">Fleet default</span>
+          <select
+            className="input mt-1"
+            value={fleet}
+            // The fleet default is a platform setting, admin-only on the server (U10).
+            disabled={!isFleetAdmin || saveFleet.isPending}
+            onChange={(e) => saveFleet.mutate(e.target.value)}
+          >
+            <option value="">Leave each device on its own channel</option>
+            {CHANNELS.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <span className="block text-[11px] text-gray-400 mt-1">
+            Devices are moved at their next update check. A device already running something newer
+            than its channel offers is not downgraded.
+          </span>
+        </label>
+
+        {canWrite && (
+          <div className="text-sm">
+            <span className="text-gray-700 dark:text-slate-300">Override for a tag or device</span>
+            <div className="flex gap-2 mt-1">
+              {tags.length > 0 && (
+                <select className="input w-auto" value={targetKind} aria-label="Override for"
+                  onChange={(e) => { setTargetKind(e.target.value as 'tag' | 'dev'); setTarget(''); setMessage(''); }}>
+                  <option value="dev">Device</option>
+                  <option value="tag">Tag</option>
+                </select>
+              )}
+              {targetKind === 'tag' && tags.length > 0 ? (
+                <select className="input flex-1 min-w-0" value={target} onChange={(e) => { setTarget(e.target.value); setMessage(''); }}>
+                  <option value="">Choose a tag…</option>
+                  {tags.map((t) => <option key={t.id} value={`tag:${t.id}`}>{t.name} ({t.ids.length})</option>)}
+                </select>
+              ) : (
+                <DevicePicker
+                  className="flex-1 min-w-0" devices={devices} placeholder="Choose a device…" aria-label="Device"
+                  value={target.startsWith('dev:') ? Number(target.slice(4)) : null}
+                  onChange={(id) => { setTarget(id == null ? '' : `dev:${id}`); setMessage(''); }}
+                />
+              )}
+              <select className="input w-auto" value={channel} onChange={(e) => setChannel(e.target.value)}>
+                {CHANNELS.map((c) => <option key={c} value={c}>{c}</option>)}
+                <option value="fleet">follow fleet default</option>
+              </select>
+              <button
+                className="btn-primary text-[12px] flex items-center gap-1 disabled:opacity-50"
+                disabled={!target || applyOverride.isPending}
+                onClick={() => applyOverride.mutate()}
+              >
+                {applyOverride.isPending && <Loader2 className="w-3 h-3 animate-spin" />}
+                Apply
+              </button>
+            </div>
+            {message && <span className="block text-[11.5px] text-gray-500 mt-1">{message}</span>}
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11.5px] text-gray-500 dark:text-slate-400">
+        <span>Devices report:</span>
+        {reported.map(([ch, n]) => <span key={ch}><span className="mono">{ch}</span> {n}</span>)}
+        {overridden.length > 0 && <span>· {overridden.length} with an override</span>}
+      </div>
+
+      {overridden.length > 0 && (
+        <div className="rounded-lg border border-gray-200 dark:border-slate-700">
+          <div className="flex items-center px-3 py-2 text-[12px] font-medium text-gray-600 dark:text-slate-300 border-b border-gray-100 dark:border-slate-700">
+            <span className="flex-1">Overrides</span>
+            {canWrite && overridden.length > 1 && (
+              <button
+                className="text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50"
+                disabled={clearOverrides.isPending}
+                onClick={() => {
+                  if (confirm(`Clear the override on all ${overridden.length} devices? They will follow the fleet default.`)) {
+                    clearOverrides.mutate(overridden.map((d) => d.id));
+                  }
+                }}
+              >
+                Clear all
+              </button>
+            )}
+          </div>
+          <table className="w-full text-[12px]">
+            <tbody className="divide-y divide-gray-100 dark:divide-slate-700">
+              {overridden.map((d) => (
+                <tr key={d.id}>
+                  <td className="px-3 py-1.5 text-gray-900 dark:text-white">{d.name.trim()}</td>
+                  <td className="px-3 py-1.5"><span className="mono">{d.update_channel}</span></td>
+                  <td className="px-3 py-1.5 text-gray-500 dark:text-slate-400">
+                    {d.reported_update_channel
+                      ? d.reported_update_channel === d.update_channel
+                        ? 'on it now'
+                        : <>reports <span className="mono">{d.reported_update_channel}</span>, moves at the next check</>
+                      : 'not checked yet'}
+                  </td>
+                  <td className="px-3 py-1.5 text-right">
+                    {canWrite && (
+                      <button
+                        className="text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50"
+                        disabled={clearOverrides.isPending}
+                        onClick={() => clearOverrides.mutate([d.id])}
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}

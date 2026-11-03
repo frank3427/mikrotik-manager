@@ -1,8 +1,9 @@
+import { useCanWrite } from '../../hooks/useCanWrite';
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   KeyRound, Webhook as WebhookIcon, Mail, Plus, Trash2, Copy, Check, Send,
-  RefreshCw, AlertTriangle, Power, X,
+  AlertTriangle, Power, X,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { automationApi } from '../../services/api';
@@ -13,7 +14,9 @@ const EVENT_LABEL: Record<string, string> = {
   log_error: 'Log error', log_warning: 'Log warning',
   high_cpu: 'High CPU', high_memory: 'High memory', cert_expiry: 'Cert expiry',
   device_discovered: 'Device discovered', firmware_update_available: 'Firmware update',
-  config_drift: 'Config drift', rollout_completed: 'Rollout completed', rollout_failed: 'Rollout failed',
+  config_drift: 'Config drift', cve_active: 'Serious CVE affects the fleet', wireguard_stale: 'WireGuard peer stale', interface_errors: 'Interface errors', interface_flapping: 'Interface flapping', optic_degraded: 'Optic light level', routing_peer_down: 'Routing peer down', platform_backup_failed: 'Platform backup failed', device_cert_renewal_failed: 'Device certificate renewal failed', rollout_completed: 'Rollout completed', rollout_failed: 'Rollout failed',
+  device_degraded: 'Device degraded', device_health_restored: 'Hardware healthy again',
+  device_identity_changed: 'Certificate or host key changed',
 };
 
 // ─── API tokens ────────────────────────────────────────────────────────────────
@@ -32,6 +35,7 @@ function TokensSection({ isAdmin }: { isAdmin: boolean }) {
     enabled: isAdmin,
   });
   const create = useMutation({
+    meta: { inlineError: true },
     mutationFn: () => automationApi.createToken({ name: name.trim(), scope, expires_days: expires ? parseInt(expires, 10) : undefined }),
     onSuccess: (r) => { setNewToken(r.data.token); setName(''); setExpires(''); qc.invalidateQueries({ queryKey: ['api-tokens'] }); },
   });
@@ -93,7 +97,7 @@ function TokensSection({ isAdmin }: { isAdmin: boolean }) {
                   {t.last_used_at ? `used ${formatDistanceToNow(new Date(t.last_used_at))} ago` : 'never used'}
                   {t.expires_at ? ` · expires ${formatDistanceToNow(new Date(t.expires_at), { addSuffix: true })}` : ''}
                 </span>
-                <button className="ml-auto p-1.5 text-gray-400 hover:text-red-600" onClick={() => del.mutate(t.id)} title="Revoke"><Trash2 className="w-3.5 h-3.5" /></button>
+                <button className="ml-auto p-1.5 text-gray-400 hover:text-red-600" onClick={() => { if (confirm(`Revoke the API token "${t.name}"? Anything using it stops working at once.`)) del.mutate(t.id); }} title="Revoke"><Trash2 className="w-3.5 h-3.5" /></button>
               </div>
             ))}
           </div>
@@ -116,6 +120,7 @@ function WebhooksSection() {
   const events = data?.availableEvents ?? [];
 
   const create = useMutation({
+    meta: { inlineError: true },
     mutationFn: () => automationApi.createWebhook({ name: form.name.trim(), url: form.url.trim(), secret: form.secret.trim() || undefined, events: [...form.events] }),
     onSuccess: () => { setForm({ name: '', url: '', secret: '', events: new Set() }); qc.invalidateQueries({ queryKey: ['webhooks'] }); },
   });
@@ -154,7 +159,7 @@ function WebhooksSection() {
                 {testResult[h.id] && <span className="text-xs text-gray-500 dark:text-slate-400 mr-1">{testResult[h.id]}</span>}
                 <button className="p-1.5 text-gray-400 hover:text-blue-600" title="Send test" onClick={() => test.mutate(h.id)}><Send className="w-3.5 h-3.5" /></button>
                 <button className="p-1.5 text-gray-400 hover:text-amber-600" title={h.enabled ? 'Disable' : 'Enable'} onClick={() => toggle.mutate({ id: h.id, enabled: !h.enabled })}><Power className="w-3.5 h-3.5" /></button>
-                <button className="p-1.5 text-gray-400 hover:text-red-600" title="Delete" onClick={() => del.mutate(h.id)}><Trash2 className="w-3.5 h-3.5" /></button>
+                <button className="p-1.5 text-gray-400 hover:text-red-600" title="Delete" onClick={() => { if (confirm(`Delete the webhook "${h.name}"?`)) del.mutate(h.id); }}><Trash2 className="w-3.5 h-3.5" /></button>
               </div>
             </div>
             <div className="font-mono text-xs text-gray-500 dark:text-slate-400 truncate">{h.url}</div>
@@ -201,6 +206,7 @@ function ReportsSection() {
 
   const { data: reports = [] } = useQuery({ queryKey: ['report-schedules'], queryFn: () => automationApi.listReports().then(r => r.data) });
   const create = useMutation({
+    meta: { inlineError: true },
     mutationFn: () => automationApi.createReport(form),
     onSuccess: () => { setForm({ name: '', frequency: 'weekly', recipients: '' }); qc.invalidateQueries({ queryKey: ['report-schedules'] }); },
   });
@@ -235,7 +241,7 @@ function ReportsSection() {
               {sendMsg[r.id] && <span className="text-xs text-gray-500 dark:text-slate-400 mr-1">{sendMsg[r.id]}</span>}
               <button className="p-1.5 text-gray-400 hover:text-blue-600" title="Send now" onClick={() => sendNow.mutate(r.id)} disabled={sendNow.isPending}><Send className="w-3.5 h-3.5" /></button>
               <button className="p-1.5 text-gray-400 hover:text-amber-600" title={r.enabled ? 'Disable' : 'Enable'} onClick={() => toggle.mutate({ id: r.id, enabled: !r.enabled })}><Power className="w-3.5 h-3.5" /></button>
-              <button className="p-1.5 text-gray-400 hover:text-red-600" title="Delete" onClick={() => del.mutate(r.id)}><Trash2 className="w-3.5 h-3.5" /></button>
+              <button className="p-1.5 text-gray-400 hover:text-red-600" title="Delete" onClick={() => { if (confirm(`Delete the scheduled report "${r.name}"?`)) del.mutate(r.id); }}><Trash2 className="w-3.5 h-3.5" /></button>
             </div>
           </div>
         ))}
@@ -257,11 +263,16 @@ function ReportsSection() {
 }
 
 export default function AutomationSettings({ isAdmin }: { isAdmin: boolean }) {
+  // Webhooks and reports need write access on the server; viewers see them
+  // read-only instead of getting a 403 (outside review U10).
+  const canWrite = useCanWrite();
   return (
     <div className="space-y-4">
       <TokensSection isAdmin={isAdmin} />
-      <WebhooksSection />
-      <ReportsSection />
+      <fieldset disabled={!canWrite} className="space-y-4 min-w-0">
+        <WebhooksSection />
+        <ReportsSection />
+      </fieldset>
     </div>
   );
 }

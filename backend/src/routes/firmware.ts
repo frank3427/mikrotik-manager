@@ -1,46 +1,143 @@
+import { loadBondMembers } from '../services/topology/bondMembers';
+import { decodedPath } from '../utils/requestPath';
 import { Router, Request, Response } from 'express';
+import { resourceSiteAccess, guardIdParams, strictIdList } from '../utils/siteAccess';
 import { query, queryOne } from '../config/database';
+import { isUpdateChannel, UPDATE_CHANNELS } from '../utils/updateChannel';
 import { requireAuth, requireWrite } from '../middleware/auth';
+import { siteScopeDevices, siteScopeByDevice } from '../utils/siteScope';
+import { activeSite, writableScope } from '../middleware/site';
 import { DeviceCollector, DeviceRow } from '../services/mikrotik/DeviceCollector';
 import { firmwareOrchestrator } from '../services/FirmwareOrchestrator';
+import { clampConcurrency, MAX_WAVE_CONCURRENCY, settleWithConcurrency, FLEET_ACTION_CONCURRENCY } from '../utils/concurrency';
+import { updateAvailable, isNewerRosVersion } from '../utils/rosVersion';
+import { newestCompleteFrom } from '../utils/firmwareMirror';
+import { findUpstreamWithinSelection } from '../utils/rolloutTopology';
+import type { StpBridge } from '../utils/stpUpstream';
+import { refuseSecrets } from '../utils/secretAccess';
 
 const router = Router();
 router.use(requireAuth);
+// Ids are plain numbers, read the same way by the site check and the handler (GHSA-j9x4-qwcj-p8v8).
+guardIdParams(router, ['id'], 'Rollout not found');
 
 // GET /api/firmware/overview — fleet versions + latest rollout
-router.get('/overview', async (_req: Request, res: Response) => {
+// A site-scoped account reaches only rollouts and devices in its own sites
+// (P1-7): a rollout by its id, or the devices named in the request.
+router.use(resourceSiteAccess(async (req) => {
+  // Decoded, as the handlers' params are (GHSA-6xq3-q9m5-7hxp); undecodable is refused.
+  const path = decodedPath(req);
+  if (path === null) return [];
+  const rollout = path.match(/^\/rollouts\/(\d+)(?:\/|$)/);
+  if (rollout) {
+    const rows = await query<{ device_id: number }>(`SELECT device_id FROM firmware_rollout_devices WHERE rollout_id = $1`, [rollout[1]]);
+    return rows.map((r) => r.device_id);
+  }
+  if (req.method === 'POST' && path === '/rollouts') {
+    const devices = (req.body as { devices?: { device_id: unknown }[] })?.devices;
+    return Array.isArray(devices) ? strictIdList(devices.map((d) => d?.device_id)) ?? [] : null;
+  }
+  if (req.method === 'PUT' && path === '/channel') {
+    const ids = (req.body as { deviceIds?: unknown })?.deviceIds;
+    return Array.isArray(ids) ? strictIdList(ids) ?? [] : null;
+  }
+  if (path === '/rollouts/upstream-check') {
+    const raw = String(req.query.ids || '');
+    return raw ? strictIdList(raw.split(',')) ?? [] : null;
+  }
+  return null;
+}, 'Rollout not found'));
+
+router.get('/overview', async (req: Request, res: Response) => {
+  const siteFilter = siteScopeDevices(activeSite(req));
   const [devices, latestRollout] = await Promise.all([
     query(`SELECT id, name, device_type, status, model, ros_version, latest_ros_version,
                   firmware_update_available, firmware_version, upgrade_firmware_version,
-                  routerboard_upgrade_available
-           FROM devices ORDER BY name ASC`),
-    queryOne<{ id: number }>(`SELECT id FROM firmware_rollouts ORDER BY created_at DESC LIMIT 1`),
+                  routerboard_upgrade_available, update_channel, reported_update_channel,
+                  architecture, installed_packages
+           FROM devices ${siteFilter ? `WHERE ${siteFilter}` : ''} ORDER BY name ASC`),
+    // The banner links to this rollout, so it must be one this site took part in.
+    queryOne<{ id: number }>(`
+      SELECT r.id FROM firmware_rollouts r
+      ${siteScopeByDevice(activeSite(req), 'frd.device_id')
+        ? `WHERE EXISTS (SELECT 1 FROM firmware_rollout_devices frd
+                          WHERE frd.rollout_id = r.id
+                            AND ${siteScopeByDevice(activeSite(req), 'frd.device_id')})`
+        : ''}
+      ORDER BY r.created_at DESC LIMIT 1`),
   ]);
+  // Tags, so the rollout table can show the same chips as the device list and a
+  // tagged group is recognisable when choosing what to upgrade (#152).
+  const tagRows = await query<{ device_id: number; id: number; name: string; color: string }>(
+    `SELECT dt.device_id, t.id, t.name, t.color
+       FROM device_tags dt JOIN tags t ON t.id = dt.tag_id`
+  ).catch(() => []);
+  const tagsByDevice = new Map<number, { id: number; name: string; color: string }[]>();
+  for (const t of tagRows) {
+    const list = tagsByDevice.get(t.device_id) ?? [];
+    list.push({ id: t.id, name: t.name, color: t.color });
+    tagsByDevice.set(t.device_id, list);
+  }
+
+  // Devices pulling from a local mirror (#193): the newest version it holds
+  // every one of their packages for. Newer than what they run means an update,
+  // whether or not the device has asked MikroTik.
+  const clients = await query<{ device_id: number; mirror_id: number; status: string }>(
+    `SELECT c.device_id, c.mirror_id, c.status FROM firmware_mirror_clients c
+       JOIN firmware_mirrors m ON m.id = c.mirror_id`).catch(() => []);
+  const clientById = new Map(clients.map((c) => [c.device_id, c]));
+  const mirrorFiles = new Map<number, { version: string; filename: string }[]>();
+  for (const id of new Set(clients.map((c) => c.mirror_id))) {
+    mirrorFiles.set(id, await query<{ version: string; filename: string }>(
+      `SELECT version, filename FROM firmware_mirror_files WHERE mirror_id = $1`, [id]).catch(() => []));
+  }
+  type OverviewDevice = { id: number; ros_version: string | null; architecture: string | null; installed_packages: string[] | null };
+  const rows = (devices as OverviewDevice[]).map((d) => {
+    const c = clientById.get(d.id);
+    const mirrorVersion = c && c.status === 'ok'
+      ? newestCompleteFrom(mirrorFiles.get(c.mirror_id) ?? [], d.architecture, d.installed_packages)
+      : null;
+    const { architecture: _a, installed_packages: _p, ...rest } = d;
+    void _a; void _p;
+    return {
+      ...rest,
+      tags: tagsByDevice.get(d.id) ?? [],
+      mirror: c ? { mirror_id: c.mirror_id, status: c.status } : null,
+      mirror_version: mirrorVersion,
+      mirror_update_available: !!mirrorVersion && isNewerRosVersion(mirrorVersion, d.ros_version),
+    };
+  });
+
   res.json({
-    devices,
+    devices: rows,
     latestRolloutId: latestRollout?.id ?? null,
     runningRolloutId: firmwareOrchestrator.running,
   });
 });
 
 // POST /api/firmware/check-all — refresh update availability on all online devices
-router.post('/check-all', requireWrite, async (_req: Request, res: Response) => {
-  const devices = await query<DeviceRow>(`SELECT * FROM devices WHERE status='online'`);
-  const settled = await Promise.allSettled(devices.map(async (d) => {
+router.post('/check-all', requireWrite, async (req: Request, res: Response) => {
+  const siteFilter = siteScopeDevices(writableScope(req));
+  const devices = await query<DeviceRow>(
+    `SELECT * FROM devices WHERE status='online' AND NOT ssh_only ${siteFilter ? `AND ${siteFilter}` : ''}`
+  );
+  // A limited number at a time (#302): this used to contact every device at once.
+  const settled = await settleWithConcurrency(devices, FLEET_ACTION_CONCURRENCY, async (d) => {
     const c = new DeviceCollector(d);
     try {
       await c.connect();
       const s = await c.checkForUpdates();
       const installed = (s['installed-version'] || '').trim();
       const latest = (s['latest-version'] || '').trim();
-      const available = !!latest && latest !== installed;
+      // A version comparison, not a string one (#144).
+      const available = updateAvailable({ installed, latest, status: s['status'] });
       await query(
         `UPDATE devices SET ros_version=COALESCE(NULLIF($2,''), ros_version),
                 latest_ros_version=NULLIF($3,''), firmware_update_available=$4 WHERE id=$1`,
         [d.id, installed, latest, available]);
       return { name: d.name, installed, latest, available };
     } finally { c.disconnect(); }
-  }));
+  });
   res.json({
     results: settled.map((s, i) => s.status === 'fulfilled'
       ? { ...s.value, ok: true }
@@ -50,11 +147,39 @@ router.post('/check-all', requireWrite, async (_req: Request, res: Response) => 
 
 // POST /api/firmware/rollouts — create a rollout (optionally scheduled)
 router.post('/rollouts', requireWrite, async (req: Request, res: Response) => {
-  const { name, halt_on_failure, pre_backup, routerboot_after, scheduled_at, devices, start } = req.body as {
+  const {
+    name, halt_on_failure, pre_backup, routerboot_after, scheduled_at, scheduled_until, devices, start,
+    wave_concurrency, package_source, post_template_id, kind: rawKind,
+  } = req.body as {
+    /** 'routerboot': upgrade the bootloader alone, without RouterOS (#262). */
+    kind?: string;
+    /** A command template to run on each device after its upgrade (#163). */
+    post_template_id?: number | null;
+    /** 'mirror': devices set up for the local mirror pull from it (#193). */
+    package_source?: string;
     name?: string; halt_on_failure?: boolean; pre_backup?: boolean; routerboot_after?: boolean; scheduled_at?: string | null;
+    /** Don't start after this time; without it the rollout may start up to an hour late. */
+    scheduled_until?: string | null;
     devices?: { device_id: number; wave: number }[]; start?: boolean;
+    wave_concurrency?: number;
   };
   if (!name || !name.trim()) return res.status(400).json({ error: 'name is required' });
+  const kind = rawKind === 'routerboot' ? 'routerboot' : 'routeros';
+  // Post-upgrade commands follow a RouterOS upgrade; a bootloader-only rollout has none.
+  if (kind === 'routerboot' && post_template_id != null) {
+    return res.status(400).json({ error: 'A RouterBOOT-only rollout has no post-upgrade commands' });
+  }
+  // The template's command is copied into the rollout now (#163).
+  let post: { command: string; name: string } | null = null;
+  if (post_template_id != null) {
+    const t = await queryOne<{ command: string; name: string }>(`SELECT command, name FROM command_templates WHERE id = $1`, [Number(post_template_id)]);
+    if (!t) return res.status(400).json({ error: 'That command template no longer exists' });
+    if (!t.command.trim()) return res.status(400).json({ error: `Template "${t.name}" has no commands` });
+    // Secrets in the template (#259): fleet admins only, every name existing.
+    const secretRefusal = await refuseSecrets(req, t.command);
+    if (secretRefusal) return res.status(secretRefusal.status).json({ error: secretRefusal.error });
+    post = t;
+  }
   if (!Array.isArray(devices) || devices.length === 0) return res.status(400).json({ error: 'devices array is required' });
   for (const d of devices) {
     if (!Number.isInteger(d.device_id) || !Number.isInteger(d.wave) || d.wave < 1 || d.wave > 9) {
@@ -62,11 +187,56 @@ router.post('/rollouts', requireWrite, async (req: Request, res: Response) => {
     }
   }
   if (scheduled_at && isNaN(Date.parse(scheduled_at))) return res.status(400).json({ error: 'scheduled_at must be a valid timestamp' });
+  if (scheduled_until) {
+    if (!scheduled_at) return res.status(400).json({ error: 'scheduled_until needs scheduled_at' });
+    if (isNaN(Date.parse(scheduled_until))) return res.status(400).json({ error: 'scheduled_until must be a valid timestamp' });
+    if (Date.parse(scheduled_until) <= Date.parse(scheduled_at)) {
+      return res.status(400).json({ error: '"Don\u2019t start after" must be later than the scheduled time' });
+    }
+  }
+
+  // Refuse before creating anything (#139). The rollout used to be written
+  // first and started second, so a rejected start left the rows behind: the
+  // user saw "already running", pressed again, and each press quietly banked
+  // another rollout for the same devices. Nothing is persisted unless the
+  // request can actually be honoured.
+  const busy = await query<{ device_id: number; name: string; rollout_id: number }>(
+    `SELECT frd.device_id, d.name, frd.rollout_id
+       FROM firmware_rollout_devices frd
+       JOIN firmware_rollouts r ON r.id = frd.rollout_id
+       JOIN devices d ON d.id = frd.device_id
+      WHERE frd.device_id = ANY($1::int[])
+        AND r.status IN ('pending','running')
+        AND frd.status NOT IN ('success','failed','skipped')`,
+    [devices.map((d) => d.device_id)]
+  );
+  if (busy.length > 0) {
+    const names = [...new Set(busy.map((b) => b.name))];
+    return res.status(409).json({
+      error:
+        `${names.join(', ')} ${names.length === 1 ? 'is' : 'are'} already part of ` +
+        `rollout #${busy[0].rollout_id}, which has not finished. ` +
+        `Wait for it to complete or cancel it first.`,
+      conflicting_rollout_id: busy[0].rollout_id,
+      device_ids: [...new Set(busy.map((b) => b.device_id))],
+    });
+  }
+  // An immediate start needs the orchestrator free; a scheduled one does not.
+  if (start && !scheduled_at && firmwareOrchestrator.running) {
+    return res.status(409).json({
+      error: `Rollout #${firmwareOrchestrator.running} is still running. ` +
+             `Wait for it to finish, or schedule this one for later.`,
+      conflicting_rollout_id: firmwareOrchestrator.running,
+    });
+  }
 
   const rollout = await queryOne<{ id: number }>(
-    `INSERT INTO firmware_rollouts (name, halt_on_failure, pre_backup, routerboot_after, scheduled_at)
-     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
-    [name.trim().slice(0, 100), halt_on_failure !== false, pre_backup !== false, routerboot_after === true, scheduled_at || null]);
+    `INSERT INTO firmware_rollouts (name, halt_on_failure, pre_backup, routerboot_after, scheduled_at, scheduled_until, wave_concurrency, package_source,
+                                    post_command, post_template_name, kind)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+    [name.trim().slice(0, 100), halt_on_failure !== false, pre_backup !== false, kind === 'routeros' && routerboot_after === true,
+     scheduled_at || null, scheduled_until || null, clampConcurrency(wave_concurrency ?? 1),
+     package_source === 'mirror' ? 'mirror' : 'mikrotik', post?.command ?? null, post?.name ?? null, kind]);
   for (const d of devices) {
     await query(
       `INSERT INTO firmware_rollout_devices (rollout_id, device_id, wave) VALUES ($1,$2,$3)`,
@@ -75,21 +245,87 @@ router.post('/rollouts', requireWrite, async (req: Request, res: Response) => {
 
   if (start && !scheduled_at) {
     try { await firmwareOrchestrator.start(rollout!.id); }
-    catch (e) { return res.status(409).json({ error: (e as Error).message, id: rollout!.id }); }
+    catch (e) {
+      // Lost a race for the orchestrator. Remove the rollout we just created
+      // rather than leaving an unstartable shell behind.
+      await query(`DELETE FROM firmware_rollouts WHERE id = $1`, [rollout!.id]).catch(() => {});
+      return res.status(409).json({ error: (e as Error).message });
+    }
   }
   res.status(201).json({ id: rollout!.id });
 });
 
+/**
+ * GET /api/firmware/rollouts/upstream-check?ids=1,2,3
+ *
+ * Which of the selected devices sit upstream of the others (#135).
+ *
+ * Running a wave concurrently means several devices reboot together, and a
+ * switch that carries the uplink to the rest takes them with it -- the manager
+ * then cannot reach the devices it is mid-upgrade on. Change Guard does not
+ * cover this: it protects configuration, not the path back to the device.
+ *
+ * Advisory only. It warns, it does not refuse: the operator may know the
+ * topology better than the discovered links do.
+ */
+router.get('/rollouts/upstream-check', async (req: Request, res: Response) => {
+  const ids = String(req.query.ids || '')
+    .split(',').map((v) => parseInt(v, 10)).filter(Number.isInteger);
+  if (ids.length < 2) return res.json({ upstream: [] });
+
+  const links = await query<{
+    from_device_id: number; to_device_id: number | null; from_interface: string | null;
+  }>(
+    `SELECT from_device_id, to_device_id, from_interface
+       FROM topology_links WHERE to_device_id IS NOT NULL`
+  );
+  // Spanning tree is what turns an ambiguous port into a definite upstream.
+  const bridges = await query<StpBridge>(
+    `SELECT device_id, bridge_name, bridge_id, root_bridge, root_bridge_id,
+            root_port, root_path_cost, designated_bridge_id, designated_port_id,
+            (SELECT site_id FROM devices WHERE id = device_id) AS site_id
+       FROM device_bridges`
+  );
+  const names = await query<{ id: number; name: string }>(
+    `SELECT id, name FROM devices WHERE id = ANY($1::int[])`, [ids]
+  );
+  const nameById = new Map(names.map((n) => [n.id, n.name]));
+
+  const upstream = findUpstreamWithinSelection(ids, links, bridges, await loadBondMembers()).map((id) => ({
+    id, name: nameById.get(id) ?? `Device ${id}`,
+  }));
+  return res.json({ upstream, maxConcurrency: MAX_WAVE_CONCURRENCY });
+});
+
 // GET /api/firmware/rollouts — recent rollouts with progress counts
-router.get('/rollouts', async (_req: Request, res: Response) => {
-  const rows = await query(`
-    SELECT r.*,
-           COUNT(d.id)::int AS device_count,
-           COUNT(d.id) FILTER (WHERE d.status = 'success')::int AS success_count,
-           COUNT(d.id) FILTER (WHERE d.status = 'failed')::int  AS failed_count
-    FROM firmware_rollouts r
-    LEFT JOIN firmware_rollout_devices d ON d.rollout_id = r.id
-    GROUP BY r.id ORDER BY r.created_at DESC LIMIT 20`);
+router.get('/rollouts', async (req: Request, res: Response) => {
+  // A rollout is shown when it touched at least one device in the active site.
+  const memberFilter = siteScopeByDevice(activeSite(req), 'frd.device_id');
+  // A site-scoped account sees only rollouts entirely within its sites (P1-7).
+  const ownSites = req.user?.siteRoles ? siteScopeByDevice(Object.keys(req.user.siteRoles).map(Number), 'x.device_id') : null;
+  const conditions = [
+    memberFilter ? `EXISTS (SELECT 1 FROM firmware_rollout_devices frd WHERE frd.rollout_id = r.id AND ${memberFilter})` : null,
+    ownSites ? `NOT EXISTS (SELECT 1 FROM firmware_rollout_devices x WHERE x.rollout_id = r.id AND NOT (${ownSites}))` : null,
+  ].filter(Boolean);
+  // Paged for the history page (#202): ?limit= (default 20, at most 100) and
+  // ?offset=. The total comes back in X-Total-Count, so the body stays the
+  // array it has always been.
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '20'), 10) || 20, 1), 100);
+  const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const [rows, total] = await Promise.all([
+    query(`
+      SELECT r.*,
+             COUNT(d.id)::int AS device_count,
+             COUNT(d.id) FILTER (WHERE d.status = 'success')::int AS success_count,
+             COUNT(d.id) FILTER (WHERE d.status = 'failed')::int  AS failed_count
+      FROM firmware_rollouts r
+      LEFT JOIN firmware_rollout_devices d ON d.rollout_id = r.id
+      ${where}
+      GROUP BY r.id ORDER BY r.created_at DESC, r.id DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+    queryOne<{ n: number }>(`SELECT COUNT(*)::int AS n FROM firmware_rollouts r ${where}`),
+  ]);
+  res.setHeader('X-Total-Count', String(total?.n ?? 0));
   res.json(rows);
 });
 
@@ -124,6 +360,30 @@ router.post('/rollouts/:id/start', requireWrite, async (req: Request, res: Respo
 const changelogCache = new Map<string, string>();
 const CHANGELOG_CACHE_MAX = 100;
 
+/**
+ * PUT /api/firmware/channel -- set or clear the update channel override on
+ * several devices at once (#162).
+ *
+ * Takes a list so the same call serves one device and every device carrying a
+ * tag, which is how "group-level" overrides work: tags are the groups. A null
+ * channel clears the override and the devices follow the fleet setting again.
+ * Takes effect at each device's next update check.
+ */
+router.put('/channel', requireWrite, async (req: Request, res: Response) => {
+  const { deviceIds, channel } = req.body as { deviceIds?: unknown; channel?: unknown };
+  if (!Array.isArray(deviceIds) || deviceIds.length === 0 || !deviceIds.every((n) => Number.isInteger(n))) {
+    return res.status(400).json({ error: 'deviceIds must be a non-empty list of device ids' });
+  }
+  if (channel !== null && !isUpdateChannel(channel)) {
+    return res.status(400).json({ error: `channel must be one of ${UPDATE_CHANNELS.join(', ')}, or null` });
+  }
+  const rows = await query<{ id: number }>(
+    `UPDATE devices SET update_channel = $1 WHERE id = ANY($2::int[]) RETURNING id`,
+    [channel, deviceIds]
+  );
+  return res.json({ updated: rows.length });
+});
+
 router.get('/changelog/:version', async (req: Request, res: Response) => {
   const version = String(req.params.version).trim();
   // RouterOS versions: 7.23.1, 7.16, 6.49.10, plus rc/beta suffixes (7.20rc3)
@@ -131,6 +391,15 @@ router.get('/changelog/:version', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Invalid RouterOS version' });
   }
   const url = `https://download.mikrotik.com/routeros/${version}/CHANGELOG`;
+
+  // Dark Site Mode. Checked before the cache too, so turning it off takes
+  // effect immediately rather than after the cached copies expire.
+  const flag = await query<{ value: unknown }>(
+    `SELECT value FROM app_settings WHERE key = 'firmware_changelog_enabled'`
+  ).catch(() => []);
+  if (flag[0]?.value === false) {
+    return res.status(409).json({ version, url, disabled: true, error: 'RouterOS changelogs are disabled in Dark Site Mode' });
+  }
 
   const cached = changelogCache.get(version);
   if (cached) return res.json({ version, url, text: cached });

@@ -1,5 +1,70 @@
 import { useState } from 'react';
-import { AlertTriangle, RefreshCw, ShieldCheck, ShieldAlert, Route } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { AlertTriangle, RefreshCw, ShieldCheck, ShieldAlert, Route, Loader2 } from 'lucide-react';
+import { devicesApi } from '../services/api';
+
+/**
+ * Whether this device can arm auto-revert right now, checked when a risky-change
+ * dialog opens. The dialogs used to promise protection unconditionally, while the
+ * backend only found out afterwards, which on a device that could not arm it
+ * meant the change ran with no way back.
+ */
+function useGuardReadiness(deviceId?: number) {
+  return useQuery({
+    queryKey: ['change-guard-check', deviceId],
+    queryFn: () => devicesApi.changeGuardCheck(deviceId!).then((r) => r.data),
+    enabled: !!deviceId,
+    staleTime: 60_000,
+    retry: false,
+  });
+}
+
+type Readiness = ReturnType<typeof useGuardReadiness>;
+
+function ReadinessNote({ readiness, blocking }: { readiness: Readiness; blocking: boolean }) {
+  if (readiness.isLoading) {
+    return (
+      <div className="flex items-start gap-2 text-xs text-gray-500 dark:text-slate-400">
+        <Loader2 className="w-4 h-4 flex-shrink-0 animate-spin" />
+        <span>Checking that this device can undo the change by itself if it goes wrong…</span>
+      </div>
+    );
+  }
+  if (readiness.isError || !readiness.data) {
+    return (
+      <div className="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400">
+        <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+        <span>
+          Couldn&apos;t check auto-revert on this device. If it can&apos;t be armed when you apply,
+          a change that risks cutting off management is refused rather than applied unprotected.
+        </span>
+      </div>
+    );
+  }
+  if (readiness.data.ready) {
+    return (
+      <div className="flex items-start gap-2 text-xs text-gray-500 dark:text-slate-400">
+        <ShieldCheck className="w-4 h-4 flex-shrink-0 text-green-600 dark:text-green-400" />
+        <span>
+          Auto-revert is ready: the device saves a restore point first. If it stops responding
+          after this change, it restores itself automatically and comes back.
+        </span>
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-lg border border-red-300 bg-red-50 dark:bg-red-900/20 dark:border-red-800 p-3 text-xs text-red-800 dark:text-red-300 flex items-start gap-2">
+      <ShieldAlert className="w-4 h-4 flex-shrink-0" />
+      <span>
+        This device can&apos;t undo a change by itself right now
+        {readiness.data.reason ? ` (${readiness.data.reason})` : ''}.{' '}
+        {blocking
+          ? 'A change predicted to cut off management won\u2019t be applied without it.'
+          : 'If the change risks cutting off management, it won\u2019t be applied.'}
+      </span>
+    </div>
+  );
+}
 
 /**
  * Confirmation for a change that could sever the manager's path to a device.
@@ -17,6 +82,8 @@ export interface ChangeGuardDialogProps {
   confirmLabel: string;
   /** When false, the safety net is unavailable and the change is unprotected. */
   protectedByGuard?: boolean;
+  /** When given, the device's real auto-revert readiness is checked and shown. */
+  deviceId?: number;
   pending?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -24,8 +91,9 @@ export interface ChangeGuardDialogProps {
 
 export default function ChangeGuardDialog({
   title, description, reason, confirmLabel,
-  protectedByGuard = true, pending = false, onConfirm, onCancel,
+  protectedByGuard = true, deviceId, pending = false, onConfirm, onCancel,
 }: ChangeGuardDialogProps) {
+  const readiness = useGuardReadiness(deviceId);
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-sm">
       <div className="card w-full max-w-md mx-4 p-6 space-y-4">
@@ -43,7 +111,9 @@ export default function ChangeGuardDialog({
           </div>
         )}
 
-        {protectedByGuard ? (
+        {deviceId ? (
+          <ReadinessNote readiness={readiness} blocking={false} />
+        ) : protectedByGuard ? (
           <div className="flex items-start gap-2 text-xs text-gray-500 dark:text-slate-400">
             <ShieldCheck className="w-4 h-4 flex-shrink-0 text-green-600 dark:text-green-400" />
             <span>
@@ -115,6 +185,8 @@ export interface LockoutVerdictDialogProps {
   verdict: LockoutVerdict;
   /** Typed into the confirm box for a critical verdict — normally the device name. */
   confirmPhrase: string;
+  /** The device the change targets; its auto-revert readiness is checked before confirming. */
+  deviceId?: number;
   pending?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -126,11 +198,16 @@ export interface LockoutVerdictDialogProps {
  * can verify is one they'll act on, rather than click past.
  */
 export function LockoutVerdictDialog({
-  verdict, confirmPhrase, pending = false, onConfirm, onCancel,
+  verdict, confirmPhrase, deviceId, pending = false, onConfirm, onCancel,
 }: LockoutVerdictDialogProps) {
   const [typed, setTyped] = useState('');
+  const readiness = useGuardReadiness(deviceId);
   const critical = verdict.severity === 'critical';
-  const canConfirm = !critical || typed.trim() === confirmPhrase;
+  // Overriding a warning is only offered when the device can undo the change by
+  // itself; the server refuses it otherwise, so the button says so up front.
+  const guardBlocked = !!deviceId && readiness.data?.ready === false;
+  const guardChecking = !!deviceId && readiness.isLoading;
+  const canConfirm = (!critical || typed.trim() === confirmPhrase) && !guardBlocked && !guardChecking;
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-sm">
@@ -207,11 +284,16 @@ export function LockoutVerdictDialog({
               placeholder={confirmPhrase}
               autoComplete="off"
             />
-            <p className="mt-1 text-xs text-gray-500 dark:text-slate-400">
-              The change will still run under auto-revert: if the device stops responding, it
-              restores itself and comes back.
-            </p>
           </div>
+        )}
+
+        {deviceId ? (
+          <ReadinessNote readiness={readiness} blocking />
+        ) : (
+          <p className="text-xs text-gray-500 dark:text-slate-400">
+            This change requires auto-revert: if the device can&apos;t arm it, the change is
+            refused rather than applied without a way back.
+          </p>
         )}
 
         <div className="flex justify-end gap-2 pt-1">
@@ -238,16 +320,38 @@ export interface GuardResult {
   confirmed: boolean;
   auto_reverting: boolean;
   unprotected_reason: string | null;
+  /** Set when the change was kept but its revert could not be proven removed. */
+  revert_may_fire_at?: string | null;
+  /** The revert's scheduler was gone before the commit could disable it. */
+  revert_may_have_fired?: boolean;
 }
 
 /** Human-readable outcome for a guarded change, or null when nothing to say. */
 export function guardOutcomeMessage(guard?: GuardResult): { tone: 'ok' | 'warn'; text: string } | null {
   if (!guard) return null;
+  if (guard.revert_may_have_fired) {
+    return {
+      tone: 'warn',
+      text: 'The change was applied and the device stayed reachable, but its auto-revert was gone '
+        + 'before it could be cancelled, so the revert may already have run. The device may have '
+        + 'restored its previous configuration (in binary mode, with a restart). Check whether the '
+        + 'change is still there.',
+    };
+  }
   if (guard.auto_reverting) {
     return {
       tone: 'warn',
       text: 'The device stopped responding after this change, so it is restoring itself to the '
         + 'previous configuration. It should come back shortly — the change was not kept.',
+    };
+  }
+  if (guard.revert_may_fire_at) {
+    return {
+      tone: 'warn',
+      text: 'Applied and the device is reachable, but the auto-revert could not be confirmed as '
+        + 'removed. The device may restore its previous configuration (and restart) at about '
+        + `${new Date(guard.revert_may_fire_at).toLocaleTimeString()}. Check its scheduler for an `
+        + 'entry starting "mtm-revert-".',
     };
   }
   if (guard.confirmed) {
@@ -257,4 +361,70 @@ export function guardOutcomeMessage(guard?: GuardResult): { tone: 'ok' | 'warn';
     return { tone: 'warn', text: `Applied without auto-revert protection: ${guard.unprotected_reason}` };
   }
   return null;
+}
+
+// ─── Shared handling for guarded writes ───────────────────────────────────────
+
+export interface PendingLockout {
+  verdict: LockoutVerdict;
+  /** Re-sends the same change with the lockout warning confirmed. */
+  retry: () => void;
+}
+
+/**
+ * State and callbacks for a screen whose writes run under Change Guard: a
+ * predicted lockout opens the verdict dialog with a retry, and an outcome
+ * worth knowing about (auto-reverting, unprotected) becomes a notice.
+ * Pair with <GuardedWriteUi>.
+ */
+export function useGuardedWrite() {
+  const [lockout, setLockout] = useState<PendingLockout | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  /** onError for a mutation: a lockout opens the dialog, anything else goes to `fallback`. */
+  const onError = (retry: () => void, fallback: (e: unknown) => void) => (e: unknown) => {
+    const verdict = lockoutVerdictOf(e);
+    if (verdict) setLockout({ verdict, retry });
+    else fallback(e);
+  };
+
+  /** onSuccess for a mutation: shows the guard outcome when it needs attention. */
+  const onSuccess = (res: unknown) => {
+    setLockout(null);
+    const msg = guardOutcomeMessage((res as { data?: { guard?: GuardResult } } | undefined)?.data?.guard);
+    setNotice(msg?.tone === 'warn' ? msg.text : null);
+  };
+
+  return { lockout, setLockout, notice, setNotice, onError, onSuccess };
+}
+
+export function GuardedWriteUi({
+  state, deviceId, deviceName, pending,
+}: {
+  state: ReturnType<typeof useGuardedWrite>;
+  deviceId: number;
+  deviceName?: string;
+  pending?: boolean;
+}) {
+  return (
+    <>
+      {state.notice && (
+        <div className="p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg text-sm text-amber-800 dark:text-amber-300 flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+          <span className="flex-1">{state.notice}</span>
+          <button onClick={() => state.setNotice(null)} className="text-xs underline">Dismiss</button>
+        </div>
+      )}
+      {state.lockout && (
+        <LockoutVerdictDialog
+          verdict={state.lockout.verdict}
+          confirmPhrase={deviceName || 'confirm'}
+          deviceId={deviceId}
+          pending={pending}
+          onConfirm={state.lockout.retry}
+          onCancel={() => state.setLockout(null)}
+        />
+      )}
+    </>
+  );
 }

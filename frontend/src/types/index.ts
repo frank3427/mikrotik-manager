@@ -7,6 +7,14 @@ export interface User {
   role: UserRole;
   auth_provider?: 'local' | 'oidc';
   created_at?: string;
+  /** Still on the default password: must change it before using the app. */
+  must_change_password?: boolean;
+  /**
+   * Per-site roles for an account limited to particular sites (P1-7), by site
+   * id. Absent for a fleet-wide account. When set, `role` is the account's
+   * highest site role capped at operator, so fleet-admin controls stay hidden.
+   */
+  siteRoles?: Record<string, UserRole>;
 }
 
 export interface IpAddress {
@@ -39,6 +47,9 @@ export interface PortVlanConfig {
   pvid?: number;
   tagged_vlans?: number[];
   untagged_vlans?: number[];
+  mode?: 'access' | 'trunk';
+  /** Trunk only: tagged_vlans is the complete set, so unlisted VLANs are removed. */
+  replace_tagged?: boolean;
 }
 
 export type DeviceStatus = 'online' | 'offline' | 'unknown';
@@ -46,9 +57,31 @@ export type DeviceType = 'router' | 'switch' | 'wireless_ap' | 'other';
 
 export interface Device {
   id: number;
+  /** A stored password (#199). Absent on rows from older endpoints. */
+  has_password?: boolean;
+  /** A verified SSH key the manager logs in with (#199). */
+  has_ssh_key?: boolean;
   name: string;
+  /**
+   * False: `name` follows the router's own /system/identity on every poll.
+   * True: an operator named it deliberately (Add Device, or a rename in Edit
+   * Device) and it stays put until "Use the router's identity" clears this.
+   */
+  name_locked?: boolean;
+  /** The router's own name (/system identity), read every poll (#253). */
+  ros_identity?: string | null;
+  /**
+   * Added over SSH only (#174): the RouterOS API isn't enabled yet. Reached
+   * over SSH; the API is retried and the flag clears once it answers.
+   */
+  ssh_only?: boolean;
+  /** When the API was last tried, and why it didn't work (SSH-only devices). */
+  api_checked_at?: string | null;
+  api_check_error?: string | null;
   ip_address: string;
   api_port: number;
+  /** api-ssl on this port (#257). Null: TLS exactly when the port is 8729. */
+  api_tls?: boolean | null;
   api_username: string;
   ssh_port?: number;
   ssh_username?: string;
@@ -64,17 +97,49 @@ export interface Device {
   status: DeviceStatus;
   last_seen?: string;
   notes?: string;
+  site_id?: number | null;
   location_address?: string;
   location_lat?: number;
   location_lng?: number;
+  /**
+   * Where the device is for display: its own location, or its site's when it
+   * has none (#167). Computed by the server; never saved on the device.
+   */
+  effective_location?: {
+    address: string | null;
+    lat: number | null;
+    lng: number | null;
+    source: 'device' | 'site';
+  } | null;
   rack_name?: string;
   rack_slot?: string;
+  /** Hardware health from /system/health (#168). */
+  health_status?: 'ok' | 'degraded' | 'unknown' | null;
+  health_issues?: { issues?: HealthIssue[]; ignored?: HealthIssue[] } | null;
+  health_checked_at?: string | null;
+  health_ignored?: string[];
+  /** Expected to drop out (solar, battery); see utils/deviceState. */
+  intermittent?: boolean;
+  intermittent_alert_after_min?: number;
   /** Detected wireless role: none | standalone | cap | controller | controller_cap. */
   wifi_role?: string | null;
   has_lte?: boolean;
+  /** When it last booted, from its uptime (#326). */
+  boot_at?: string | null;
+  /** Reboots in the last 30 days, including ones too quick to show as outages (device detail only). */
+  reboots_30d?: number;
+  last_reboot_at?: string | null;
+  /** Runs User Manager, RouterOS's RADIUS server (#251); null until checked. */
+  user_manager?: boolean | null;
   created_at: string;
   updated_at?: string;
   tags?: { id: number; name: string; color: string }[];
+}
+
+export interface HealthIssue {
+  item: string;
+  value: string;
+  message: string;
 }
 
 export interface Tag {
@@ -96,6 +161,21 @@ export interface Interface {
   comment?: string;
   speed?: string;
   full_duplex?: boolean;
+  /**
+   * RouterOS's factory name for the port, which survives renaming.
+   * Absent on bridges, bonds and VLANs, and on rows collected before v0.24.15.
+   */
+  default_name?: string | null;
+  /** Negotiated rate from /interface/ethernet/monitor, e.g. "25Gbps". */
+  link_rate?: string | null;
+  /**
+   * Tri-state. Null means the port is not an SFP cage — RouterOS omits the
+   * field on copper. False is an empty cage, true a seated module.
+   */
+  sfp_present?: boolean | null;
+  sfp_type?: string | null;
+  sfp_connector?: string | null;
+  sfp_vendor?: string | null;
   config_json?: Record<string, string>;
   updated_at?: string;
 }
@@ -123,6 +203,8 @@ export interface BridgeVlanEntry {
   untagged_vlan_ids?: string[];
   /** True when the port is a tagged member of at least one VLAN (i.e. a trunk). */
   tagged: boolean;
+  /** The bridge-port row as RouterOS printed it: `hw-offload`, `dynamic` and the rest. */
+  config_json?: Record<string, string> | null;
 }
 
 export interface SwitchPort extends Interface {
@@ -215,6 +297,9 @@ export interface Client {
   tx_bytes: number;
   rx_bytes: number;
   signal_strength?: number;
+  /** Link rates from the access point's side, bits per second (#252); wireless only. */
+  tx_rate_bps?: number | string | null;
+  rx_rate_bps?: number | string | null;
   client_type: 'wired' | 'wireless';
   active: boolean;
   last_seen?: string;
@@ -231,6 +316,11 @@ export interface Backup {
   backup_type: 'manual' | 'scheduled' | 'config-snapshot';
   notes?: string;
   created_at: string;
+  /** Holds passwords and keys; encrypted on disk, admin-only to view (#172). */
+  contains_secrets?: boolean;
+  /** The device's type and tags, for the table (#219). */
+  device_type?: string;
+  device_tags?: { id: number; name: string; color: string }[];
 }
 
 export interface TopologyDevice {
@@ -266,6 +356,54 @@ export interface TopologyLink {
   discovered_at: string;
 }
 
+/** A node the manager doesn't manage, added by hand (#147): ISP modem, server, NAS... */
+export interface TopologyNode {
+  id: number;
+  site_id: number | null;
+  name: string;
+  kind: string;
+  address: string | null;
+  notes: string | null;
+}
+
+/** One end of a hand-drawn link: a managed device, your own node, or a discovered neighbour. */
+export interface HandLinkEnd {
+  kind: 'device' | 'node' | 'external';
+  /** Device or node id, or the neighbour's map id ("ext-…"). */
+  ref: number | string;
+  /** For a neighbour: its name when the link was drawn, in case discovery stops seeing it. */
+  name?: string | null;
+}
+
+/** A link drawn by hand (#147). */
+export interface HandLink {
+  id: number;
+  label: string | null;
+  /** The port at each end, as typed (#260). */
+  aPort?: string | null;
+  bPort?: string | null;
+  a: HandLinkEnd;
+  b: HandLinkEnd;
+}
+
+/** A client device, attached where it really connects (#147). */
+export interface TopologyClient {
+  mac: string;
+  name: string;
+  ip: string | null;
+  deviceId: number;
+  interface: string | null;
+  wireless: boolean;
+  /** False when only ARP or an uplink saw it, so the attachment is a guess. */
+  portKnown: boolean;
+  /** Seen on a port facing an unmanaged neighbour: drawn behind that neighbour. */
+  behindNeighbour?: boolean;
+  /** The VLAN it was seen in, labelled ("VLAN 1212 · guest" or a VLAN interface name), for grouping (#296). */
+  vlan?: string | null;
+  vendor?: string | null;
+  lastSeen?: string | null;
+}
+
 export interface ExternalTopologyNode {
   id: string;
   name: string;
@@ -276,7 +414,7 @@ export interface ExternalTopologyNode {
 }
 
 export interface MetricsSummary {
-  devices: { total: number; online: number; offline: number };
+  devices: { total: number; online: number; offline: number; degraded?: number; intermittent_offline?: number };
   clients: { total: number; active: number };
   alerts: { critical: number; warning: number };
   availability?: { fleetUptimePct30d: number };
@@ -375,6 +513,9 @@ export interface WirelessAP {
   radio_count: number;
   client_count: number;
   ssid_count: number;
+  wifi_role?: string | null;
+  /** False for a CAPsMAN controller with no radios of its own: listed, not an AP (#365). */
+  has_radios?: boolean;
 }
 
 export interface WirelessMetricPoint {
@@ -430,6 +571,8 @@ export interface RfChannelRow {
   clashes: RfClash[];
   controller_device_id: number | null;
   controller_name: string | null;
+  /** The RfLocation this radio is analysed in: a controller, or a site's standalone APs. */
+  location_key: string;
 }
 
 export interface RfLocation {
@@ -470,21 +613,6 @@ export interface RfTxQualityRow {
   tx_retry_pct: number;
 }
 
-export interface RfConnectivityStage {
-  success: number;
-  failure: number;
-  pct: number | null;
-}
-
-export interface RfConnectivity {
-  range: string;
-  log_derived: boolean;
-  stages: {
-    association: RfConnectivityStage;
-    authentication: RfConnectivityStage;
-    dhcp: RfConnectivityStage;
-  };
-}
 
 export interface ConfigSnapshotMeta {
   id: number;

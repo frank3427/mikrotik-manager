@@ -1,9 +1,17 @@
 import { useState, useEffect } from 'react';
+import ReviewChangesButton from '../components/common/ReviewChangesButton';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Clock, RefreshCw, AlertTriangle, Save } from 'lucide-react';
 import clsx from 'clsx';
 import { networkServicesApi, devicesApi } from '../services/api';
+import { liveRefetch, type LiveRow } from '../utils/liveFreshness';
 import { useCanWrite } from '../hooks/useCanWrite';
+import { apiErrorMessage } from '../utils/apiError';
+import ListInput from '../components/common/ListInput';
+import { splitList } from '../utils/ipPrefix';
+import { isValidIPv4, isValidIPv6, isValidHostname } from '../utils/deviceAddress';
+import DevicePicker from '../components/common/DevicePicker';
+import { shortList } from '../utils/deviceCards';
 
 function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
   return (
@@ -70,6 +78,7 @@ export default function NetworkServicesNTPPage() {
     queryKey: ['network-services-overview'],
     queryFn: () => networkServicesApi.overview().then(r => r.data as Record<string, unknown>[]),
     staleTime: 60_000,
+    refetchInterval: (q) => liveRefetch(q.state.data as LiveRow[] | undefined),
   });
   const conflictDevices = overview.filter(d => {
     if ((d.id as number) === deviceId) return false;
@@ -90,11 +99,13 @@ export default function NetworkServicesNTPPage() {
     }
   }, [ntp]);
 
-  const save = useMutation({
-    mutationFn: () => networkServicesApi.setNtp(deviceId, {
+  const saveRequest = () => networkServicesApi.setNtp(deviceId, {
       server_enabled: serverEnabled, server_broadcast: serverBroadcast, server_manycast: serverManycast,
       client_enabled: clientEnabled, client_mode: clientMode, client_servers: clientServers,
-    }),
+    });
+  const save = useMutation({
+    meta: { inlineError: true },
+    mutationFn: saveRequest,
     onSuccess: () => {
       setDirty(false);
       qc.invalidateQueries({ queryKey: ['ns-ntp', deviceId] });
@@ -126,11 +137,11 @@ export default function NetworkServicesNTPPage() {
       {/* Device selector */}
       <div className="card p-4">
         <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">Select Device</label>
-        <select className="input w-full max-w-xs" value={selectedDeviceId}
-          onChange={e => setSelectedDeviceId(e.target.value === '' ? '' : parseInt(e.target.value))}>
-          <option value="">— Choose a device —</option>
-          {devices.map(d => <option key={d.id} value={d.id}>{d.name} ({d.ip_address}){d.status !== 'online' ? ' — offline' : ''}</option>)}
-        </select>
+        <DevicePicker
+          className="max-w-xs" devices={devices} aria-label="Device"
+          value={selectedDeviceId === '' ? null : selectedDeviceId}
+          onChange={(id) => setSelectedDeviceId(id ?? '')}
+        />
         {selectedDevice?.status !== 'online' && deviceId > 0 && (
           <div className="mt-2 flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
             <AlertTriangle className="w-3.5 h-3.5" />This device is currently offline.
@@ -142,7 +153,7 @@ export default function NetworkServicesNTPPage() {
       {conflictDevices.length > 0 && deviceId > 0 && serverEnabled && (
         <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-sm text-amber-700 dark:text-amber-300">
           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-          <span>NTP server also enabled on: <strong>{conflictDevices.map(d => d.name as string).join(', ')}</strong>. Multiple NTP servers may cause time drift.</span>
+          <span>NTP server also enabled on: <strong>{shortList(conflictDevices.map(d => String(d.name)))}</strong>. Multiple NTP servers may cause time drift.</span>
         </div>
       )}
 
@@ -171,7 +182,7 @@ export default function NetworkServicesNTPPage() {
             </div>
             <div className="p-5 space-y-4">
               {!serverHasData ? (
-                <p className="text-sm text-gray-400 dark:text-slate-500">NTP server settings not available (requires RouterOS 7).</p>
+                <p className="text-sm text-gray-400 dark:text-slate-500">This device has no NTP server. On RouterOS 6 it comes with the optional ntp package; the client below works without it.</p>
               ) : (
                 <>
                   <SettingRow label="Enable NTP Server" description="Allow other devices on the network to sync their clocks to this device.">
@@ -227,10 +238,12 @@ export default function NetworkServicesNTPPage() {
                   {(clientMode === 'unicast' || clientMode === 'manycast') && (
                     <div>
                       <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-1">NTP Servers</label>
-                      <input type="text" className="input w-full max-w-sm" value={clientServers}
-                        onChange={e => { setClientServers(e.target.value); mark(); }}
-                        placeholder="pool.ntp.org,time.cloudflare.com" disabled={!canWrite || !clientEnabled} />
-                      <p className="mt-1 text-xs text-gray-400 dark:text-slate-500">Comma-separated list of NTP server addresses.</p>
+                      <div className="max-w-sm">
+                        <ListInput value={splitList(clientServers)} onChange={(v) => { setClientServers(v.join(',')); mark(); }}
+                          ariaLabel="NTP servers" placeholder="pool.ntp.org" disabled={!canWrite || !clientEnabled}
+                          validate={(e) => (isValidIPv4(e) || isValidIPv6(e) || isValidHostname(e) ? null : `${e} isn\u2019t an address or host name`)} />
+                      </div>
+                      <p className="mt-1 text-xs text-gray-400 dark:text-slate-500">NTP server addresses or host names.</p>
                     </div>
                   )}
 
@@ -268,6 +281,7 @@ export default function NetworkServicesNTPPage() {
                 className="flex items-center gap-1.5 px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg disabled:opacity-50 transition-colors">
                 <Save className="w-3.5 h-3.5" />{save.isPending ? 'Saving…' : 'Save Changes'}
               </button>
+              <ReviewChangesButton request={saveRequest} onApply={() => save.mutate()} applyLabel="Save" disabled={save.isPending} />
               <button onClick={() => {
                 if (ntp) {
                   setServerEnabled(ntp.server?.['enabled'] === 'yes');
@@ -279,7 +293,7 @@ export default function NetworkServicesNTPPage() {
                   setDirty(false);
                 }
               }} className="text-sm text-gray-500 hover:text-gray-700">Discard</button>
-              {save.isError && <span className="text-sm text-red-500">{(save.error as Error).message}</span>}
+              {save.isError && <span className="text-sm text-red-500">{apiErrorMessage(save.error)}</span>}
               {save.isSuccess && <span className="text-sm text-green-600 dark:text-green-400">Saved</span>}
             </div>
           )}

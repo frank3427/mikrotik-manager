@@ -1,11 +1,25 @@
 import { Router, Request, Response } from 'express';
+import { deviceSiteAccess, deviceIdParam } from '../utils/siteAccess';
 import { query, queryOne } from '../config/database';
 import { requireAuth, requireWrite } from '../middleware/auth';
-import { BackupService } from '../services/BackupService';
+import { BackupService, describeRestore } from '../services/BackupService';
 import { DeviceCollector, DeviceRow } from '../services/mikrotik/DeviceCollector';
 
 const router = Router();
 router.use(requireAuth);
+// Every route starts with the device id; a site-scoped account only reaches its own sites' devices (P1-7).
+router.use(deviceSiteAccess(deviceIdParam));
+
+// The :id a handler acts on must be the plain number the site check read
+// (GHSA-6xq3-q9m5-7hxp); anything else is answered as not found.
+router.param('deviceId', (_req, res, next, id) => {
+  if (!/^\d{1,10}$/.test(String(id))) { res.status(404).json({ error: 'Device not found' }); return; }
+  next();
+});
+router.param('id', (_req, res, next, id) => {
+  if (!/^\d{1,10}$/.test(String(id))) { res.status(404).json({ error: 'Device not found' }); return; }
+  next();
+});
 
 const backupService = new BackupService();
 
@@ -20,6 +34,18 @@ interface SnapshotRow {
   change_summary: string | null;
   backup_id: number | null;
   collected_at: string;
+  contains_secrets: boolean | null;
+}
+
+/**
+ * Snapshots taken from RouterOS v6 before hide-sensitive was used can hold
+ * passwords and keys, so only admins may read them, as with secret backups.
+ */
+const SECRET_SNAPSHOT_MESSAGE =
+  'This snapshot was taken from a RouterOS v6 device before passwords were left out, so it may contain them. Only admins can view it.';
+
+function mayRead(req: Request, row: { contains_secrets: boolean | null }): boolean {
+  return !row.contains_secrets || req.user?.role === 'admin';
 }
 
 /**
@@ -41,7 +67,7 @@ function snapshotText(row: { config_text: string | null; config_json: Record<str
 router.get('/:deviceId', async (req: Request, res: Response) => {
   const rows = await query(
     `SELECT id, device_id, config_hash, change_summary, backup_id, collected_at,
-            (backup_id IS NOT NULL) AS has_backup
+            (backup_id IS NOT NULL) AS has_backup, COALESCE(contains_secrets, false) AS contains_secrets
      FROM device_configs
      WHERE device_id = $1
      ORDER BY collected_at DESC`,
@@ -53,11 +79,12 @@ router.get('/:deviceId', async (req: Request, res: Response) => {
 // GET /api/config-history/:deviceId/:id — full config for a single snapshot
 router.get('/:deviceId/:id', async (req: Request, res: Response) => {
   const row = await queryOne<SnapshotRow>(
-    `SELECT id, device_id, config_json, config_text, config_hash, change_summary, backup_id, collected_at
+    `SELECT id, device_id, config_json, config_text, config_hash, change_summary, backup_id, collected_at, contains_secrets
      FROM device_configs WHERE id = $1 AND device_id = $2`,
     [req.params.id, req.params.deviceId]
   );
   if (!row) return res.status(404).json({ error: 'Snapshot not found' });
+  if (!mayRead(req, row)) return res.status(403).json({ error: SECRET_SNAPSHOT_MESSAGE });
   return res.json({ ...row, text: snapshotText(row) });
 });
 
@@ -65,15 +92,16 @@ router.get('/:deviceId/:id', async (req: Request, res: Response) => {
 router.get('/:deviceId/:fromId/diff/:toId', async (req: Request, res: Response) => {
   const [from, to] = await Promise.all([
     queryOne<SnapshotRow>(
-      `SELECT id, config_text, config_json, change_summary, collected_at FROM device_configs WHERE id = $1 AND device_id = $2`,
+      `SELECT id, config_text, config_json, change_summary, collected_at, contains_secrets FROM device_configs WHERE id = $1 AND device_id = $2`,
       [req.params.fromId, req.params.deviceId]
     ),
     queryOne<SnapshotRow>(
-      `SELECT id, config_text, config_json, change_summary, collected_at FROM device_configs WHERE id = $1 AND device_id = $2`,
+      `SELECT id, config_text, config_json, change_summary, collected_at, contains_secrets FROM device_configs WHERE id = $1 AND device_id = $2`,
       [req.params.toId, req.params.deviceId]
     ),
   ]);
   if (!from || !to) return res.status(404).json({ error: 'Snapshot not found' });
+  if (!mayRead(req, from) || !mayRead(req, to)) return res.status(403).json({ error: SECRET_SNAPSHOT_MESSAGE });
 
   return res.json({
     from: { id: from.id, text: snapshotText(from), collected_at: from.collected_at },
@@ -89,7 +117,12 @@ router.post('/:deviceId/capture', requireWrite, async (req: Request, res: Respon
   const collector = new DeviceCollector(device);
   try {
     await collector.connect();
-    const created = await collector.snapshotConfig('manual');
+    const outcome = await collector.snapshotConfig('manual');
+    // A failed capture is a failure, not "no changes" (outside review C10).
+    if (outcome.status === 'failed') {
+      return res.status(502).json({ error: `Capture failed: ${outcome.reason}` });
+    }
+    const created = outcome.status === 'created';
     const latest = await queryOne(
       `SELECT id, config_hash, change_summary, backup_id, collected_at,
               (backup_id IS NOT NULL) AS has_backup
@@ -100,7 +133,9 @@ router.post('/:deviceId/capture', requireWrite, async (req: Request, res: Respon
       created,
       message: created
         ? 'Snapshot captured'
-        : 'No configuration changes since the last snapshot',
+        : outcome.status === 'repaired'
+          ? 'No configuration changes; the restorable backup the last snapshot was missing has been saved'
+          : 'No configuration changes since the last snapshot',
       snapshot: latest,
     });
   } catch (err) {
@@ -122,8 +157,12 @@ router.post('/:deviceId/:id/rollback', requireWrite, async (req: Request, res: R
   }
 
   try {
-    await backupService.restoreBackup(snap.backup_id);
-    return res.json({ message: 'Rollback initiated successfully' });
+    const outcome = await backupService.restoreBackup(snap.backup_id, { userId: req.user?.userId ?? null });
+    const message = describeRestore(outcome);
+    // Only a complete (or self-reverting) restore is a success; the UI shows the
+    // message either way, and a partial one says exactly where it stopped.
+    const ok = outcome.status === 'applied' || outcome.status === 'reverting';
+    return res.status(ok ? 200 : 422).json({ ...outcome, message, ...(ok ? {} : { error: message }) });
   } catch (err) {
     return res.status(500).json({ error: `Rollback failed: ${(err as Error).message}` });
   }

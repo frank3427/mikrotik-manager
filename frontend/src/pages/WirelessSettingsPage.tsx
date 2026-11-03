@@ -1,13 +1,16 @@
 import { useState, useEffect } from 'react';
+import ReviewChangesButton from '../components/common/ReviewChangesButton';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  Wifi, Plus, Pencil, Trash2, RefreshCw, ChevronDown, ChevronRight,
+  Plus, Pencil, Trash2, RefreshCw, ChevronDown, ChevronRight,
   Eye, EyeOff, CheckCircle, XCircle, Power, ScanLine, Radio,
 } from 'lucide-react';
 import { wirelessApi, settingsApi } from '../services/api';
-import { useCanWrite } from '../hooks/useCanWrite';
+import { useCanWrite, useIsFleetAdmin } from '../hooks/useCanWrite';
+import { useGuardedWrite, GuardedWriteUi } from '../components/ChangeGuardDialog';
 import type { WirelessAP } from '../types';
 import clsx from 'clsx';
+import DevicePicker from '../components/common/DevicePicker';
 
 // ─── Radio helpers ────────────────────────────────────────────────────────────
 
@@ -233,6 +236,12 @@ function defaultSsidForm(isNewWifiPkg: boolean, firstRadio: string, firstRadioBa
   };
 }
 
+/** The confirmation before taking a wireless interface off the air (#294). */
+function disableWirelessPrompt(name: string, ssid?: string): string {
+  return `Disable ${name}${ssid ? ` ("${ssid}")` : ''}? Clients connected to it will be disconnected, `
+    + 'and if this device is managed over that wireless link, the manager may lose contact.';
+}
+
 function SsidModal({
   apId, existing, isNewWifiPkg, availableRadios, allAps, onClose,
 }: {
@@ -276,7 +285,8 @@ function SsidModal({
 
   const parseArr = (v?: string) => v ? v.split(',').map(s => s.trim()).filter(Boolean) : [];
 
-  const [form, setForm] = useState<SsidForm>(() => existing ? {
+  // What the form held when it opened; an edit sends only what differs from it.
+  const [loadedForm] = useState<SsidForm>(() => existing ? {
     ssid:                existing.ssid || '',
     mode:                existing.mode || (isNewWifiPkg ? 'ap' : 'ap-bridge'),
     band:                existing.band || '',
@@ -296,6 +306,7 @@ function SsidModal({
     country:             existing.country || '',
     installation:        existing.installation || 'indoor',
   } : defaultSsidForm(isNewWifiPkg, availableRadios[0]?.name ?? '', availableRadios[0]?.band ?? ''));
+  const [form, setForm] = useState<SsidForm>(loadedForm);
 
   const set = (k: keyof SsidForm) => (v: string | boolean) => setForm(f => ({ ...f, [k]: v }));
 
@@ -361,38 +372,59 @@ function SsidModal({
 
   const [error, setError] = useState('');
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    if (!form.ssid.trim()) { setError('SSID name is required'); return; }
+  /** What a save would send, or why it can't be saved; null when nothing changed. */
+  const savePayload = (): { data: Record<string, unknown> } | { error: string } | null => {
+    if (!form.ssid.trim()) return { error: 'SSID name is required' };
     if (!isEdit && form.authentication_types.length > 0 && !form.passphrase.trim()) {
-      setError('Passphrase is required when authentication types are selected');
-      return;
+      return { error: 'Passphrase is required when authentication types are selected' };
     }
     if (!isEdit && deployToApIds.length === 0) {
-      setError('Select at least one AP to deploy to');
-      return;
+      return { error: 'Select at least one AP to deploy to' };
     }
+    const build = (f: SsidForm): Record<string, unknown> => {
     const data: Record<string, unknown> = {
-      ssid: form.ssid, mode: form.mode, disabled: form.disabled,
+      ssid: f.ssid, mode: f.mode, disabled: f.disabled,
     };
-    if (form.band) data.band = form.band;
-    if (form.passphrase.trim()) data.passphrase = form.passphrase;
-    if (form.authentication_types.length > 0) data.authentication_types = form.authentication_types;
+    if (f.band) data.band = f.band;
+    if (f.passphrase.trim()) data.passphrase = f.passphrase;
+    if (f.authentication_types.length > 0) data.authentication_types = f.authentication_types;
     // Bridge and radio are per-device — only apply in single-AP mode
     if (!isBulk) {
-      data.bridge = form.bridge;
-      if (form.bridge && form.vlan_id) data.vlan_id = form.vlan_id;
-      if (form.master_interface) data.master_interface = form.master_interface;
+      data.bridge = f.bridge;
+      if (f.bridge && f.vlan_id) data.vlan_id = f.vlan_id;
+      if (f.master_interface) data.master_interface = f.master_interface;
     }
-    if (form.frequency)     data.frequency     = form.frequency;
-    if (form.channel_width) data.channel_width = form.channel_width;
-    if (form.tx_power)      data.tx_power      = form.tx_power;
-    if (form.tx_power_mode) data.tx_power_mode = form.tx_power_mode;
-    if (form.antenna_gain)  data.antenna_gain  = form.antenna_gain;
-    if (form.country)       data.country       = form.country;
-    if (form.installation)  data.installation  = form.installation;
+    if (f.frequency)     data.frequency     = f.frequency;
+    if (f.channel_width) data.channel_width = f.channel_width;
+    if (f.tx_power)      data.tx_power      = f.tx_power;
+    if (f.tx_power_mode) data.tx_power_mode = f.tx_power_mode;
+    if (f.antenna_gain)  data.antenna_gain  = f.antenna_gain;
+    if (f.country)       data.country       = f.country;
+    if (f.installation)  data.installation  = f.installation;
+    return data;
+    };
+    let data = build(form);
+    if (isEdit) {
+      // Only what changed. Re-sending every field on each save could pin the
+      // radio's channel and rewrite settings nobody touched.
+      const before = build(loadedForm);
+      data = Object.fromEntries(Object.entries(data).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(before[k])));
+      // A frequency that was cleared means "automatic" again.
+      if (loadedForm.frequency && !form.frequency) data.frequency = 'auto';
+      if (!Object.keys(data).length) return null;
+    }
+    return { data };
+  };
 
+  const handleSubmit = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    setError('');
+    const p = savePayload();
+    if (p === null) { onClose(); return; }
+    if ('error' in p) { setError(p.error); return; }
+    const { data } = p;
+    // Ticking Disabled on a running SSID asks first, as the power button does (#294).
+    if (isEdit && existing!.disabled !== 'true' && form.disabled && !confirm(disableWirelessPrompt(existing!.name, form.ssid))) return;
     if (isBulk) {
       bulkMutation.mutate(data);
     } else {
@@ -621,6 +653,20 @@ function SsidModal({
 
           <div className="flex justify-end gap-2 pt-2">
             <button type="button" className="btn-secondary" onClick={onClose}>Cancel</button>
+            {/* One AP only: a bulk deploy has its own per-AP results. */}
+            {!isBulk && (
+              <ReviewChangesButton applyLabel={isEdit ? 'Save Changes' : 'Create SSID'}
+                disabled={mutation.isPending || bulkMutation.isPending}
+                onApply={() => handleSubmit()}
+                request={() => {
+                  const p = savePayload();
+                  if (p && 'error' in p) return Promise.reject(new Error(p.error));
+                  const data = p?.data ?? {};
+                  return isEdit
+                    ? wirelessApi.updateInterface(apId, existing!.name, data)
+                    : wirelessApi.createInterface(deployToApIds[0] ?? apId, data);
+                }} />
+            )}
             <button type="submit" className="btn-primary" disabled={mutation.isPending || bulkMutation.isPending}>
               {(mutation.isPending || bulkMutation.isPending)
                 ? 'Saving…'
@@ -826,6 +872,7 @@ function APScanSettings({ canWrite }: { canWrite: boolean }) {
 
 export default function WirelessSettingsPage() {
   const canWrite = useCanWrite();
+  const isFleetAdmin = useIsFleetAdmin();
   const qc = useQueryClient();
   const [selectedApId, setSelectedApId] = useState<number | null>(null);
 
@@ -850,15 +897,33 @@ export default function WirelessSettingsPage() {
     enabled: !!selectedApId && selectedAp?.status === 'online',
   });
 
+  // Disabling or deleting the interface an AP is managed through is predicted
+  // as a lockout; confirming re-sends the change (outside review P2-8).
+  const guard = useGuardedWrite();
+  const [writeError, setWriteError] = useState('');
+  const failed = (e: unknown) =>
+    setWriteError((e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Operation failed');
+  const done = (res: unknown) => { qc.invalidateQueries({ queryKey: ['wireless-ifaces', selectedApId] }); setWriteError(''); guard.onSuccess(res); };
+
   const deleteSsidMutation = useMutation({
-    mutationFn: (name: string) => wirelessApi.deleteInterface(selectedApId!, name),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['wireless-ifaces', selectedApId] }),
+    mutationFn: ({ name, confirm }: { name: string; confirm?: boolean }) => wirelessApi.deleteInterface(selectedApId!, name, confirm),
+    onSuccess: done,
   });
 
   const toggleSsidMutation = useMutation({
-    mutationFn: ({ name, disabled }: { name: string; disabled: boolean }) =>
-      wirelessApi.updateInterface(selectedApId!, name, { disabled }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['wireless-ifaces', selectedApId] }),
+    mutationFn: ({ name, disabled, confirm }: { name: string; disabled: boolean; confirm?: boolean }) =>
+      wirelessApi.updateInterface(selectedApId!, name, { disabled, ...(confirm ? { confirm_lockout: true } : {}) }),
+    onSuccess: done,
+  });
+  const toggleSsid = (name: string, disabled: boolean, ssid?: string) => {
+    // One click used to take an SSID off the air (#294): disabling asks first.
+    if (disabled && !confirm(disableWirelessPrompt(name, ssid))) return;
+    toggleSsidMutation.mutate({ name, disabled }, {
+      onError: guard.onError(() => toggleSsidMutation.mutate({ name, disabled, confirm: true }, { onError: failed }), failed),
+    });
+  };
+  const deleteSsid = (name: string) => deleteSsidMutation.mutate({ name }, {
+    onError: guard.onError(() => deleteSsidMutation.mutate({ name, confirm: true }, { onError: failed }), failed),
   });
 
   // Detect new RouterOS 7 wifi package by interface naming (wifi1/wifi2 vs wlan1/wlan2).
@@ -884,17 +949,11 @@ export default function WirelessSettingsPage() {
       {aps.length > 1 && (
         <div className="flex items-center gap-3">
           <label className="text-sm font-medium text-gray-700 dark:text-slate-300">Access Point:</label>
-          <select
-            className="input w-auto"
-            value={selectedApId ?? ''}
-            onChange={e => setSelectedApId(Number(e.target.value))}
-          >
-            {aps.map(ap => (
-              <option key={ap.id} value={ap.id}>
-                {ap.name} ({ap.ip_address}) — {ap.status}
-              </option>
-            ))}
-          </select>
+          <DevicePicker
+            className="w-auto min-w-[18rem]" devices={aps} aria-label="Access point"
+            value={selectedApId ?? null}
+            onChange={(id) => { if (id != null) setSelectedApId(id); }}
+          />
         </div>
       )}
 
@@ -904,6 +963,11 @@ export default function WirelessSettingsPage() {
         </div>
       )}
 
+      {writeError && <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-600 dark:text-red-400">{writeError}</div>}
+      {selectedApId && (
+        <GuardedWriteUi state={guard} deviceId={selectedApId} deviceName={selectedAp?.name}
+          pending={toggleSsidMutation.isPending || deleteSsidMutation.isPending} />
+      )}
       {selectedAp && (
         <>
           {isOffline && (
@@ -1022,7 +1086,7 @@ export default function WirelessSettingsPage() {
                             {canWrite && (
                               <div className="flex items-center justify-end gap-1">
                                 <button
-                                  onClick={() => toggleSsidMutation.mutate({ name: iface.name, disabled: iface.disabled !== 'true' })}
+                                  onClick={() => toggleSsid(iface.name, iface.disabled !== 'true', iface.ssid)}
                                   className="p-1.5 rounded-lg text-gray-400 hover:text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors"
                                   title={iface.disabled === 'true' ? 'Enable' : 'Disable'}
                                 >
@@ -1038,7 +1102,7 @@ export default function WirelessSettingsPage() {
                                 <button
                                   onClick={() => {
                                     if (confirm(`Delete SSID "${iface.name}"?`))
-                                      deleteSsidMutation.mutate(iface.name);
+                                      deleteSsid(iface.name);
                                   }}
                                   className="p-1.5 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
                                   title="Delete"
@@ -1059,10 +1123,11 @@ export default function WirelessSettingsPage() {
       )}
 
       {/* ── Spectral Scan Schedule ───────────────────────────────────── */}
-      <SpectralScanSettings canWrite={canWrite} />
+      {/* The schedule is a platform setting: admins only on the server (U10). */}
+      <SpectralScanSettings canWrite={isFleetAdmin} />
 
       {/* ── AP Scan Schedule ─────────────────────────────────────────── */}
-      <APScanSettings canWrite={canWrite} />
+      <APScanSettings canWrite={isFleetAdmin} />
 
       {/* Modals */}
       {ssidModal.open && selectedApId && (

@@ -1,13 +1,17 @@
 import { useState } from 'react';
+import { isWirelessDevice } from '../../utils/wireless';
 import { NavLink, useLocation } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
+import { useIsFleetAdmin } from '../../hooks/useCanWrite';
 import {
-  LayoutDashboard, Router, Users, Bell, GitBranch, HardDrive,
+  LayoutDashboard, Router, Users, Bell, GitBranch, HardDrive, ShieldCheck,
   Settings, Network, ChevronLeft, ChevronRight, Layers, ChevronDown, SlidersHorizontal, X, Wifi,
   Server, Globe, Clock, Shield, FileText, Activity, BarChart3, Ticket, ArrowUpCircle, Radio,
-  LayoutGrid,
+  LayoutGrid, TerminalSquare, KeyRound, UserCheck,
+  Route,
 } from 'lucide-react';
 import clsx from 'clsx';
+import SiteSelector from './SiteSelector';
 import { APP_VERSION } from '../../version';
 import { devicesApi } from '../../services/api';
 
@@ -15,8 +19,21 @@ const monitorItems = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/topology',  icon: GitBranch,       label: 'Topology' },
   { to: '/traffic',   icon: Activity,        label: 'Traffic' },
-  { to: '/events',    icon: Bell,            label: 'Events' },
+];
+
+const monitorAfterEventsItems = [
   { to: '/security',  icon: Shield,          label: 'Security' },
+  // Reported as unreachable (#148): the only route to this page was the
+  // "All sites" entry in the selector under the logo, itself hidden unless more
+  // than one site exists — so a single-site install could not get here at all.
+  // Shown unconditionally now. One sidebar row does not impose the concept on
+  // anyone the way an unreachable page frustrates the people who want it.
+  { to: '/sites',     icon: Globe,           label: 'Sites' },
+];
+
+const eventsSubItems = [
+  { to: '/events',          icon: FileText,    label: 'Device Logs' },
+  { to: '/firewall-events', icon: ShieldCheck, label: 'Firewall Logs' },
 ];
 
 const wirelessSubItems = [
@@ -31,6 +48,7 @@ const networkServicesSubItems = [
   { to: '/network-services/dns',        icon: Globe,     label: 'DNS' },
   { to: '/network-services/ntp',        icon: Clock,     label: 'NTP' },
   { to: '/network-services/wireguard',  icon: Shield,    label: 'WireGuard' },
+  { to: '/network-services/routing',    icon: Route,     label: 'Routing' },
   { to: '/network-services/syslog',     icon: FileText,  label: 'Logging' },
   { to: '/network-services/netflow',    icon: BarChart3, label: 'NetFlow' },
   { to: '/network-services/discovery',  icon: Radio,     label: 'Discovery & SNMP' },
@@ -38,7 +56,12 @@ const networkServicesSubItems = [
 
 const operationsItems = [
   { to: '/firmware',  icon: ArrowUpCircle,   label: 'Firmware' },
+  { to: '/commands',  icon: TerminalSquare,  label: 'Bulk Commands' },
+  { to: '/templates', icon: FileText,        label: 'Templates' },
   { to: '/backups',   icon: HardDrive,       label: 'Backups' },
+  { to: '/credentials', icon: KeyRound,      label: 'Credentials' },
+  // Fleet admins only (#200).
+  { to: '/certificates', icon: ShieldCheck,  label: 'Certificates', fleetAdmin: true },
 ];
 
 interface SidebarProps {
@@ -161,6 +184,7 @@ function CollapsedGroupLink({
 export default function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
   const location = useLocation();
+  const isFleetAdmin = useIsFleetAdmin();
 
   const { data: devices = [] } = useQuery({
     queryKey: ['devices'],
@@ -170,7 +194,8 @@ export default function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
 
   const hasSwitches  = devices.some(d => d.device_type === 'switch');
   const hasRouters   = devices.some(d => d.device_type === 'router');
-  const hasWireless  = devices.some(d => d.device_type === 'wireless_ap');
+  // Radios of their own count too: an all-in-one router added as a router is an AP as well.
+  const hasWireless  = devices.some(isWirelessDevice);
 
   const onlineCount = devices.filter(d => d.status === 'online').length;
 
@@ -180,6 +205,12 @@ export default function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
   const devicesActive = location.pathname.startsWith('/devices');
   const [devicesOpenPref, setDevicesOpenPref] = useState<boolean | null>(null);
   const devicesOpen = devicesOpenPref ?? devicesActive;
+
+  const eventsActive =
+    location.pathname === '/events' ||
+    location.pathname === '/firewall-events';
+  const [eventsOpenPref, setEventsOpenPref] = useState<boolean | null>(null);
+  const eventsOpen = eventsOpenPref ?? eventsActive;
 
   const wirelessActive = location.pathname.startsWith('/wireless');
   const [wirelessOpenPref, setWirelessOpenPref] = useState<boolean | null>(null);
@@ -242,11 +273,57 @@ export default function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
         </button>
       </div>
 
+      {/* Site selector — under the brand block, deliberately separate from it */}
+      <SiteSelector isCollapsed={isCollapsed} onNavigate={handleNavClick} />
+
       {/* Navigation */}
       <nav className="flex-1 px-[14px] py-3 space-y-[1px] overflow-y-auto">
         {/* ── Monitor ── */}
         <SectionLabel label="Monitor" isCollapsed={isCollapsed} />
+        {/* Traffic analytics is fleet-wide, so it isn't offered to site-limited accounts (P1-7). */}
         {monitorItems.map(({ to, icon, label }) => (
+          <NavItem key={to} to={to} icon={icon} label={label} isCollapsed={isCollapsed} onClick={handleNavClick} />
+        ))}
+
+        {isCollapsed ? (
+          <CollapsedGroupLink
+            to="/events"
+            icon={Bell}
+            label="Events"
+            groupActive={eventsActive}
+            onClick={handleNavClick}
+          />
+        ) : (
+          <>
+            <GroupHeader
+              icon={Bell}
+              label="Events"
+              isActive={eventsActive}
+              isOpen={eventsOpen}
+              onToggle={() => setEventsOpenPref(!eventsOpen)}
+            />
+            {eventsOpen && (
+              <div
+                className="ml-4 pl-3 space-y-[1px]"
+                style={{ borderLeft: '1px solid var(--line)' }}
+              >
+                {eventsSubItems.map(({ to, icon, label }) => (
+                  <NavItem
+                    key={to}
+                    to={to}
+                    end
+                    icon={icon}
+                    label={label}
+                    isCollapsed={false}
+                    onClick={handleNavClick}
+                  />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {monitorAfterEventsItems.map(({ to, icon, label }) => (
           <NavItem key={to} to={to} icon={icon} label={label} isCollapsed={isCollapsed} onClick={handleNavClick} />
         ))}
 
@@ -343,10 +420,12 @@ export default function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
             )}
           </>
         )}
+        {/* RADIUS logins across the network (#251). */}
+        <NavItem to="/user-manager" icon={UserCheck} label="User Manager" isCollapsed={isCollapsed} onClick={handleNavClick} />
 
         {/* ── Operations ── */}
         <SectionLabel label="Operations" isCollapsed={isCollapsed} />
-        {operationsItems.map(({ to, icon, label }) => (
+        {operationsItems.filter((i) => !('fleetAdmin' in i) || isFleetAdmin).map(({ to, icon, label }) => (
           <NavItem key={to} to={to} icon={icon} label={label} isCollapsed={isCollapsed} onClick={handleNavClick} />
         ))}
       </nav>

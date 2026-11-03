@@ -1,5 +1,7 @@
 import { useState } from 'react';
+import { useRememberedRange } from '../../hooks/useRememberedRange';
 import { useQuery } from '@tanstack/react-query';
+import LoadError from '../common/LoadError';
 import { Route, AlertTriangle, ArrowRight, Wifi } from 'lucide-react';
 import clsx from 'clsx';
 import { clientsApi, type RoamSession } from '../../services/api';
@@ -119,8 +121,8 @@ function Session({ s }: { s: RoamSession }) {
  * the one place "why does this device keep dropping?" can actually be answered.
  */
 export default function RoamingTimeline({ mac }: { mac: string }) {
-  const [range, setRange] = useState<(typeof RANGES)[number]>('24h');
-  const { data, isLoading } = useQuery({
+  const [range, setRange] = useRememberedRange<(typeof RANGES)[number]>('roaming', '24h', RANGES);
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ['roaming', mac, range],
     queryFn: () => clientsApi.getRoaming(mac, range).then(r => r.data),
   });
@@ -144,7 +146,9 @@ export default function RoamingTimeline({ mac }: { mac: string }) {
         </div>
       </div>
 
-      {isLoading ? (
+      {isError ? (
+        <LoadError what="roaming history" error={error} />
+      ) : isLoading ? (
         <div className="py-6 text-center text-xs text-gray-400">Reading access point logs…</div>
       ) : sessions.length === 0 ? (
         <div className="py-6 text-center text-xs text-gray-400">

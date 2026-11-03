@@ -1,12 +1,14 @@
 import { useState } from 'react';
+import ReviewChangesButton from '../common/ReviewChangesButton';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  Plus, Trash2, Pencil, AlertCircle, RefreshCw, Check, X, ArrowRightLeft, Shield,
-  ArrowUp, ArrowDown, List, Activity, AlertTriangle,
+  Plus, Trash2, Pencil, Power, AlertCircle, RefreshCw, Check, X, ArrowRightLeft, Shield,
+  ArrowUp, ArrowDown, List, Activity,
 } from 'lucide-react';
 import { devicesApi } from '../../services/api';
 import { useCanWrite } from '../../hooks/useCanWrite';
 import { formatBytes, formatCount, ruleSummary, natSummary } from '../../utils/firewallSummary';
+import { useGuardedWrite, GuardedWriteUi } from '../ChangeGuardDialog';
 import clsx from 'clsx';
 
 type Row = Record<string, string> & { '.id': string };
@@ -34,12 +36,6 @@ const NAT_ACTIONS = ['masquerade', 'src-nat', 'dst-nat', 'netmap', 'redirect', '
 
 function errMsg(err: unknown) {
   return (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Operation failed';
-}
-// Extract a 409 lockout-guard payload from a failed mutation, if present.
-function lockoutOf(err: unknown): string | null {
-  const r = (err as { response?: { status?: number; data?: { lockout?: boolean; reason?: string } } })?.response;
-  if (r?.status === 409 && r.data?.lockout) return r.data.reason || 'This change may lock you out of the device.';
-  return null;
 }
 
 function Toggle({ value, onChange, label }: { value: boolean; onChange: (v: boolean) => void; label: string }) {
@@ -85,22 +81,32 @@ function ruleToForm(r: Row): RuleForm {
     comment: r.comment ?? '', disabled: r.disabled === 'true',
   };
 }
-function fwPayload(f: RuleForm, force = false): Record<string, unknown> {
+/**
+ * The rule as RouterOS properties. When editing, a field left empty is sent as
+ * '' so it is cleared on the device (P2-10); it used to be left out, and the
+ * old value stayed while the UI showed it gone. Switching a source or
+ * destination between an address and an address list clears the other one.
+ */
+function fwPayload(f: RuleForm, force = false, forEdit = false): Record<string, unknown> {
   const p: Record<string, unknown> = { chain: f.chain, action: f.action, disabled: f.disabled ? 'yes' : 'no' };
-  if (f.src_kind === 'address') p.src_address = f.src_value;
-  if (f.src_kind === 'list')    p.src_address_list = f.src_value;
-  if (f.dst_kind === 'address') p.dst_address = f.dst_value;
-  if (f.dst_kind === 'list')    p.dst_address_list = f.dst_value;
-  if (f.protocol)         p.protocol = f.protocol;
-  if (f.src_port)         p.src_port = f.src_port;
-  if (f.dst_port)         p.dst_port = f.dst_port;
-  if (f.in_interface)     p.in_interface = f.in_interface;
-  if (f.out_interface)    p.out_interface = f.out_interface;
-  if (f.connection_state) p.connection_state = f.connection_state;
+  const put = (key: string, value: string, use = true) => {
+    if (use && value) Object.assign(p, { [key]: value });
+    else if (forEdit) Object.assign(p, { [key]: '' });
+  };
+  put('src_address', f.src_value, f.src_kind === 'address');
+  put('src_address_list', f.src_value, f.src_kind === 'list');
+  put('dst_address', f.dst_value, f.dst_kind === 'address');
+  put('dst_address_list', f.dst_value, f.dst_kind === 'list');
+  put('protocol', f.protocol);
+  put('src_port', f.src_port);
+  put('dst_port', f.dst_port);
+  put('in_interface', f.in_interface);
+  put('out_interface', f.out_interface);
+  put('connection_state', f.connection_state);
   if (f.action === 'jump' && f.jump_target) p.jump_target = f.jump_target;
   p.log = f.log ? 'yes' : 'no';
-  if (f.log && f.log_prefix) p.log_prefix = f.log_prefix;
-  if (f.comment) p.comment = f.comment;
+  put('log_prefix', f.log_prefix, f.log);
+  put('comment', f.comment);
   if (force) p.force = true;
   return p;
 }
@@ -156,10 +162,10 @@ function EndpointPicker({
 
 // ─── Firewall Rule Modal ──────────────────────────────────────────────────────
 function RuleModal({
-  title, form, setForm, onSave, onClose, isPending, error, lists,
+  title, form, setForm, onSave, onReview, onClose, isPending, error, lists,
 }: {
   title: string; form: RuleForm; setForm: React.Dispatch<React.SetStateAction<RuleForm>>;
-  onSave: () => void; onClose: () => void; isPending: boolean; error: string; lists: string[];
+  onSave: () => void; onReview?: () => Promise<unknown>; onClose: () => void; isPending: boolean; error: string; lists: string[];
 }) {
   const set = (k: keyof RuleForm, v: string | boolean) => setForm(f => ({ ...f, [k]: v }));
   const toggleState = (s: string) => {
@@ -278,6 +284,7 @@ function RuleModal({
           )}
           <div className="flex items-center justify-end gap-3 pt-2">
             <button onClick={onClose} className="btn-secondary">Cancel</button>
+            {onReview && <ReviewChangesButton request={onReview} onApply={onSave} applyLabel="Save Rule" disabled={isPending} />}
             <button onClick={onSave} disabled={isPending} className="btn-primary flex items-center gap-2">
               {isPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Save Rule
             </button>
@@ -288,32 +295,8 @@ function RuleModal({
   );
 }
 
-// ─── Lockout confirm dialog (safe-apply) ─────────────────────────────────────────
-function LockoutDialog({ reason, onConfirm, onCancel, pending }: { reason: string; onConfirm: () => void; onCancel: () => void; pending: boolean }) {
-  return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="card w-full max-w-md mx-4 p-6 space-y-4">
-        <div className="flex items-start gap-3">
-          <AlertTriangle className="w-6 h-6 text-amber-500 flex-shrink-0 mt-0.5" />
-          <div>
-            <h3 className="font-semibold text-gray-900 dark:text-white">Possible lockout</h3>
-            <p className="mt-1 text-sm text-gray-600 dark:text-slate-300">{reason}</p>
-          </div>
-        </div>
-        <div className="flex justify-end gap-3">
-          <button onClick={onCancel} disabled={pending} className="btn-secondary">Cancel</button>
-          <button onClick={onConfirm} disabled={pending}
-            className="px-4 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-sm font-medium rounded-lg flex items-center gap-2 disabled:opacity-50">
-            {pending && <RefreshCw className="w-4 h-4 animate-spin" />} Apply anyway
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // ─── Address Lists section ───────────────────────────────────────────────────────
-function AddressListsCard({ deviceId }: { deviceId: number }) {
+function AddressListsCard({ deviceId, deviceName }: { deviceId: number; deviceName?: string }) {
   const qc = useQueryClient();
   const canWrite = useCanWrite();
   const [open, setOpen] = useState(false);
@@ -327,23 +310,41 @@ function AddressListsCard({ deviceId }: { deviceId: number }) {
   });
   const invalidate = () => qc.invalidateQueries({ queryKey: ['address-lists', deviceId] });
 
+  // Guarded: the manager may be let in by one of these lists (P2-8).
+  const guard = useGuardedWrite();
+  const fail = (e: unknown) => setErr(errMsg(e));
   const addMut = useMutation({
-    mutationFn: () => devicesApi.addAddressListEntry(deviceId, { list, address, comment: comment || undefined }),
-    onSuccess: () => { invalidate(); setAdding(false); setList(''); setAddress(''); setComment(''); setErr(''); },
-    onError: (e) => setErr(errMsg(e)),
+    mutationFn: (confirm: boolean) => devicesApi.addAddressListEntry(deviceId, { list, address, comment: comment || undefined, ...(confirm ? { confirm_lockout: true } : {}) }),
+    onSuccess: (res) => { invalidate(); guard.onSuccess(res); setAdding(false); setList(''); setAddress(''); setComment(''); setErr(''); },
   });
   const delMut = useMutation({
-    mutationFn: (id: string) => devicesApi.removeAddressListEntry(deviceId, id),
-    onSuccess: invalidate,
+    mutationFn: ({ id, confirm }: { id: string; confirm?: boolean }) => devicesApi.removeAddressListEntry(deviceId, id, confirm),
+    onSuccess: (res) => { invalidate(); setErr(''); guard.onSuccess(res); },
   });
+  // Turning an entry off without deleting it (Stanley, D85). Guarded like a
+  // removal: disabling the entry that admits the manager locks it out too.
+  const togMut = useMutation({
+    mutationFn: ({ id, disabled, confirm }: { id: string; disabled: boolean; confirm?: boolean }) =>
+      devicesApi.updateAddressListEntry(deviceId, id, { disabled, ...(confirm ? { confirm_lockout: true } : {}) }),
+    onSuccess: (res) => { invalidate(); setErr(''); guard.onSuccess(res); },
+  });
+  const add = () => addMut.mutate(false, { onError: guard.onError(() => addMut.mutate(true, { onError: fail }), fail) });
+  const remove = (id: string) => delMut.mutate({ id }, { onError: guard.onError(() => delMut.mutate({ id, confirm: true }, { onError: fail }), fail) });
+  const toggle = (id: string, disabled: boolean) =>
+    togMut.mutate({ id, disabled }, { onError: guard.onError(() => togMut.mutate({ id, disabled, confirm: true }, { onError: fail }), fail) });
 
-  const grouped = entries.reduce<Record<string, Row[]>>((acc, e) => {
-    const k = e.list ?? '(none)'; (acc[k] ??= []).push(e); return acc;
-  }, {});
-  const listNames = Object.keys(grouped).sort();
+  // A Map, not an object: a list named "constructor" or "__proto__" (names
+  // come from the device) found Object.prototype and crashed the tab (U12).
+  const grouped = new Map<string, Row[]>();
+  for (const e of entries) {
+    const k = e.list ?? '(none)';
+    grouped.set(k, [...(grouped.get(k) ?? []), e]);
+  }
+  const listNames = [...grouped.keys()].sort();
 
   return (
     <div className="card overflow-hidden">
+      <GuardedWriteUi state={guard} deviceId={deviceId} deviceName={deviceName} pending={addMut.isPending || delMut.isPending || togMut.isPending} />
       <button onClick={() => setOpen(o => !o)} className="w-full flex items-center gap-2 p-4 text-left">
         <div className="w-7 h-7 bg-indigo-50 dark:bg-indigo-900/20 rounded-lg flex items-center justify-center flex-shrink-0">
           <List className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />
@@ -358,22 +359,35 @@ function AddressListsCard({ deviceId }: { deviceId: number }) {
           <p className="text-xs text-gray-500 dark:text-slate-400">
             Reusable address objects. Reference a list from any firewall rule&apos;s Source/Destination instead of repeating IPs.
           </p>
+          {err && !adding && <p className="text-xs text-red-500">{err}</p>}
           {listNames.length === 0 ? (
             <div className="text-sm text-gray-400 py-3 text-center">No address lists yet.</div>
           ) : listNames.map(name => (
             <div key={name} className="border border-gray-200 dark:border-slate-700 rounded-lg overflow-hidden">
               <div className="px-3 py-1.5 bg-gray-50 dark:bg-slate-800 text-xs font-semibold text-gray-700 dark:text-slate-200 font-mono">{name}</div>
               <div className="divide-y divide-gray-100 dark:divide-slate-700/50">
-                {grouped[name].map(e => (
-                  <div key={e['.id']} className="flex items-center gap-2 px-3 py-1.5 text-xs">
-                    <span className="font-mono text-gray-700 dark:text-slate-300">{e.address}</span>
-                    {e.comment && <span className="text-gray-400 italic truncate">{e.comment}</span>}
-                    {e.dynamic === 'true' && <span className="text-amber-500 text-[10px]">dynamic</span>}
-                    {canWrite && e.dynamic !== 'true' && (
-                      <button onClick={() => delMut.mutate(e['.id'])} className="ml-auto text-gray-400 hover:text-red-500"><Trash2 className="w-3.5 h-3.5" /></button>
-                    )}
-                  </div>
-                ))}
+                {(grouped.get(name) ?? []).map(e => {
+                  const off = e.disabled === 'true';
+                  const busy = togMut.isPending && togMut.variables?.id === e['.id'];
+                  return (
+                    <div key={e['.id']} className="flex items-center gap-2 px-3 py-1.5 text-xs">
+                      <span className={clsx('font-mono', off ? 'text-gray-400 line-through' : 'text-gray-700 dark:text-slate-300')}>{e.address}</span>
+                      {e.comment && <span className="text-gray-400 italic truncate">{e.comment}</span>}
+                      {off && <span className="text-gray-400 text-[10px] uppercase tracking-wide">disabled</span>}
+                      {e.dynamic === 'true' && <span className="text-amber-500 text-[10px]">dynamic</span>}
+                      {canWrite && e.dynamic !== 'true' && (
+                        <div className="ml-auto flex items-center gap-2">
+                          <button onClick={() => toggle(e['.id'], !off)} disabled={busy}
+                            title={off ? 'Enable this entry' : 'Disable this entry (it stays in the list)'}
+                            className={clsx('disabled:opacity-40', off ? 'text-gray-400 hover:text-green-600' : 'text-green-600 hover:text-gray-500')}>
+                            <Power className="w-3.5 h-3.5" />
+                          </button>
+                          <button onClick={() => remove(e['.id'])} title="Remove this entry" className="text-gray-400 hover:text-red-500"><Trash2 className="w-3.5 h-3.5" /></button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           ))}
@@ -388,7 +402,9 @@ function AddressListsCard({ deviceId }: { deviceId: number }) {
               {err && <p className="text-xs text-red-500">{err}</p>}
               <div className="flex justify-end gap-2">
                 <button onClick={() => { setAdding(false); setErr(''); }} className="btn-secondary text-xs py-1">Cancel</button>
-                <button onClick={() => addMut.mutate()} disabled={!list || !address || addMut.isPending} className="btn-primary text-xs py-1">Add Entry</button>
+                <button onClick={add} disabled={!list || !address || addMut.isPending} className="btn-primary text-xs py-1">Add Entry</button>
+                <ReviewChangesButton className="text-xs py-1" deviceName={deviceName} applyLabel="Add Entry" onApply={add} disabled={!list || !address || addMut.isPending}
+                  request={() => devicesApi.addAddressListEntry(deviceId, { list, address, comment: comment || undefined })} />
               </div>
             </div>
           ) : (
@@ -514,20 +530,22 @@ function natRuleToForm(r: Row): NatForm {
     comment: r.comment ?? '', disabled: r.disabled === 'true',
   };
 }
-function natPayload(f: NatForm): Record<string, unknown> {
+/** The NAT rule as RouterOS properties; when editing, an emptied field is sent as '' to clear it. */
+function natPayload(f: NatForm, forEdit = false): Record<string, unknown> {
   const p: Record<string, unknown> = { chain: f.chain, action: f.action, disabled: f.disabled ? 'yes' : 'no' };
   for (const [k, ros] of [['src_address', 'src_address'], ['dst_address', 'dst_address'], ['protocol', 'protocol'],
     ['src_port', 'src_port'], ['dst_port', 'dst_port'], ['in_interface', 'in_interface'], ['out_interface', 'out_interface'],
     ['to_addresses', 'to_addresses'], ['to_ports', 'to_ports'], ['comment', 'comment']] as const) {
-    const v = (f as unknown as Record<string, string>)[k];
-    if (v) p[ros] = v;
+    const v = new Map(Object.entries(f)).get(k) as string | undefined;
+    if (v) Object.assign(p, { [ros]: v });
+    else if (forEdit) Object.assign(p, { [ros]: '' });
   }
   return p;
 }
 
-function NatModal({ title, form, setForm, onSave, onClose, isPending, error }: {
+function NatModal({ title, form, setForm, onSave, onReview, onClose, isPending, error }: {
   title: string; form: NatForm; setForm: React.Dispatch<React.SetStateAction<NatForm>>;
-  onSave: () => void; onClose: () => void; isPending: boolean; error: string;
+  onSave: () => void; onReview?: () => Promise<unknown>; onClose: () => void; isPending: boolean; error: string;
 }) {
   const set = (k: keyof NatForm, v: string | boolean) => setForm(f => ({ ...f, [k]: v }));
   const setPattern = (pattern: NatPattern) => setForm(f => {
@@ -634,6 +652,7 @@ function NatModal({ title, form, setForm, onSave, onClose, isPending, error }: {
           )}
           <div className="flex items-center justify-end gap-3 pt-2">
             <button onClick={onClose} className="btn-secondary">Cancel</button>
+            {onReview && <ReviewChangesButton request={onReview} onApply={onSave} applyLabel="Save Rule" disabled={isPending} />}
             <button onClick={onSave} disabled={isPending} className="btn-primary flex items-center gap-2">
               {isPending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />} Save Rule
             </button>
@@ -688,15 +707,15 @@ function NatCard({ deviceId }: { deviceId: number }) {
             onToggle={r => toggleMut.mutate({ id: r['.id'], disabled: !(r.disabled === 'true') })}
             onDelete={r => { if (confirm('Delete this NAT rule?')) delMut.mutate(r['.id']); }} onMove={onMove} />}
       {showAdd && <NatModal title="Add NAT Rule" form={form} setForm={setForm} isPending={addMut.isPending} error={err}
-        onClose={() => setShowAdd(false)} onSave={() => addMut.mutate(natPayload(form))} />}
+        onClose={() => setShowAdd(false)} onSave={() => addMut.mutate(natPayload(form))} onReview={() => devicesApi.addNatRule(deviceId, natPayload(form))} />}
       {editing && <NatModal title="Edit NAT Rule" form={form} setForm={setForm} isPending={updMut.isPending} error={err}
-        onClose={() => setEditing(null)} onSave={() => updMut.mutate({ id: editing['.id'], d: natPayload(form) })} />}
+        onClose={() => setEditing(null)} onSave={() => updMut.mutate({ id: editing['.id'], d: natPayload(form, true) })} onReview={() => devicesApi.updateNatRule(deviceId, editing['.id'], natPayload(form, true))} />}
     </div>
   );
 }
 
 // ─── Main FirewallTab ─────────────────────────────────────────────────────────────
-export default function FirewallTab({ deviceId }: { deviceId: number }) {
+export default function FirewallTab({ deviceId, deviceName }: { deviceId: number; deviceName?: string }) {
   const qc = useQueryClient();
   const canWrite = useCanWrite();
   const [chainFilter, setChainFilter] = useState('all');
@@ -704,9 +723,11 @@ export default function FirewallTab({ deviceId }: { deviceId: number }) {
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState<RuleForm>(EMPTY_FW);
   const [err, setErr] = useState('');
-  // Safe-apply: the backend returns 409 {lockout} for self-lockout rules; we
-  // stash the pending payload + reason and let the operator confirm with force.
-  const [lockout, setLockout] = useState<{ payload: Record<string, unknown>; mode: 'add' | 'edit'; id?: string; reason: string } | null>(null);
+  // Every rule change runs under Change Guard. A predicted lockout comes back
+  // as 409 with a verdict; confirming re-sends the same change with
+  // confirm_lockout. That covers toggles, moves and deletes too, which used to
+  // skip the check entirely.
+  const guard = useGuardedWrite();
 
   const { data: rules = [], isLoading, refetch, isFetching } = useQuery({
     queryKey: ['firewall', deviceId], queryFn: () => devicesApi.getFirewall(deviceId).then(r => r.data as Row[]),
@@ -716,35 +737,53 @@ export default function FirewallTab({ deviceId }: { deviceId: number }) {
   });
   const listNames = Array.from(new Set(addrLists.map(e => e.list).filter(Boolean))).sort();
   const invalidate = () => qc.invalidateQueries({ queryKey: ['firewall', deviceId] });
+  const done = (res: unknown) => { invalidate(); setErr(''); guard.onSuccess(res); };
+  const fail = (e: unknown) => setErr(errMsg(e));
 
   const addMut = useMutation({
     mutationFn: (d: Record<string, unknown>) => devicesApi.addFirewallRule(deviceId, d),
-    onSuccess: () => { invalidate(); setShowAdd(false); setErr(''); setLockout(null); },
+    onSuccess: (res) => { done(res); setShowAdd(false); },
   });
   const updMut = useMutation({
     mutationFn: ({ id, d }: { id: string; d: Record<string, unknown> }) => devicesApi.updateFirewallRule(deviceId, id, d),
-    onSuccess: () => { invalidate(); setEditing(null); setErr(''); setLockout(null); },
+    onSuccess: (res) => { done(res); setEditing(null); },
   });
-  const delMut = useMutation({ mutationFn: (id: string) => devicesApi.deleteFirewallRule(deviceId, id), onSuccess: invalidate });
-  const toggleMut = useMutation({ mutationFn: ({ id, disabled }: { id: string; disabled: boolean }) => devicesApi.updateFirewallRule(deviceId, id, { disabled: disabled ? 'yes' : 'no' }), onSuccess: invalidate });
-  const moveMut = useMutation({ mutationFn: ({ id, destination }: { id: string; destination?: string }) => devicesApi.moveFirewallRule(deviceId, id, destination), onSuccess: invalidate });
+  const delMut = useMutation({
+    mutationFn: ({ id, confirm }: { id: string; confirm?: boolean }) => devicesApi.deleteFirewallRule(deviceId, id, confirm),
+    onSuccess: done,
+  });
+  const toggleMut = useMutation({
+    mutationFn: ({ id, disabled, confirm }: { id: string; disabled: boolean; confirm?: boolean }) =>
+      devicesApi.updateFirewallRule(deviceId, id, { disabled: disabled ? 'yes' : 'no', ...(confirm ? { confirm_lockout: true } : {}) }),
+    onSuccess: done,
+  });
+  const moveMut = useMutation({
+    mutationFn: ({ id, destination, confirm }: { id: string; destination?: string; confirm?: boolean }) =>
+      devicesApi.moveFirewallRule(deviceId, id, destination, confirm),
+    onSuccess: done,
+  });
   const resetMut = useMutation({ mutationFn: () => devicesApi.resetFirewallCounters(deviceId), onSuccess: invalidate });
 
-  const handleErr = (e: unknown, mode: 'add' | 'edit', id?: string) => {
-    const lo = lockoutOf(e);
-    if (lo) setLockout({ payload: fwPayload(form, false), mode, id, reason: lo });
-    else setErr(errMsg(e));
+  // Each action retries itself with the lockout confirmed if the user overrides.
+  const submitAdd = () => {
+    const d = fwPayload(form);
+    addMut.mutate(d, { onError: guard.onError(() => addMut.mutate({ ...d, confirm_lockout: true }, { onError: fail }), fail) });
   };
-  const submitAdd = () => addMut.mutate(fwPayload(form), { onError: (e) => handleErr(e, 'add') });
-  const submitEdit = () => editing && updMut.mutate({ id: editing['.id'], d: fwPayload(form) }, { onError: (e) => handleErr(e, 'edit', editing['.id']) });
-  const confirmLockout = () => {
-    if (!lockout) return;
-    const forced = { ...lockout.payload, force: true };
-    if (lockout.mode === 'add') addMut.mutate(forced);
-    else if (lockout.id) updMut.mutate({ id: lockout.id, d: forced });
+  const submitEdit = () => {
+    if (!editing) return;
+    const id = editing['.id'];
+    const d = fwPayload(form, false, true);
+    updMut.mutate({ id, d }, { onError: guard.onError(() => updMut.mutate({ id, d: { ...d, confirm_lockout: true } }, { onError: fail }), fail) });
   };
+  const toggle = (id: string, disabled: boolean) =>
+    toggleMut.mutate({ id, disabled }, { onError: guard.onError(() => toggleMut.mutate({ id, disabled, confirm: true }, { onError: fail }), fail) });
+  const remove = (id: string) =>
+    delMut.mutate({ id }, { onError: guard.onError(() => delMut.mutate({ id, confirm: true }, { onError: fail }), fail) });
+  const move = (id: string, destination?: string) =>
+    moveMut.mutate({ id, destination }, { onError: guard.onError(() => moveMut.mutate({ id, destination, confirm: true }, { onError: fail }), fail) });
+  const anyPending = addMut.isPending || updMut.isPending || delMut.isPending || toggleMut.isPending || moveMut.isPending;
 
-  const onMove = (r: Row, dir: 'up' | 'down') => { const d = moveDestination(rules, r, dir); if (d.ok) moveMut.mutate({ id: r['.id'], destination: d.destination }); };
+  const onMove = (r: Row, dir: 'up' | 'down') => { const d = moveDestination(rules, r, dir); if (d.ok) move(r['.id'], d.destination); };
 
   const allChains = ['all', ...Array.from(new Set(rules.map(r => r.chain).filter(Boolean))).sort()];
   const filtered = chainFilter === 'all' ? rules : rules.filter(r => r.chain === chainFilter);
@@ -753,7 +792,7 @@ export default function FirewallTab({ deviceId }: { deviceId: number }) {
 
   return (
     <div className="space-y-4">
-      <AddressListsCard deviceId={deviceId} />
+      <AddressListsCard deviceId={deviceId} deviceName={deviceName} />
 
       <div className="flex items-center gap-2">
         <div className="w-7 h-7 bg-blue-50 dark:bg-blue-900/20 rounded-lg flex items-center justify-center"><Shield className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /></div>
@@ -783,18 +822,18 @@ export default function FirewallTab({ deviceId }: { deviceId: number }) {
         <p className="text-xs text-gray-400 flex items-center gap-1.5"><AlertCircle className="w-3.5 h-3.5" /> Switch to &quot;All&quot; to reorder rules (order is global across chains).</p>
       )}
       {err && <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-600 dark:text-red-400">{err}</div>}
+      <GuardedWriteUi state={guard} deviceId={deviceId} deviceName={deviceName} pending={anyPending} />
 
       {filtered.length === 0 ? <div className="card p-8 text-center text-gray-400">No firewall rules{chainFilter !== 'all' ? ` in "${chainFilter}"` : ''}.</div>
         : <RuleTable rows={filtered} fullOrder={rules} canWrite={canWrite} canReorder={chainFilter === 'all'} summaryFn={ruleSummary}
             onEdit={r => { setForm(ruleToForm(r)); setErr(''); setEditing(r); }}
-            onToggle={r => toggleMut.mutate({ id: r['.id'], disabled: !(r.disabled === 'true') })}
-            onDelete={r => { if (confirm('Delete this firewall rule?')) delMut.mutate(r['.id']); }} onMove={onMove} />}
+            onToggle={r => toggle(r['.id'], !(r.disabled === 'true'))}
+            onDelete={r => { if (confirm('Delete this firewall rule?')) remove(r['.id']); }} onMove={onMove} />}
 
       {showAdd && <RuleModal title="Add Firewall Rule" form={form} setForm={setForm} isPending={addMut.isPending} error={err} lists={listNames}
-        onClose={() => setShowAdd(false)} onSave={submitAdd} />}
+        onClose={() => setShowAdd(false)} onSave={submitAdd} onReview={() => devicesApi.addFirewallRule(deviceId, fwPayload(form))} />}
       {editing && <RuleModal title="Edit Firewall Rule" form={form} setForm={setForm} isPending={updMut.isPending} error={err} lists={listNames}
-        onClose={() => setEditing(null)} onSave={submitEdit} />}
-      {lockout && <LockoutDialog reason={lockout.reason} pending={addMut.isPending || updMut.isPending} onCancel={() => setLockout(null)} onConfirm={confirmLockout} />}
+        onClose={() => setEditing(null)} onSave={submitEdit} onReview={() => devicesApi.updateFirewallRule(deviceId, editing['.id'], fwPayload(form, false, true))} />}
 
       {/* NAT is available on all RouterOS devices */}
       <div className="border-t border-gray-200 dark:border-slate-700 pt-2" />

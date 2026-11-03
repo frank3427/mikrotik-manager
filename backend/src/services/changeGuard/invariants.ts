@@ -13,9 +13,10 @@
  * vlan-filtering is on, and PVID-derived untagged membership is added dynamically
  * (which is why effective `current-*` membership is what we test).
  */
-import { detectLockoutRisk } from '../../utils/firewallSafety';
-import { vlanMembership, type DeviceSnapshot, type ManagementPath } from './pathModel';
+import { evaluateInputChain } from './firewallPath';
+import { vlanMembership, bareGateway, routeFor, routeActive, routeDiscards, type DeviceSnapshot, type ManagementPath } from './pathModel';
 import type { GuardDevice } from './ChangeGuard';
+import { managementService } from '../../utils/apiTls';
 
 export interface InvariantResult {
   ok: boolean;
@@ -27,6 +28,14 @@ export interface InvariantResult {
    * dynamically-added PVID entry that a later change could remove).
    */
   severity?: 'critical' | 'warning';
+  /**
+   * Satisfied as far as the check can tell, but it depends on something the
+   * model can't evaluate. A change that leaves an invariant uncertain is
+   * reported as a warning, which makes auto-revert mandatory for it.
+   */
+  uncertain?: boolean;
+  /** The check itself threw, so it says nothing either way (set by `evaluate`). */
+  failed?: boolean;
 }
 
 export interface Invariant {
@@ -62,6 +71,27 @@ export const INVARIANTS: Invariant[] = [
   },
 
   {
+    // A check of its own, not part of mgmt-ip-present: a violation already
+    // present would otherwise hide that one (an address on a bridge port is
+    // held by the bridge, which this compares by actual-interface).
+    id: 'mgmt-ip-interface',
+    title: 'The management address stays on the interface the manager reaches it through',
+    check(snap, path) {
+      if (!path.mgmtInterface) return ok();
+      const rows = snap.addresses.filter(
+        (a) => !isTrue(a['disabled']) && !isTrue(a['invalid']) && stripCidr(a['address']) === path.mgmtIp
+      );
+      if (rows.length === 0) return ok(); // mgmt-ip-present reports that
+      if (rows.some((a) => (a['actual-interface'] || a['interface']) === path.mgmtInterface)) return ok();
+      const now = rows[0]['actual-interface'] || rows[0]['interface'];
+      return {
+        ok: false,
+        detail: `${path.mgmtIp} would move from ${path.mgmtInterface} to ${now} (#285). The manager reaches the device through ${path.mgmtInterface}, so the address would stop answering there.`,
+      };
+    },
+  },
+
+  {
     id: 'mgmt-iface-up',
     title: 'The interface holding the management address is enabled',
     check(snap, path) {
@@ -72,6 +102,46 @@ export const INVARIANTS: Invariant[] = [
       }
       return isTrue(row['disabled'])
         ? { ok: false, detail: `Interface ${path.mgmtInterface} holds the management address and would be disabled.` }
+        : ok();
+    },
+  },
+
+  {
+    id: 'mgmt-parent-up',
+    title: 'The port under the management VLAN interface is enabled',
+    check(snap, path) {
+      // A VLAN interface on a plain port (not a bridge) rides that port. It was
+      // never checked, so disabling ether1 under vlan10 passed as safe (P2-7).
+      if (!path.mgmtParent) return ok();
+      const row = snap.interfaces.find((i) => i['name'] === path.mgmtParent);
+      if (!row) {
+        return { ok: false, detail: `${path.mgmtParent}, the port under the management VLAN interface ${path.mgmtInterface}, would no longer exist.` };
+      }
+      return isTrue(row['disabled'])
+        ? { ok: false, detail: `${path.mgmtParent} carries the management VLAN interface ${path.mgmtInterface} and would be disabled.` }
+        : ok();
+    },
+  },
+
+  {
+    id: 'mgmt-not-bridge-slave',
+    title: 'The port carrying management is not swallowed by a bridge',
+    check(snap, path) {
+      // Management addressed directly on a port, or on a VLAN interface whose
+      // parent is a plain port, only works while that port is NOT a bridge slave:
+      // RouterOS hands a slave's frames to the bridge, so the address (or the
+      // VLAN interface) on it stops receiving anything.
+      const port = path.mgmtParent ?? path.mgmtInterface;
+      if (!port || port === path.bridge) return ok();
+      const row = snap.interfaces.find((i) => i['name'] === port);
+      if (row && !['ether', 'bond', 'sfp', 'wlan', 'wifi'].some((t) => (row['type'] || 'ether').startsWith(t))) return ok();
+      const slave = snap.bridgePorts.find((p) => p['interface'] === port && !isTrue(p['disabled']));
+      return slave
+        ? {
+            ok: false,
+            severity: 'critical',
+            detail: `${port} carries management (${path.mgmtParent ? `under ${path.mgmtInterface}` : path.mgmtIp}) and would become a port of bridge ${slave['bridge']}. A bridge port hands its frames to the bridge, so management on it would stop working.`,
+          }
         : ok();
     },
   },
@@ -131,17 +201,6 @@ export const INVARIANTS: Invariant[] = [
         };
       }
 
-      // Present, but only because RouterOS auto-added it from the PVID. That entry
-      // disappears if the PVID or frame-types change, so management would be
-      // resting on something the operator did not configure.
-      if (!m.untaggedStatic.includes(path.bridge)) {
-        return {
-          ok: false,
-          severity: 'warning',
-          detail: `${path.bridge} would remain an untagged member of VLAN ${vid} only through a dynamic "added by pvid" entry, not a configured one. Management would keep working for now, but any later change to the bridge PVID or frame-types would remove it. Add ${path.bridge} to VLAN ${vid} explicitly.`,
-        };
-      }
-
       // The ingress port must be a member of the VLAN, but it need NOT be an
       // untagged one: a tagged trunk that also accepts untagged frames via its PVID
       // is a normal and correct configuration. Requiring "untagged" here produced a
@@ -155,6 +214,17 @@ export const INVARIANTS: Invariant[] = [
           detail: `${path.ingressPort} — the port management traffic arrives on — would not be a member of VLAN ${vid} at all.`,
         };
       }
+      // Present, but only because RouterOS auto-added it from the PVID. That entry
+      // disappears if the PVID or frame-types change, so management would be
+      // resting on something the operator did not configure.
+      if (!m.untaggedStatic.includes(path.bridge)) {
+        return {
+          ok: false,
+          severity: 'warning',
+          detail: `${path.bridge} would remain an untagged member of VLAN ${vid} only through a dynamic "added by pvid" entry, not a configured one. Management would keep working for now, but any later change to the bridge PVID or frame-types would remove it. Add ${path.bridge} to VLAN ${vid} explicitly.`,
+        };
+      }
+
       return ok();
     },
   },
@@ -163,7 +233,9 @@ export const INVARIANTS: Invariant[] = [
     id: 'ingress-port-pvid',
     title: 'The ingress port still stamps the management VLAN',
     check(snap, path) {
-      if (path.taggedManagement || !path.bridge || !filteringOn(snap, path.bridge)) return ok();
+      // Whenever management arrives untagged on the port, including an access
+      // port feeding a tagged VLAN interface (P2-7).
+      if (path.ingressTagged || !path.bridge || !filteringOn(snap, path.bridge)) return ok();
       if (!path.ingressPort || path.mgmtVlanId == null) return ok();
       const port = snap.bridgePorts.find(
         (p) => p['interface'] === path.ingressPort && p['bridge'] === path.bridge
@@ -176,6 +248,78 @@ export const INVARIANTS: Invariant[] = [
             ok: false,
             detail: `${path.ingressPort} would stamp untagged traffic with VLAN ${pvid} instead of the management VLAN ${path.mgmtVlanId}, moving management into a VLAN the CPU does not receive.`,
           };
+    },
+  },
+
+  {
+    id: 'ingress-port-tagged-member',
+    title: 'The ingress port still carries the tagged management VLAN',
+    check(snap, path) {
+      // The tagged counterpart of ingress-port-pvid. Nothing checked this until
+      // #165 made unticking a VLAN in the port editor actually remove it: the
+      // bridge could stay a tagged member while the uplink the manager arrives
+      // on was dropped from the VLAN, and the frames would be filtered at ingress.
+      if (!path.taggedManagement || !path.bridge || !filteringOn(snap, path.bridge)) return ok();
+      if (!path.ingressPort || path.mgmtVlanId == null) return ok();
+      const m = vlanMembership(snap, path.bridge, path.mgmtVlanId);
+      if (!m.found) return ok(); // covered by vlan-iface-tagged
+      // An access port carries the VLAN untagged; requiring "tagged" there was
+      // false before any change, so it could never flip and real breakage on
+      // that port went unreported (P2-7).
+      if (!path.ingressTagged) {
+        return m.untagged.includes(path.ingressPort) || m.tagged.includes(path.ingressPort)
+          ? ok()
+          : {
+              ok: false,
+              severity: 'critical',
+              detail: `${path.ingressPort} — the access port management arrives on — would no longer be a member of VLAN ${path.mgmtVlanId}.`,
+            };
+      }
+      return m.tagged.includes(path.ingressPort)
+        ? ok()
+        : {
+            ok: false,
+            detail: `${path.ingressPort} would no longer be a tagged member of VLAN ${path.mgmtVlanId}. Management arrives tagged on that VLAN through ${path.ingressPort}, so the bridge would drop it at ingress.`,
+          };
+    },
+  },
+
+  {
+    id: 'ingress-port-frame-types',
+    title: 'The ingress port still admits the frames management arrives in',
+    /**
+     * Added with #151, when setPortVlanConfig began writing frame-types.
+     *
+     * Until then nothing set frame admission, so no invariant modelled it — the
+     * other checks here only mention it in passing. It strands a device more
+     * directly than the PVID does: admit-only-vlan-tagged on the port carrying
+     * untagged management drops those frames at ingress, while every VLAN table
+     * row still lists the port and every other invariant stays satisfied.
+     */
+    check(snap, path) {
+      if (!path.ingressPort || !path.bridge || !filteringOn(snap, path.bridge)) return ok();
+      const port = snap.bridgePorts.find(
+        (p) => p['interface'] === path.ingressPort && p['bridge'] === path.bridge
+      );
+      if (!port) return ok(); // covered by ingress-port-member
+      const frames = (port['frame-types'] || '').trim();
+      if (!frames || frames === 'admit-all') return ok();
+
+      if (!path.ingressTagged && frames === 'admit-only-vlan-tagged') {
+        return {
+          ok: false,
+          severity: 'critical',
+          detail: `${path.ingressPort} would accept only VLAN-tagged frames, but management arrives untagged on it. Those frames would be dropped at ingress even though the VLAN table still lists the port.`,
+        };
+      }
+      if (path.ingressTagged && frames === 'admit-only-untagged-and-priority-tagged') {
+        return {
+          ok: false,
+          severity: 'critical',
+          detail: `${path.ingressPort} would accept only untagged frames, but management arrives tagged on VLAN ${path.mgmtVlanId ?? '?'}. Those frames would be dropped at ingress.`,
+        };
+      }
+      return ok();
     },
   },
 
@@ -220,7 +364,7 @@ export const INVARIANTS: Invariant[] = [
     id: 'mgmt-service-open',
     title: 'The API service the manager uses stays enabled on its port',
     check(snap, path, device) {
-      const wanted = device.api_port === 8729 ? 'api-ssl' : 'api';
+      const wanted = managementService(device);
       const svc = snap.services.find((s) => s['name'] === wanted);
       if (!svc) return ok();
       if (isTrue(svc['disabled'])) {
@@ -235,15 +379,17 @@ export const INVARIANTS: Invariant[] = [
 
   {
     id: 'input-chain-permits',
-    title: 'No input-chain rule blocks the management port',
+    title: 'The input chain still lets the manager in',
     check(snap, path, device) {
-      for (const rule of snap.firewallFilter) {
-        const risk = detectLockoutRisk(rule, { mgmtPorts: [device.api_port] });
-        if (risk.risky) {
-          return { ok: false, detail: `A firewall rule would block management access: ${risk.reason}` };
-        }
-      }
-      return ok();
+      const verdict = evaluateInputChain(snap, {
+        srcIp: path.managerIp,
+        dstIp: device.ip_address,
+        dstPort: device.api_port,
+        inInterface: path.mgmtInterface,
+      });
+      if (verdict.outcome === 'dropped') return { ok: false, detail: verdict.reason };
+      if (verdict.outcome === 'unknown') return { ok: true, uncertain: true, detail: verdict.reason };
+      return ok(verdict.reason);
     },
   },
 
@@ -251,15 +397,44 @@ export const INVARIANTS: Invariant[] = [
     id: 'route-to-manager',
     title: 'A route back toward the manager still exists',
     check(snap, path) {
-      // Only meaningful when the manager is reached via a gateway rather than
-      // being on the same subnet.
-      if (path.ingressPortSource !== 'fdb-default-gw') return ok();
-      const hasDefault = snap.routes.some(
-        (r) => (r['dst-address'] || '') === '0.0.0.0/0' && r['active'] !== 'false' && !isTrue(r['disabled'])
-      );
-      return hasDefault
-        ? ok()
-        : { ok: false, detail: 'The default route would be removed, and the manager reaches this device through the default gateway.' };
+      // Only meaningful when the manager is reached through a gateway rather
+      // than being on the same subnet. It used to be checked only when the
+      // path had been inferred from the default gateway, so removing a
+      // specific route to the manager passed as safe (P2-7).
+      if (!path.managerGateway) return ok();
+      // The route the device would actually pick (longest prefix, main table, not a
+      // blackhole). "Some route covers the manager" was satisfied by a default
+      // route pointing somewhere else entirely.
+      const target = path.managerIp ?? '0.0.0.0';
+      const best = path.managerIp
+        ? routeFor(snap, path.managerIp, path.mgmtTable)
+        : snap.routes
+          .filter((r) => (r['dst-address'] || '') === '0.0.0.0/0' && routeActive(r, path.mgmtTable))
+          .sort((x, y) => (parseInt(x['distance'] || '255', 10) || 255) - (parseInt(y['distance'] || '255', 10) || 255))[0] ?? null;
+      if (!best) {
+        return path.managerIp
+          ? { ok: false, detail: `No route toward the manager (${target}) would remain; it is reached through ${path.managerGateway}.` }
+          : { ok: false, detail: 'The default route would be removed, and the manager reaches this device through the default gateway.' };
+      }
+      if (routeDiscards(best)) {
+        return {
+          ok: false,
+          detail: `The route that would carry traffic back to the manager (${best['dst-address']}) discards it (${best['type'] || 'blackhole'}).`,
+        };
+      }
+      const gw = bareGateway(best['gateway']);
+      const via = [gw, bareGateway(best['immediate-gw'])];
+      if (!via.includes(path.managerGateway)) {
+        return {
+          ok: true,
+          uncertain: true,
+          detail: `The route back toward the manager would go through ${gw || best['dst-address']} instead of ${path.managerGateway}. That may be fine, but the model cannot confirm the manager is reachable that way.`,
+        };
+      }
+      if (!path.mgmtTableCertain) {
+        return { ok: true, uncertain: true, detail: `A route in ${path.mgmtTable} remains, but the routing table management uses could not be confirmed.` };
+      }
+      return ok();
     },
   },
 ];
@@ -284,8 +459,10 @@ export function evaluate(
     try {
       out.set(inv.id, inv.check(snap, path, device));
     } catch (err) {
-      // A broken check must never block a legitimate change.
-      out.set(inv.id, { ok: true, detail: `check skipped: ${(err as Error).message}` });
+      // A broken check must not block a legitimate change, but it must not
+      // vouch for it either: report it uncertain so protection is mandatory.
+      console.warn(`[ChangeGuard] invariant ${inv.id} threw: ${(err as Error).message}`);
+      out.set(inv.id, { ok: true, uncertain: true, failed: true, detail: `${inv.title}: this check could not be evaluated (${(err as Error).message}).` });
     }
   }
   return out;

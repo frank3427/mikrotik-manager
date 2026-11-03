@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'react-router-dom';
 import { Bell, Search, Trash2, AlertCircle, Info, AlertTriangle } from 'lucide-react';
 import { eventsApi, devicesApi } from '../services/api';
 import { useCanWrite } from '../hooks/useCanWrite';
@@ -7,6 +8,7 @@ import { useSocket } from '../hooks/useSocket';
 import { format } from 'date-fns';
 import type { EventSeverity } from '../types';
 import clsx from 'clsx';
+import DevicePicker from '../components/common/DevicePicker';
 
 const severityIcon = (severity: EventSeverity) => {
   if (severity === 'error' || severity === 'critical') return AlertCircle;
@@ -25,17 +27,31 @@ const ALL_SEVERITIES = ['error', 'warning', 'info'] as const;
 export default function EventsPage() {
   const queryClient = useQueryClient();
   const canWrite = useCanWrite();
-  const [search, setSearch] = useState('');
-  const [severities, setSeverities] = useState<Set<string>>(new Set(ALL_SEVERITIES));
+  // ?search= lets other pages (e.g. the dashboard proxy card) deep-link a filter.
+  const [searchParams] = useSearchParams();
+  const [search, setSearch] = useState(searchParams.get('search') ?? '');
+  const [severities, setSeverities] = useState<Set<string>>(() => {
+    // ?severity=error deep-links from the dashboard's alert count.
+    const wanted = (searchParams.get('severity') ?? '').split(',')
+      .filter((x): x is (typeof ALL_SEVERITIES)[number] => (ALL_SEVERITIES as readonly string[]).includes(x));
+    return new Set<string>(wanted.length ? wanted : ALL_SEVERITIES);
+  });
   const [topic, setTopic] = useState('');
   const [deviceId, setDeviceId] = useState('');
   const [page, setPage] = useState(0);
+  // NTP/cloud clock adjustments are routine and hidden by default (#213).
+  const [showClock, setShowClock] = useState(false);
+  // Firewall packet logs have their own high-volume page (#334).
+  const [showFirewall, setShowFirewall] = useState(false);
   // RouterOS reports topics as a comma-separated list, so the server splits them
   // into individual tokens and counts them across the whole table — the operator
   // picks from what actually exists rather than guessing a spelling (#108).
   const { data: topicList = [] } = useQuery({
-    queryKey: ['event-topics'],
-    queryFn: () => eventsApi.topics().then(r => r.data),
+    queryKey: ['event-topics', showFirewall],
+    queryFn: () =>
+      eventsApi
+        .topics(showFirewall ? { firewall: 1 } : undefined)
+        .then(r => r.data),
     staleTime: 300_000,
   });
   const PAGE_SIZE = 100;
@@ -56,7 +72,7 @@ export default function EventsPage() {
       : [...severities].join(',');
 
   const { data: eventsData, isLoading } = useQuery({
-    queryKey: ['events', { search, severityParam, topic, deviceId, page }],
+    queryKey: ['events', { search, severityParam, topic, deviceId, page, showClock, showFirewall }],
     queryFn: () =>
       eventsApi
         .list({
@@ -66,6 +82,8 @@ export default function EventsPage() {
           deviceId: deviceId ? parseInt(deviceId) : undefined,
           limit: PAGE_SIZE,
           offset: page * PAGE_SIZE,
+          ...(showClock ? { clock: 1 as const } : {}),
+          ...(showFirewall ? { firewall: 1 as const } : {}),
         })
         .then((r) => r.data),
     refetchInterval: 30_000,
@@ -87,6 +105,9 @@ export default function EventsPage() {
 
   const events = eventsData?.events ?? [];
   const total = eventsData?.total ?? 0;
+  // Past the server's cap the total is a floor, shown as "100,000+".
+  const capped = eventsData?.totalCapped ?? false;
+  const totalLabel = `${total.toLocaleString()}${capped ? '+' : ''}`;
 
   return (
     <div className="space-y-4">
@@ -95,7 +116,7 @@ export default function EventsPage() {
           Events
           {total > 0 && (
             <span className="ml-2 text-sm font-normal text-gray-500 dark:text-slate-400">
-              ({total.toLocaleString()})
+              ({totalLabel})
             </span>
           )}
           {eventsData?.criticalCount ? (
@@ -159,18 +180,41 @@ export default function EventsPage() {
               <span className={clsx('text-xs font-medium', color)}>{label}</span>
             </label>
           ))}
+          <span className="w-px h-4 bg-gray-200 dark:bg-slate-600" />
+          <label className="flex items-center gap-1.5 cursor-pointer select-none"
+            title="NTP and IP Cloud clock adjustments ('ntp change time', 'cloud change time')">
+            <input type="checkbox" checked={showClock}
+              onChange={(e) => { setShowClock(e.target.checked); setPage(0); }}
+              className="w-3.5 h-3.5 rounded accent-current cursor-pointer" />
+            <span className="text-xs font-medium text-gray-500 dark:text-slate-400">Clock changes</span>
+          </label>
+
+          <span className="w-px h-4 bg-gray-200 dark:bg-slate-600" />
+
+          <label
+            className="flex items-center gap-1.5 cursor-pointer select-none"
+            title="Show RouterOS firewall packet logs in Device Logs"
+          >
+            <input
+              type="checkbox"
+              checked={showFirewall}
+              onChange={(e) => {
+                setShowFirewall(e.target.checked);
+                setPage(0);
+              }}
+              className="w-3.5 h-3.5 rounded accent-current cursor-pointer"
+            />
+            <span className="text-xs font-medium text-gray-500 dark:text-slate-400">
+              Firewall packets
+            </span>
+          </label>
         </div>
 
-        <select
-          className="input w-full sm:w-44"
-          value={deviceId}
-          onChange={(e) => { setDeviceId(e.target.value); setPage(0); }}
-        >
-          <option value="">All devices</option>
-          {devices.map((d) => (
-            <option key={d.id} value={d.id}>{d.name}</option>
-          ))}
-        </select>
+        <DevicePicker
+          className="w-full sm:w-56" emptyLabel="All devices" devices={devices} aria-label="Device"
+          value={deviceId ? Number(deviceId) : null}
+          onChange={(id) => { setDeviceId(id == null ? '' : String(id)); setPage(0); }}
+        />
       </div>
 
       {isLoading ? (
@@ -236,7 +280,7 @@ export default function EventsPage() {
       {total > PAGE_SIZE && (
         <div className="flex items-center justify-between text-sm">
           <span className="text-gray-500 dark:text-slate-400">
-            Showing {(page * PAGE_SIZE + 1).toLocaleString()}–{Math.min((page + 1) * PAGE_SIZE, total).toLocaleString()} of {total.toLocaleString()}
+            Showing {(page * PAGE_SIZE + 1).toLocaleString()}–{(page * PAGE_SIZE + events.length).toLocaleString()} of {totalLabel}
           </span>
           <div className="flex gap-2">
             <button
@@ -248,7 +292,7 @@ export default function EventsPage() {
             </button>
             <button
               onClick={() => setPage((p) => p + 1)}
-              disabled={(page + 1) * PAGE_SIZE >= total}
+              disabled={capped ? events.length < PAGE_SIZE : (page + 1) * PAGE_SIZE >= total}
               className="btn-secondary py-1 text-xs"
             >
               Next →

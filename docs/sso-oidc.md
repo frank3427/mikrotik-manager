@@ -58,14 +58,44 @@ links to an existing local account when `email_verified` matches — no duplicat
 SSO users have no local password and are labelled with an **SSO** badge under
 Users & Roles.
 
-**Roles are resolved server-side** from your group mapping on every login. Existing users
-are never silently demoted when a login carries no matching group, so a temporary IdP
-misconfiguration cannot strip your admins.
+**Roles are resolved server-side** at every sign-in. With a group mapping configured, the
+identity provider decides: a user's role is the one their groups map to, or the default role
+if none do, so removing someone from the admin group takes effect at their next sign-in.
+The one exception is the last admin account, which is never demoted, so a provider
+misconfiguration can't leave the install with no admin. With no group mapping configured,
+roles are managed here under Users & Roles and SSO never changes them. (Before 0.24.50 a
+user kept a mapped role after leaving the group.)
 
-**Break-glass.** Local username and password login stays available. The seeded local admin
-can always get in, even if the IdP is misconfigured, expired, or unreachable. Do not delete
-that account.
+**Allowed email domains need a verified email.** A new user is admitted by domain only when
+the provider says the address is verified (`email_verified: true`). An unverified address is
+whatever the user typed in, so it can't vouch for a domain. Some providers, Microsoft Entra
+ID among them, don't send `email_verified`; there, admit users with a group mapping instead
+of a domain list. Users already linked to their SSO identity aren't affected.
 
-**Behind a reverse proxy.** The redirect URI is derived from the request host. If your
-external URL differs from what the backend sees — a proxy, a custom domain, a tunnel —
+**Sign-in is tied to your browser.** Starting a sign-in sets a short-lived cookie that only
+the SSO endpoints receive, and the sign-in can only be finished in the browser holding it.
+The provider's redirect brings back a one-time code, not a session; the app exchanges it for
+the session straight away and removes it from the address bar. So a sign-in link can't be
+used to log someone else in to your account, and no session token is left in browser
+history. A sign-in started before an admin turns SSO off is refused when it comes back.
+
+**Break-glass.** Local username and password login stays available unless you turn it off
+(below). The seeded local admin can always get in, even if the IdP is misconfigured,
+expired, or unreachable. Do not delete that account.
+
+**SSO-only sign-in.** Set `PASSWORD_LOGIN=false` in `.env` and restart to make SSO the only
+way in. The login page then shows just the SSO button, and password sign-in, password
+changes and two-factor setup are refused; **My Account** disappears from Settings. API tokens
+keep working. It only takes effect while SSO is configured, so a typo can't lock everyone out.
+If SSO breaks, set `PASSWORD_LOGIN=true`, restart, and sign in with the local admin: that is
+the break-glass, and nothing inside the app can turn it off.
+
+**Turning SSO off while signed in through it.** An admin signed in through SSO has no local
+password, so the app refuses to turn SSO off, or to point it at a different provider, from
+that session: it would lock them out at their next sign-in. Make that change from a local
+admin account.
+
+**Behind a reverse proxy.** The redirect URI is derived from the host and scheme of the
+request. Behind a proxy set up as in [Behind a reverse proxy](configuration.md#behind-a-reverse-proxy)
+that is your external URL. If it still differs (a tunnel, a proxy that rewrites the host),
 set **Public base URL** to pin it, or the provider will reject the callback.

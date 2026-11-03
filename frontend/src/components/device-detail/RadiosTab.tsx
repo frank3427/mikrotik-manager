@@ -1,4 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { useRememberedRange } from '../../hooks/useRememberedRange';
+import ReviewChangesButton from '../common/ReviewChangesButton';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Wifi, Activity, Users, Radio, RefreshCw, Pencil, ChevronDown, ChevronRight,
@@ -6,14 +8,17 @@ import {
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, Legend, BarChart, Bar, Cell,
+  ResponsiveContainer, BarChart, Bar, Cell,
 } from 'recharts';
-import { wirelessApi } from '../../services/api';
+import { chartTooltip } from '../common/chartTooltip';
+import { wirelessApi, devicesApi } from '../../services/api';
 import { useCanWrite } from '../../hooks/useCanWrite';
+import { invalidateDevice } from '../../utils/invalidateDevice';
 import RfHealth from '../wireless/RfHealth';
 import type { WirelessInterface, WirelessMetricPoint } from '../../types';
 import clsx from 'clsx';
 import { format } from 'date-fns';
+import { changedFields } from '../../utils/formDiff';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -59,7 +64,7 @@ function RadioEditModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
-  const [form, setForm] = useState({
+  const loaded = {
     ssid:          iface.ssid || '',
     band:          iface.band || '2ghz-b/g/n',
     frequency:     String(iface.frequency || ''),
@@ -70,7 +75,8 @@ function RadioEditModal({
     country:       iface.country || 'united states',
     installation:  iface.installation || 'indoor',
     disabled:      iface.disabled,
-  });
+  };
+  const [form, setForm] = useState(loaded);
   const set = (k: keyof typeof form) => (v: string | boolean) =>
     setForm(f => ({ ...f, [k]: v }));
 
@@ -87,18 +93,16 @@ function RadioEditModal({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    mutation.mutate({
-      ssid: form.ssid,
-      band: form.band,
-      frequency: form.frequency,
-      channel_width: form.channel_width,
-      tx_power: form.tx_power,
-      tx_power_mode: form.tx_power_mode,
-      antenna_gain: form.antenna_gain,
-      country: form.country,
-      installation: form.installation,
-      disabled: form.disabled,
-    });
+    // Only what changed. The frequency shown is the one the radio is running
+    // on now; re-sending it on every save pinned a radio set to choose its
+    // channel automatically to that frequency.
+    const changes = changedFields(loaded, form);
+    if (!Object.keys(changes).length) { onClose(); return; }
+    // Taking a radio off the air asks first (#294).
+    if (changes.disabled === true && !confirm(
+      `Disable ${iface.name}${iface.ssid ? ` ("${iface.ssid}")` : ''}? Clients connected to it will be disconnected, `
+      + 'and if this device is managed over that wireless link, the manager may lose contact.')) return;
+    mutation.mutate(changes);
   };
 
   return (
@@ -190,6 +194,9 @@ function RadioEditModal({
           )}
           <div className="flex justify-end gap-2 pt-1">
             <button type="button" className="btn-secondary" onClick={onClose}>Cancel</button>
+            <ReviewChangesButton applyLabel="Save" disabled={mutation.isPending}
+              request={() => wirelessApi.updateInterface(deviceId, iface.name, changedFields(loaded, form))}
+              onApply={() => mutation.mutate(changedFields(loaded, form))} />
             <button type="submit" className="btn-primary" disabled={mutation.isPending}>
               {mutation.isPending ? 'Saving…' : 'Save'}
             </button>
@@ -206,7 +213,7 @@ const RANGES = ['1h', '3h', '6h', '12h', '24h', '7d'] as const;
 
 function WirelessCharts({ deviceId, ifaces }: { deviceId: number; ifaces: WirelessInterface[] }) {
   const [selectedIface, setSelectedIface] = useState(ifaces[0]?.name || '');
-  const [range, setRange] = useState<string>('6h');
+  const [range, setRange] = useRememberedRange<string>('radios', '6h');
 
   const { data: raw = [] } = useQuery({
     queryKey: ['wireless-metrics', deviceId, selectedIface, range],
@@ -336,6 +343,11 @@ function ScanWarningModal({
           <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
             All wireless clients connected to this AP will be briefly disconnected during the scan.
           </p>
+          {/* Seen on a legacy-package radio in station mode (#295): the scan dropped its own uplink. */}
+          <p className="text-sm text-gray-700 dark:text-slate-300">
+            If this radio is itself connected to another access point (a wireless link or a client of
+            another AP), that connection drops too, so avoid it on a link the manager reaches the device through.
+          </p>
           <p className="text-xs text-gray-500 dark:text-slate-400">
             The scan takes approximately {isSpectral ? '10' : '20'} seconds. Clients will
             reconnect automatically once the radio returns to its channel.
@@ -394,6 +406,14 @@ function SpectrumAnalyzer({ deviceId, ifaces }: { deviceId: number; ifaces: Wire
   const [scanTime, setScanTime]           = useState<string | null>(null);
   const [selectedHistoryId, setSelectedHistoryId] = useState<number | null>(null);
   const [showWarning, setShowWarning]     = useState(false);
+  // The chart belongs to one radio (outside review U14): switching radios
+  // clears it, and a scan that finishes after a switch isn't shown under the
+  // radio that is selected now.
+  const ifaceRef = useRef(selectedIface);
+  useEffect(() => {
+    ifaceRef.current = selectedIface;
+    setChartData([]); setScanTime(null); setSelectedHistoryId(null); setScanError(null);
+  }, [selectedIface]);
 
   const { data: history = [], refetch: refetchHistory } = useQuery({
     queryKey: ['spectral-history', deviceId, selectedIface],
@@ -419,11 +439,13 @@ function SpectrumAnalyzer({ deviceId, ifaces }: { deviceId: number; ifaces: Wire
   }
 
   async function handleScanNow() {
+    const iface = selectedIface;
     setScanning(true);
     setScanError(null);
     try {
-      const result = await wirelessApi.runSpectralScan(deviceId, selectedIface);
+      const result = await wirelessApi.runSpectralScan(deviceId, iface);
       const scan = result.data as { id: number; scanned_at: string; data: Record<string, string>[] };
+      if (ifaceRef.current !== iface) return; // the user moved to another radio meanwhile
       setChartData(parseSpectralRows(scan.data));
       setScanTime(scan.scanned_at);
       setSelectedHistoryId(scan.id);
@@ -558,7 +580,7 @@ function SpectrumAnalyzer({ deviceId, ifaces }: { deviceId: number; ifaces: Wire
               <Tooltip
                 formatter={(value: number) => [`${value + SPECTRAL_BASELINE} dBm`, 'Power']}
                 labelFormatter={(label: number) => `${label} MHz`}
-                contentStyle={{ fontSize: 12 }}
+                {...chartTooltip}
               />
               <Bar dataKey="barValue" maxBarSize={8} isAnimationActive={false}>
                 {chartData.map((entry, index) => (
@@ -598,10 +620,15 @@ interface APScanRecord {
   data: APNetworkEntry[];
 }
 
+/**
+ * Kept as Tailwind classes rather than the hex from rssiColor, but the
+ * thresholds now match RSSI_ZONES exactly. They used to differ from it, so a
+ * client at −58 dBm was "Good" here and "Fair" on the RF Health page (#154).
+ */
 function signalColor(dbm: number): string {
-  if (dbm >= -55) return 'text-green-600 dark:text-green-400';
+  if (dbm >= -45) return 'text-green-600 dark:text-green-400';
+  if (dbm >= -55) return 'text-lime-600 dark:text-lime-400';
   if (dbm >= -70) return 'text-yellow-600 dark:text-yellow-400';
-  if (dbm >= -85) return 'text-orange-500 dark:text-orange-400';
   return 'text-red-500 dark:text-red-400';
 }
 
@@ -761,9 +788,11 @@ function APScanner({ deviceId }: { deviceId: number }) {
                     {/* SSID */}
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
-                        {net.security !== 'open'
-                          ? <Lock className="w-3 h-3 text-gray-400 flex-shrink-0" />
-                          : <Unlock className="w-3 h-3 text-amber-400 flex-shrink-0" />}
+                        {net.security === 'open'
+                          ? <Unlock className="w-3 h-3 text-amber-400 flex-shrink-0" />
+                          : net.security === 'unknown'
+                            ? null
+                            : <Lock className="w-3 h-3 text-gray-400 flex-shrink-0" />}
                         {net.hidden
                           ? <span className="text-gray-400 italic text-xs">Hidden network</span>
                           : <span className="font-medium text-gray-900 dark:text-white">{net.ssid}</span>}
@@ -803,7 +832,14 @@ function APScanner({ deviceId }: { deviceId: number }) {
                     </td>
                     {/* Security */}
                     <td className="px-4 py-3 text-xs text-gray-600 dark:text-slate-400">
-                      {net.security || '—'}
+                      {net.security === 'unknown' ? (
+                        // The legacy wireless driver's scan can leave encryption out of its API
+                        // reply; the scan run as a script has it, where the router can (#295).
+                        <span className="underline decoration-dotted cursor-help"
+                          title="Not reported: this router's legacy wireless scan didn't say whether the network is encrypted, and reading it from the scan run as a script didn't work here (RouterOS 6, or no permission to run scripts), so it can't be shown as open or protected.">
+                          unknown
+                        </span>
+                      ) : (net.security || '—')}
                     </td>
                   </tr>
                 );
@@ -918,7 +954,6 @@ interface Props {
 
 export default function RadiosTab({ deviceId, deviceStatus }: Props) {
   const canWrite = useCanWrite();
-  const qc = useQueryClient();
   const [editIface, setEditIface] = useState<WirelessInterface | null>(null);
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
 
@@ -929,15 +964,19 @@ export default function RadiosTab({ deviceId, deviceStatus }: Props) {
       return next;
     });
 
-  const { data: ifaces = [], isLoading, refetch } = useQuery({
+  const { data: ifaces = [], isLoading } = useQuery({
     queryKey: ['device-wireless', deviceId],
     queryFn: () => wirelessApi.getCachedInterfaces(deviceId).then(r => r.data as WirelessInterface[]),
     refetchInterval: 30_000,
   });
-
-  const refreshMutation = useMutation({
-    mutationFn: () => wirelessApi.getCachedInterfaces(deviceId),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['device-wireless', deviceId] }),
+  // Refresh reads the radios from the device (a scoped sync), then reloads the
+  // tab; the radio list is stored by the poller, so a plain reload showed the
+  // last slow poll's data. Viewers get the reload.
+  const qc = useQueryClient();
+  const refresh = useMutation({
+    meta: { inlineError: true },
+    mutationFn: async () => { if (canWrite) await devicesApi.sync(deviceId, 'wireless'); },
+    onSettled: () => invalidateDevice(qc, deviceId),
   });
 
   const isOffline = deviceStatus !== 'online';
@@ -993,11 +1032,12 @@ export default function RadiosTab({ deviceId, deviceStatus }: Props) {
               {expandedCards.size === ifaces.length ? 'Collapse all' : 'Expand all'}
             </button>
             <button
-              onClick={() => refetch()}
+              onClick={() => refresh.mutate()}
+              disabled={refresh.isPending}
               className="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 hover:bg-gray-100 dark:hover:bg-slate-700 transition-colors"
-              title="Refresh"
+              title={canWrite ? 'Read the radios from the device now' : 'Reload'}
             >
-              <RefreshCw className={clsx('w-4 h-4', isLoading && 'animate-spin')} />
+              <RefreshCw className={clsx('w-4 h-4', (isLoading || refresh.isPending) && 'animate-spin')} />
             </button>
           </div>
         </div>

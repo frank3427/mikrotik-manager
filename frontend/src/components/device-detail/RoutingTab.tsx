@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import ReviewChangesButton from '../common/ReviewChangesButton';
 import { LockoutVerdictDialog, lockoutVerdictOf, type LockoutVerdict } from '../ChangeGuardDialog';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Plus, Trash2, AlertCircle, RefreshCw } from 'lucide-react';
@@ -25,7 +26,7 @@ const dApi = devicesApi as typeof devicesApi & {
   removeFilterRule: (id: number, itemId: string) => Promise<unknown>;
 };
 
-const SUB_TABS = ['Routes', 'OSPF', 'BGP', 'Route Filters', 'Tables'] as const;
+const SUB_TABS = ['IPv4 Routes', 'IPv6 Routes', 'OSPF', 'BGP', 'Route Filters', 'Tables'] as const;
 type SubTab = (typeof SUB_TABS)[number];
 
 // ─── Reusable helpers ─────────────────────────────────────────────────────────
@@ -87,24 +88,32 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
     queryFn: () => devicesApi.getRouting(deviceId).then(r => r.data),
   });
 
+  const { data: tableRows = [] } = useQuery({
+    queryKey: ['routing-tables', deviceId],
+    queryFn: () => dApi.getRoutingTables(deviceId).then(r => r.data),
+  });
+  const [tableFilter, setTableFilter] = useState('all');
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ dst_address: '', gateway: '', distance: '1', comment: '' });
+  const [form, setForm] = useState({ dst_address: '', gateway: '', distance: '1', comment: '', routing_table: '' });
   const [addError, setAddError] = useState('');
   const [deleteError, setDeleteError] = useState('');
   // 409 + verdict from the lockout predictor, with the retry that confirms it.
   const [lockout, setLockout] = useState<{ verdict: LockoutVerdict; retry: () => void } | null>(null);
 
+  const addRequest = (confirm: boolean) => devicesApi.addRoute(deviceId, {
+    dst_address: form.dst_address,
+    gateway: form.gateway,
+    distance: form.distance ? parseInt(form.distance, 10) : undefined,
+    comment: form.comment || undefined,
+    // Blank = the device default (main); sent only when a table was picked.
+    ...(form.routing_table ? { routing_table: form.routing_table } : {}),
+    ...(confirm ? { confirm_lockout: true } : {}),
+  });
   const addMutation = useMutation({
-    mutationFn: (confirm: boolean) => devicesApi.addRoute(deviceId, {
-      dst_address: form.dst_address,
-      gateway: form.gateway,
-      distance: form.distance ? parseInt(form.distance, 10) : undefined,
-      comment: form.comment || undefined,
-      ...(confirm ? { confirm_lockout: true } : {}),
-    }),
+    mutationFn: addRequest,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['routing', deviceId] });
-      setForm({ dst_address: '', gateway: '', distance: '1', comment: '' });
+      setForm({ dst_address: '', gateway: '', distance: '1', comment: '', routing_table: '' });
       setShowAdd(false);
       setAddError('');
       setLockout(null);
@@ -137,12 +146,28 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
   const isDynamic = (r: Record<string, string>) =>
     r['dynamic'] === 'true' || (r['flags'] && /[DCBOE]/.test(r['flags']));
 
+  const tableOf = (r: Record<string, string>) => r['routing-table'] || 'main';
+  const typeOf = (r: Record<string, string>) =>
+    // RouterOS 7 sends blackhole="" on a blackhole route and omits it elsewhere.
+    (r['blackhole'] !== undefined && r['blackhole'] !== 'false' && r['blackhole'] !== 'no') ? 'blackhole' : (r['type'] && r['type'] !== 'unicast' ? r['type'] : '');
+  // Tables the device defines, plus any a route names that the table list doesn't.
+  const tableNames = Array.from(new Set([
+    'main',
+    ...tableRows.map(t => t['name']).filter(Boolean),
+    ...(routes as Record<string, string>[]).map(tableOf),
+  ])).sort((a, b) => (a === 'main' ? -1 : b === 'main' ? 1 : a.localeCompare(b)));
+  const shownRoutes = (routes as Record<string, string>[]).filter(r => tableFilter === 'all' || tableOf(r) === tableFilter);
+
   if (isLoading) return <div className="text-center py-8 text-gray-400">Loading...</div>;
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <div>
+        <div className="flex items-center gap-3">
+          <select className="input text-sm py-1" value={tableFilter} onChange={e => setTableFilter(e.target.value)} aria-label="Filter by routing table">
+            <option value="all">All tables</option>
+            {tableNames.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
           {deleteError && (
             <span className="text-sm text-red-500 flex items-center gap-1">
               <AlertCircle className="w-4 h-4" />{deleteError}
@@ -164,7 +189,12 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
       {canWrite && showAdd && (
         <div className="card p-4 space-y-3">
           <h4 className="text-sm font-semibold text-gray-900 dark:text-white">New Static Route</h4>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <div><label className="label">Routing table</label>
+              <select className="input" value={form.routing_table} onChange={e => setForm(f => ({ ...f, routing_table: e.target.value }))}>
+                <option value="">main (default)</option>
+                {tableNames.filter(t => t !== 'main').map(t => <option key={t} value={t}>{t}</option>)}
+              </select></div>
             <div><label className="label">Destination (CIDR)</label>
               <input className="input font-mono" value={form.dst_address} onChange={e => setForm(f => ({ ...f, dst_address: e.target.value }))} placeholder="0.0.0.0/0" /></div>
             <div><label className="label">Gateway</label>
@@ -179,6 +209,8 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
             <button onClick={() => addMutation.mutate(false)} disabled={!form.dst_address || !form.gateway || addMutation.isPending} className="btn-primary flex items-center gap-2 text-sm">
               {addMutation.isPending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />} Add Route
             </button>
+            <ReviewChangesButton request={() => addRequest(false)} onApply={() => addMutation.mutate(false)} applyLabel="Add Route"
+              deviceName={deviceName} disabled={!form.dst_address || !form.gateway || addMutation.isPending} />
             <button onClick={() => setShowAdd(false)} className="btn-secondary text-sm">Cancel</button>
           </div>
         </div>
@@ -194,6 +226,7 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
                 <th className="table-header px-4 py-2.5 text-left">Destination</th>
                 <th className="table-header px-4 py-2.5 text-left">Gateway</th>
                 <th className="table-header px-4 py-2.5 text-left">Interface</th>
+                <th className="table-header px-4 py-2.5 text-left">Table</th>
                 <th className="table-header px-4 py-2.5 text-left">Dist.</th>
                 <th className="table-header px-4 py-2.5 text-left">Status</th>
                 <th className="table-header px-4 py-2.5 text-left">Comment</th>
@@ -201,7 +234,8 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100 dark:divide-slate-700 table-zebra">
-              {(routes as Record<string, string>[]).map((r, i) => {
+              {shownRoutes.map((r, i) => {
+                const rtype = typeOf(r);
                 const active = r['active'] === 'true' || r['flags']?.includes('A');
                 const dynamic = isDynamic(r);
                 const routeId = r['.id'] || '';
@@ -210,6 +244,10 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
                     <td className="px-4 py-2.5 font-mono text-gray-900 dark:text-white">{r['dst-address'] || '—'}</td>
                     <td className="px-4 py-2.5 font-mono text-gray-500 dark:text-slate-400">{r['gateway'] || '—'}</td>
                     <td className="px-4 py-2.5 font-mono text-gray-500 dark:text-slate-400">{r['interface'] || '—'}</td>
+                    <td className="px-4 py-2.5 font-mono text-gray-500 dark:text-slate-400">
+                      {tableOf(r)}
+                      {r['vrf-interface'] && <span className="ml-1 text-xs text-gray-400 dark:text-slate-500">({r['vrf-interface']})</span>}
+                    </td>
                     <td className="px-4 py-2.5 text-gray-500 dark:text-slate-400">{r['distance'] || '—'}</td>
                     <td className="px-4 py-2.5">
                       <div className="flex items-center gap-1.5">
@@ -217,6 +255,7 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
                           {active ? 'Active' : 'Inactive'}
                         </span>
                         {dynamic && <span className="text-xs text-gray-400 dark:text-slate-500">(dynamic)</span>}
+                        {rtype && <span className="text-xs font-medium text-amber-600 dark:text-amber-400">{rtype}</span>}
                       </div>
                     </td>
                     <td className="px-4 py-2.5 text-gray-400 dark:text-slate-500 text-xs">{r['comment'] || ''}</td>
@@ -243,6 +282,7 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
 
       {lockout && (
         <LockoutVerdictDialog
+          deviceId={deviceId}
           verdict={lockout.verdict}
           confirmPhrase={deviceName || 'confirm'}
           pending={addMutation.isPending || deleteMutation.isPending}
@@ -250,6 +290,82 @@ function RoutesSubTab({ deviceId, deviceName }: { deviceId: number; deviceName?:
           onCancel={() => setLockout(null)}
         />
       )}
+    </div>
+  );
+}
+
+// ─── IPv6 Routes sub-tab (#312), read-only ───────────────────────────────────
+function Ipv6RoutesSubTab({ deviceId }: { deviceId: number }) {
+  const { data, isLoading, refetch, isFetching, error } = useQuery({
+    queryKey: ['routing-ipv6', deviceId],
+    queryFn: () => devicesApi.getIpv6Routes(deviceId).then(r => r.data),
+  });
+  const [tableFilter, setTableFilter] = useState('all');
+  const routes = data?.routes ?? [];
+  const tableNames = Array.from(new Set(['main', ...routes.map(r => r.table)]))
+    .sort((a, b) => (a === 'main' ? -1 : b === 'main' ? 1 : a.localeCompare(b)));
+  const shown = routes.filter(r => tableFilter === 'all' || r.table === tableFilter);
+
+  if (isLoading) return <div className="text-center py-8 text-gray-400">Loading...</div>;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          {tableNames.length > 1 && (
+            <select className="input text-sm py-1" value={tableFilter} onChange={e => setTableFilter(e.target.value)} aria-label="Filter IPv6 routes by routing table">
+              <option value="all">All tables</option>
+              {tableNames.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          )}
+          <span className="text-xs text-gray-400 dark:text-slate-500">Read-only</span>
+        </div>
+        <button onClick={() => refetch()} disabled={isFetching} className="btn-secondary flex items-center gap-2 text-sm">
+          <RefreshCw className={clsx('w-3.5 h-3.5', isFetching && 'animate-spin')} /> Refresh
+        </button>
+      </div>
+      <div className="card overflow-hidden">
+        {error ? (
+          <Empty text={`Could not read IPv6 routes: ${errMsg(error)}`} />
+        ) : data && !data.supported ? (
+          <Empty text="IPv6 isn't available on this device (the ipv6 package is off or not installed)." />
+        ) : routes.length === 0 ? (
+          <Empty text={data?.disabled ? 'IPv6 is turned off on this device (IPv6, Settings in WinBox).' : 'No IPv6 routes.'} />
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-gray-200 dark:border-slate-700 bg-gray-50 dark:bg-slate-700/50">
+                <th className="table-header px-4 py-2.5 text-left">Destination</th>
+                <th className="table-header px-4 py-2.5 text-left">Gateway</th>
+                <th className="table-header px-4 py-2.5 text-left">Table</th>
+                <th className="table-header px-4 py-2.5 text-left">Dist.</th>
+                <th className="table-header px-4 py-2.5 text-left">Status</th>
+                <th className="table-header px-4 py-2.5 text-left">Comment</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100 dark:divide-slate-700 table-zebra">
+              {shown.map((r, i) => (
+                <tr key={r.id || i} className={clsx('hover:bg-gray-50 dark:hover:bg-slate-700/30', r.disabled && 'opacity-60')}>
+                  <td className="px-4 py-2.5 font-mono text-gray-900 dark:text-white">{r.dst || '—'}</td>
+                  <td className="px-4 py-2.5 font-mono text-gray-500 dark:text-slate-400" title={r.immediateGw && r.immediateGw !== r.gateway ? `via ${r.immediateGw}` : undefined}>{r.gateway || '—'}</td>
+                  <td className="px-4 py-2.5 font-mono text-gray-500 dark:text-slate-400">{r.table}</td>
+                  <td className="px-4 py-2.5 text-gray-500 dark:text-slate-400">{r.distance || '—'}</td>
+                  <td className="px-4 py-2.5">
+                    <div className="flex items-center gap-1.5">
+                      <span className={clsx('text-xs font-medium', r.disabled ? 'text-gray-400' : r.active ? 'text-green-600 dark:text-green-400' : 'text-gray-400')}>
+                        {r.disabled ? 'Disabled' : r.active ? 'Active' : 'Inactive'}
+                      </span>
+                      {r.source && <span className="text-xs text-gray-400 dark:text-slate-500">({r.source})</span>}
+                      {r.type && <span className="text-xs font-medium text-amber-600 dark:text-amber-400">{r.type}</span>}
+                    </div>
+                  </td>
+                  <td className="px-4 py-2.5 text-gray-400 dark:text-slate-500 text-xs">{r.comment}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }
@@ -270,8 +386,9 @@ function OspfSubTab({ deviceId }: { deviceId: number }) {
   const [areaForm, setAreaForm] = useState({ name: '', area: '0.0.0.0', instance: '' });
   const [error, setError] = useState('');
 
+  const addInstanceRequest = () => dApi.addOspfInstance(deviceId, instanceForm);
   const addInstanceMutation = useMutation({
-    mutationFn: () => dApi.addOspfInstance(deviceId, instanceForm),
+    mutationFn: addInstanceRequest,
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['routing-ospf', deviceId] }); setShowAddInstance(false); setInstanceForm({ name: '', 'router-id': '' }); setError(''); },
     onError: (err: unknown) => setError(errMsg(err)),
   });
@@ -282,8 +399,10 @@ function OspfSubTab({ deviceId }: { deviceId: number }) {
     onError: (err: unknown) => setError(errMsg(err)),
   });
 
+  const addAreaRequest = () => dApi.addOspfArea(deviceId, { name: areaForm.name, 'area-id': areaForm.area, ...(areaForm.instance ? { instance: areaForm.instance } : {}) });
   const addAreaMutation = useMutation({
-    mutationFn: () => dApi.addOspfArea(deviceId, areaForm),
+    // RouterOS names the property area-id (outside review C7).
+    mutationFn: addAreaRequest,
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['routing-ospf', deviceId] }); setShowAddArea(false); setAreaForm({ name: '', area: '0.0.0.0', instance: '' }); setError(''); },
     onError: (err: unknown) => setError(errMsg(err)),
   });
@@ -320,6 +439,7 @@ function OspfSubTab({ deviceId }: { deviceId: number }) {
                   <button onClick={() => addInstanceMutation.mutate()} disabled={!instanceForm.name || addInstanceMutation.isPending} className="btn-primary text-sm flex items-center gap-1.5">
                     {addInstanceMutation.isPending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />} Add
                   </button>
+                  <ReviewChangesButton request={addInstanceRequest} onApply={() => addInstanceMutation.mutate()} applyLabel="Add" disabled={!instanceForm.name || addInstanceMutation.isPending} />
                   <button onClick={() => setShowAddInstance(false)} className="btn-secondary text-sm">Cancel</button>
                 </div>
               </div>
@@ -370,6 +490,7 @@ function OspfSubTab({ deviceId }: { deviceId: number }) {
                   <button onClick={() => addAreaMutation.mutate()} disabled={!areaForm.name || addAreaMutation.isPending} className="btn-primary text-sm flex items-center gap-1.5">
                     {addAreaMutation.isPending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />} Add
                   </button>
+                  <ReviewChangesButton request={addAreaRequest} onApply={() => addAreaMutation.mutate()} applyLabel="Add" disabled={!areaForm.name || addAreaMutation.isPending} />
                   <button onClick={() => setShowAddArea(false)} className="btn-secondary text-sm">Cancel</button>
                 </div>
               </div>
@@ -432,12 +553,14 @@ function BgpSubTab({ deviceId }: { deviceId: number }) {
   });
 
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ name: '', 'remote.address': '', 'remote.as': '', 'local.role': 'ebgp' });
+  const EMPTY_BGP = { name: '', 'remote.address': '', 'remote.as': '', 'local.role': 'ebgp', local_as: '', instance: '' };
+  const [form, setForm] = useState(EMPTY_BGP);
   const [error, setError] = useState('');
 
+  const addRequest = () => dApi.addBgpConnection(deviceId, form);
   const addMutation = useMutation({
-    mutationFn: () => dApi.addBgpConnection(deviceId, form),
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['routing-bgp', deviceId] }); setShowAdd(false); setForm({ name: '', 'remote.address': '', 'remote.as': '', 'local.role': 'ebgp' }); setError(''); },
+    mutationFn: addRequest,
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['routing-bgp', deviceId] }); setShowAdd(false); setForm(EMPTY_BGP); setError(''); },
     onError: (err: unknown) => setError(errMsg(err)),
   });
 
@@ -451,6 +574,10 @@ function BgpSubTab({ deviceId }: { deviceId: number }) {
 
   const connections = (data?.connections as Record<string, string>[]) || [];
   const sessions    = (data?.sessions    as Record<string, string>[]) || [];
+  // RouterOS 7.20+ puts the local AS on an instance: use the device's own, or
+  // create one from the local AS entered here when it has none.
+  const instances   = (data?.instances   as Record<string, string>[]) || [];
+  const oneInstance = instances.length === 1 ? instances[0] : null;
 
   return (
     <div className="space-y-6">
@@ -473,11 +600,33 @@ function BgpSubTab({ deviceId }: { deviceId: number }) {
                       <option value="ibgp">iBGP</option>
                     </select>
                   </div>
+                  {instances.length > 1 ? (
+                    <div><label className="label">Instance</label>
+                      <select className="input" value={form.instance} onChange={e => setForm(f => ({ ...f, instance: e.target.value }))}>
+                        <option value="">Choose…</option>
+                        {instances.map(i => <option key={i['.id'] || i['name']} value={i['name']}>{i['name']}{i['as'] ? ` (AS ${i['as']})` : ''}</option>)}
+                      </select>
+                    </div>
+                  ) : (
+                    <div><label className="label">Local AS</label>
+                      <input className="input font-mono" value={oneInstance ? (oneInstance['as'] || '') : form.local_as} disabled={!!oneInstance}
+                        onChange={e => setForm(f => ({ ...f, local_as: e.target.value }))} placeholder="65001"
+                        title={oneInstance ? `Set by the device's BGP instance ${oneInstance['name']}` : 'Your AS number'} />
+                    </div>
+                  )}
                 </div>
+                <p className="text-xs text-gray-400">
+                  {oneInstance
+                    ? `The connection joins this device's BGP instance ${oneInstance['name']}${oneInstance['as'] ? ` (AS ${oneInstance['as']})` : ''}.`
+                    : instances.length > 1
+                      ? 'Choose the instance the connection belongs to; it carries the local AS.'
+                      : 'With no BGP instance on the device yet, one called default is created with this local AS (RouterOS 7.20 and later need one).'}
+                </p>
                 <div className="flex gap-2">
-                  <button onClick={() => addMutation.mutate()} disabled={!form.name || !form['remote.address'] || addMutation.isPending} className="btn-primary text-sm flex items-center gap-1.5">
+                  <button onClick={() => addMutation.mutate()} disabled={!form.name || !form['remote.address'] || !form['remote.as'] || (instances.length > 1 && !form.instance) || addMutation.isPending} className="btn-primary text-sm flex items-center gap-1.5">
                     {addMutation.isPending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />} Add
                   </button>
+                  <ReviewChangesButton request={addRequest} onApply={() => addMutation.mutate()} applyLabel="Add" disabled={!form.name || !form['remote.address'] || !form['remote.as'] || (instances.length > 1 && !form.instance) || addMutation.isPending} />
                   <button onClick={() => setShowAdd(false)} className="btn-secondary text-sm">Cancel</button>
                 </div>
               </div>
@@ -539,8 +688,9 @@ function RouteFiltersSubTab({ deviceId }: { deviceId: number }) {
   const [form, setForm] = useState({ chain: '', action: 'accept', prefix: '', comment: '' });
   const [error, setError] = useState('');
 
+  const addRequest = () => dApi.addFilterRule(deviceId, { ...form, prefix: form.prefix || undefined });
   const addMutation = useMutation({
-    mutationFn: () => dApi.addFilterRule(deviceId, { ...form, prefix: form.prefix || undefined }),
+    mutationFn: addRequest,
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['routing-filters', deviceId] }); setShowAdd(false); setForm({ chain: '', action: 'accept', prefix: '', comment: '' }); setError(''); },
     onError: (err: unknown) => setError(errMsg(err)),
   });
@@ -581,6 +731,7 @@ function RouteFiltersSubTab({ deviceId }: { deviceId: number }) {
                 <button onClick={() => addMutation.mutate()} disabled={!form.chain || addMutation.isPending} className="btn-primary text-sm flex items-center gap-1.5">
                   {addMutation.isPending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />} Add Rule
                 </button>
+                <ReviewChangesButton request={addRequest} onApply={() => addMutation.mutate()} applyLabel="Add Rule" disabled={!form.chain || addMutation.isPending} />
                 <button onClick={() => setShowAdd(false)} className="btn-secondary text-sm">Cancel</button>
               </div>
             </div>
@@ -597,7 +748,7 @@ function RouteFiltersSubTab({ deviceId }: { deviceId: number }) {
               <th className="table-header px-4 py-2.5 text-left">#</th>
               <th className="table-header px-4 py-2.5 text-left">Chain</th>
               <th className="table-header px-4 py-2.5 text-left">Action</th>
-              <th className="table-header px-4 py-2.5 text-left">Prefix</th>
+              <th className="table-header px-4 py-2.5 text-left">Prefix / rule</th>
               <th className="table-header px-4 py-2.5 text-left">Comment</th>
               {canWrite && <th className="w-10" />}
             </tr></thead>
@@ -611,7 +762,7 @@ function RouteFiltersSubTab({ deviceId }: { deviceId: number }) {
                       {r['action'] || '—'}
                     </span>
                   </td>
-                  <td className="px-4 py-2.5 font-mono text-xs text-gray-500 dark:text-slate-400">{r['prefix'] || r['dst-address'] || '—'}</td>
+                  <td className="px-4 py-2.5 font-mono text-xs text-gray-500 dark:text-slate-400">{r['rule'] || r['prefix'] || r['dst-address'] || '—'}</td>
                   <td className="px-4 py-2.5 text-xs text-gray-400 dark:text-slate-500">{r['comment'] || ''}</td>
                   {canWrite && <td className="px-4 py-2.5">
                     {r['.id'] && <button onClick={() => { if (confirm('Remove filter rule?')) removeMutation.mutate(r['.id']); }} className="p-1 text-gray-400 hover:text-red-500"><Trash2 className="w-3.5 h-3.5" /></button>}
@@ -640,8 +791,9 @@ function TablesSubTab({ deviceId }: { deviceId: number }) {
   const [form, setForm] = useState({ name: '', fib: false });
   const [error, setError] = useState('');
 
+  const addRequest = () => dApi.addRoutingTable(deviceId, form);
   const addMutation = useMutation({
-    mutationFn: () => dApi.addRoutingTable(deviceId, form),
+    mutationFn: addRequest,
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['routing-tables', deviceId] }); setShowAdd(false); setForm({ name: '', fib: false }); setError(''); },
     onError: (err: unknown) => setError(errMsg(err)),
   });
@@ -674,6 +826,7 @@ function TablesSubTab({ deviceId }: { deviceId: number }) {
                 <button onClick={() => addMutation.mutate()} disabled={!form.name || addMutation.isPending} className="btn-primary text-sm flex items-center gap-1.5">
                   {addMutation.isPending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />} Add Table
                 </button>
+                <ReviewChangesButton request={addRequest} onApply={() => addMutation.mutate()} applyLabel="Add Table" disabled={!form.name || addMutation.isPending} />
                 <button onClick={() => setShowAdd(false)} className="btn-secondary text-sm">Cancel</button>
               </div>
             </div>
@@ -711,7 +864,7 @@ function TablesSubTab({ deviceId }: { deviceId: number }) {
 
 // ─── Main RoutingTab with sub-tabs ────────────────────────────────────────────
 export default function RoutingTab({ deviceId, deviceName }: { deviceId: number; deviceName?: string }) {
-  const [activeSubTab, setActiveSubTab] = useState<SubTab>('Routes');
+  const [activeSubTab, setActiveSubTab] = useState<SubTab>('IPv4 Routes');
 
   return (
     <div className="space-y-4">
@@ -734,7 +887,8 @@ export default function RoutingTab({ deviceId, deviceName }: { deviceId: number;
       </div>
 
       {/* Sub-tab content */}
-      {activeSubTab === 'Routes'        && <RoutesSubTab deviceId={deviceId} deviceName={deviceName} />}
+      {activeSubTab === 'IPv4 Routes'   && <RoutesSubTab deviceId={deviceId} deviceName={deviceName} />}
+      {activeSubTab === 'IPv6 Routes'   && <Ipv6RoutesSubTab deviceId={deviceId} />}
       {activeSubTab === 'OSPF'          && <OspfSubTab deviceId={deviceId} />}
       {activeSubTab === 'BGP'           && <BgpSubTab deviceId={deviceId} />}
       {activeSubTab === 'Route Filters' && <RouteFiltersSubTab deviceId={deviceId} />}

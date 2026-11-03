@@ -4,6 +4,7 @@
 // aggregates into 60-second windows written to InfluxDB (time series) and
 // Postgres (daily per-client rollups).
 
+import { managerAddressesFor } from '../../utils/managerAddresses';
 import * as dgram from 'dgram';
 import { Point } from '@influxdata/influxdb-client';
 import { query } from '../../config/database';
@@ -12,6 +13,11 @@ import { decodePacket, pruneTemplateCache, TemplateCache } from './decoder';
 import { classifyApp, APP_LAN } from './appCategories';
 import { FlowAggregator, CLIENT_UNKNOWN, Direction } from './FlowAggregator';
 import { PacketRateLimiter } from './rateLimiter';
+import {
+  AMBIGUOUS, attributionDestination, buildAttributionMaps, isLocalAddress, matchClient,
+  type AttributionMaps, type ClientRow, type DeviceRow, type ExporterInfo,
+  canonicalIp,
+} from './attribution';
 
 const FLUSH_INTERVAL_MS = 60_000;
 const MAP_REFRESH_MS = 60_000;
@@ -33,6 +39,19 @@ const OVERFLOW_EXPORTER_ID = -999_999;
 // enough that a flood can't monopolise the event loop.
 const RATE_LIMIT = { windowMs: 1_000, maxPerSource: 2_000, maxSources: 1_000 };
 
+// Sources whose packets were refused, kept so the NetFlow page can say why
+// traffic is missing instead of it vanishing silently.
+const MAX_REJECTED_SOURCES = 50;
+
+export type RejectReason = 'unknown_exporter' | 'public_address';
+
+export interface RejectedSource {
+  address: string;
+  reason: RejectReason;
+  packets: number;
+  lastSeen: string;
+}
+
 export interface ExporterStats {
   deviceId: number;
   deviceName: string;
@@ -52,6 +71,8 @@ export interface CollectorStats {
   packetsDropped: number;
   templatesCached: number;
   exporters: ExporterStats[];
+  acceptUnknown: boolean;
+  rejectedSources: RejectedSource[];
 }
 
 interface NetflowSettings {
@@ -61,36 +82,14 @@ interface NetflowSettings {
   acceptUnknown: boolean;
 }
 
-function isPrivateIPv4(ip: string): boolean {
-  const parts = ip.split('.');
-  if (parts.length !== 4) return false;
-  const a = Number(parts[0]);
-  const b = Number(parts[1]);
-  if (a === 10) return true;
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  if (a === 192 && b === 168) return true;
-  if (a === 169 && b === 254) return true; // link-local
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-  return false;
-}
-
-function isLocalAddress(ip: string): boolean {
-  if (ip.includes(':')) {
-    const lower = ip.toLowerCase();
-    return lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe8');
-  }
-  return isPrivateIPv4(ip);
-}
-
 export class NetflowCollector {
   private socket: dgram.Socket | null = null;
   private templates: TemplateCache = new Map();
   private aggregator = new FlowAggregator();
 
-  private exporterByIp = new Map<string, { deviceId: number; deviceName: string }>();
-  private clientMacByIp = new Map<string, string>();
+  private maps: AttributionMaps = buildAttributionMaps([], []);
 
-  private settings: NetflowSettings = { enabled: false, port: 2055, topN: 50, acceptUnknown: true };
+  private settings: NetflowSettings = { enabled: false, port: 2055, topN: 50, acceptUnknown: false };
   private listening = false;
 
   // Pseudo-exporter ids for sources that don't match a managed device (e.g.
@@ -100,6 +99,9 @@ export class NetflowCollector {
   // identity, so this only coarsens per-exporter stats).
   private unknownExporterIds = new Map<string, number>();
   private nextPseudoId = -1;
+  private rejected = new Map<string, RejectedSource>();
+  /** Daily rollups that failed to write, retried at the next flush (J5). */
+  private pendingRollups: Array<{ day: string; mac: string; siteId: number; upload: number; download: number; apps: Record<string, number> }> = [];
 
   private rateLimiter = new PacketRateLimiter(RATE_LIMIT);
   private packetsDropped = 0;
@@ -144,9 +146,12 @@ export class NetflowCollector {
   // interval and directly by the settings route when netflow_* keys change.
   async reconcile(): Promise<void> {
     const next = await this.readSettings();
+    // Also when it should be listening and isn't: a port busy at start, or a
+    // socket error, used to stop the collector until a restart (J5).
     const needsRebind =
       next.enabled !== this.settings.enabled ||
-      (next.enabled && next.port !== this.settings.port);
+      (next.enabled && next.port !== this.settings.port) ||
+      (next.enabled && !this.socket);
     this.settings = next;
     if (!needsRebind) return;
 
@@ -169,6 +174,8 @@ export class NetflowCollector {
       packetsDropped: this.packetsDropped,
       templatesCached: this.templates.size,
       exporters: Array.from(this.exporterStats.values()),
+      acceptUnknown: this.settings.acceptUnknown,
+      rejectedSources: Array.from(this.rejected.values()),
     };
   }
 
@@ -188,23 +195,36 @@ export class NetflowCollector {
         // externally reachable port pushed to devices as the export target.
         port: Number(process.env.NETFLOW_BIND_PORT) || Number(map['netflow_collector_port']) || 2055,
         topN: Number(map['netflow_topn_clients']) || 50,
-        acceptUnknown: map['netflow_accept_unknown'] !== false,
+        // Off unless turned on (outside review P2-23). Installs from before
+        // keep the stored value they had.
+        acceptUnknown: map['netflow_accept_unknown'] === true,
       };
     } catch {
       return this.settings;
     }
   }
 
-  private bindSocket(port: number): void {
-    const socket = dgram.createSocket('udp4');
+  /**
+   * IPv4 and IPv6 on one socket where the kernel has IPv6 (#233); IPv4 only
+   * where it doesn't, so a host booted without IPv6 still collects.
+   */
+  private bindSocket(port: number, type: 'udp6' | 'udp4' = 'udp6'): void {
+    const socket = dgram.createSocket({ type, ipv6Only: false });
     socket.on('message', (msg, rinfo) => this.onMessage(msg, rinfo));
-    socket.on('error', (err) => {
-      console.error(`[NetFlow] Socket error: ${err.message}`);
+    socket.on('error', (err: NodeJS.ErrnoException) => {
+      const v6Unavailable = type === 'udp6' && !this.listening
+        && ['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EINVAL', 'EPROTONOSUPPORT'].includes(err.code ?? '');
       this.closeSocket();
+      if (v6Unavailable) {
+        console.log(`[NetFlow] IPv6 isn't available (${err.code}); listening on IPv4 only`);
+        this.bindSocket(port, 'udp4');
+        return;
+      }
+      console.error(`[NetFlow] Socket error: ${err.message}`);
     });
     socket.bind(port, () => {
       this.listening = true;
-      console.log(`[NetFlow] Collector listening on udp/${port}`);
+      console.log(`[NetFlow] Collector listening on udp/${port} (${type === 'udp6' ? 'IPv4 and IPv6' : 'IPv4'})`);
     });
     this.socket = socket;
   }
@@ -224,6 +244,9 @@ export class NetflowCollector {
 
   private onMessage(msg: Buffer, rinfo: dgram.RemoteInfo): void {
     this.packetsReceived++;
+    // ::ffff:a.b.c.d from the dual-stack socket becomes a.b.c.d, and IPv6 is
+    // written one way, so it matches device addresses (#233).
+    const source = canonicalIp(rinfo.address);
 
     // Cheap guards before any parsing work: undersized datagrams can't carry a
     // usable header, and a single source must not be able to monopolise the
@@ -232,54 +255,89 @@ export class NetflowCollector {
       this.packetsDropped++;
       return;
     }
-    if (this.rateLimiter.shouldDrop(rinfo.address)) {
+    if (this.rateLimiter.shouldDrop(source)) {
       this.packetsDropped++;
       return;
     }
 
-    let exporter = this.exporterByIp.get(rinfo.address);
-    if (!exporter) {
-      // Source doesn't match any managed device — common when the exporting
-      // routers sit behind NAT relative to the collector, so every packet
-      // arrives from the NAT gateway's address. Client attribution doesn't
-      // depend on exporter identity, so (unless disabled) process these as a
-      // per-source pseudo-exporter instead of dropping real traffic data.
-      this.packetsFromUnknownExporter++;
-      if (!this.settings.acceptUnknown) return;
-      let pseudoId = this.unknownExporterIds.get(rinfo.address);
-      if (pseudoId === undefined) {
-        if (this.unknownExporterIds.size >= MAX_UNKNOWN_EXPORTERS) {
-          // Too many distinct unidentified sources to track individually; fold
-          // them into one bucket so the maps stay bounded.
-          exporter = { deviceId: OVERFLOW_EXPORTER_ID, deviceName: 'Unidentified (many sources)' };
-        } else {
-          pseudoId = this.nextPseudoId--;
-          this.unknownExporterIds.set(rinfo.address, pseudoId);
-          console.log(`[NetFlow] Accepting flows from unidentified exporter ${rinfo.address} (NAT in path?)`);
-        }
+    // Who sent this? A managed device's address identifies the exporter and so
+    // the site its clients are matched in. An address shared by devices in two
+    // sites is a managed device, but not one site's, so its clients are matched
+    // as for an unidentified exporter.
+    const found = this.maps.exporterByIp.get(source);
+    let identified: ExporterInfo | null = null;
+    let statsId: number;
+    let statsName: string;
+    if (found && found !== AMBIGUOUS) {
+      identified = found;
+      statsId = found.deviceId;
+      statsName = found.deviceName;
+    } else {
+      if (!found) {
+        // Doesn't match any managed device. Usually NAT between the routers
+        // and the collector, so every packet arrives from the NAT gateway. But
+        // NetFlow is unauthenticated, so anyone who can reach the port could
+        // send forged flows naming real clients (outside review P2-23). These
+        // are taken only when the admin has turned that on, and never from a
+        // public address: a NAT gateway in front of the collector is local.
+        this.packetsFromUnknownExporter++;
+        if (!this.settings.acceptUnknown) { this.reject(source, 'unknown_exporter'); return; }
+        if (!isLocalAddress(source)) { this.reject(source, 'public_address'); return; }
       }
-      if (!exporter) {
-        exporter = { deviceId: pseudoId as number, deviceName: `Unidentified (${rinfo.address})` };
-      }
+      const pseudo = this.pseudoExporter(source, found === AMBIGUOUS);
+      statsId = pseudo.id;
+      statsName = pseudo.name;
     }
 
-    const result = decodePacket(msg, rinfo.address, this.templates);
+    const result = decodePacket(msg, source, this.templates);
     this.flowsDecoded += result.flows.length;
     this.recordsWithoutTemplate += result.recordsWithoutTemplate;
 
-    let stats = this.exporterStats.get(exporter.deviceId);
+    let stats = this.exporterStats.get(statsId);
     if (!stats) {
-      stats = { deviceId: exporter.deviceId, deviceName: exporter.deviceName, packets: 0, flows: 0, lastSeen: null };
-      this.exporterStats.set(exporter.deviceId, stats);
+      stats = { deviceId: statsId, deviceName: statsName, packets: 0, flows: 0, lastSeen: null };
+      this.exporterStats.set(statsId, stats);
     }
     stats.packets++;
     stats.flows += result.flows.length;
-    stats.deviceName = exporter.deviceName;
+    stats.deviceName = statsName;
     if (result.flows.length > 0) stats.lastSeen = new Date().toISOString();
 
+    // The manager's own traffic with this exporter (polling, backups, an SSTP
+    // or VPN path to it) isn't a client's (#345).
+    const manager = identified ? managerAddressesFor(statsId) : null;
     for (const flow of result.flows) {
-      this.attribute(exporter.deviceId, flow.srcAddr, flow.dstAddr, flow.srcPort, flow.dstPort, flow.protocol, flow.bytes, flow.packets);
+      const dstAddr = attributionDestination(flow);
+      if (manager && (manager.has(flow.srcAddr) || manager.has(dstAddr))) continue;
+      this.attribute(statsId, identified, flow.srcAddr, dstAddr, flow.srcPort, flow.dstPort, flow.protocol, flow.bytes, flow.packets);
     }
+  }
+
+  private reject(address: string, reason: RejectReason): void {
+    const now = new Date().toISOString();
+    const seen = this.rejected.get(address);
+    if (seen) { seen.packets++; seen.lastSeen = now; seen.reason = reason; return; }
+    if (this.rejected.size >= MAX_REJECTED_SOURCES) return;
+    this.rejected.set(address, { address, reason, packets: 1, lastSeen: now });
+    console.log(`[NetFlow] Refusing flows from ${address}: ${reason === 'public_address'
+      ? 'not a managed device, and a public address'
+      : 'not a managed device (turn on accepting unidentified exporters if NAT is in the path)'}`);
+  }
+
+  // Pseudo-exporter ids for sources that don't identify one managed device.
+  private pseudoExporter(address: string, shared: boolean): { id: number; name: string } {
+    let id = this.unknownExporterIds.get(address);
+    if (id === undefined) {
+      if (this.unknownExporterIds.size >= MAX_UNKNOWN_EXPORTERS) {
+        // Too many distinct sources to track individually; fold them into one
+        // bucket so the maps stay bounded.
+        return { id: OVERFLOW_EXPORTER_ID, name: 'Unidentified (many sources)' };
+      }
+      id = this.nextPseudoId--;
+      this.unknownExporterIds.set(address, id);
+      if (!shared) console.log(`[NetFlow] Accepting flows from unidentified exporter ${address} (NAT in path?)`);
+    }
+    return { id, name: shared ? `Shared address (${address})` : `Unidentified (${address})` };
   }
 
   // Attribution rules:
@@ -291,6 +349,7 @@ export class NetflowCollector {
   //    source is the router's WAN address) → dropped
   private attribute(
     exporterId: number,
+    exporter: ExporterInfo | null,
     srcAddr: string,
     dstAddr: string,
     srcPort: number,
@@ -299,73 +358,62 @@ export class NetflowCollector {
     bytes: number,
     packets: number
   ): void {
-    const srcMac = this.clientMacByIp.get(srcAddr);
-    const dstMac = this.clientMacByIp.get(dstAddr);
+    // Clients are matched in the exporter's site (outside review J4).
+    const src = matchClient(this.maps, exporter, srcAddr);
+    const dst = matchClient(this.maps, exporter, dstAddr);
+    const srcMac = src.mac;
+    const dstMac = dst.mac;
     const srcLocal = srcMac !== undefined || isLocalAddress(srcAddr);
     const dstLocal = dstMac !== undefined || isLocalAddress(dstAddr);
 
-    const add = (clientKey: string, direction: Direction, app: string) => {
-      this.aggregator.add({ exporterId, clientKey, direction, app, bytes, packets });
+    const add = (side: { mac?: string; siteId: number | null }, direction: Direction, app: string) => {
+      this.aggregator.add({ exporterId, siteId: side.siteId, clientKey: side.mac || CLIENT_UNKNOWN, direction, app, bytes, packets });
       this.flowsAttributed++;
     };
 
     if (srcMac && dstMac) {
       // Client-to-client on the local network
-      add(srcMac, 'upload', APP_LAN);
-      add(dstMac, 'download', APP_LAN);
+      add(src, 'upload', APP_LAN);
+      add(dst, 'download', APP_LAN);
       return;
     }
     if (srcLocal && dstLocal) {
       // Local flow we can't fully attribute (e.g. printer ↔ unknown host)
-      add(srcMac || dstMac || CLIENT_UNKNOWN, srcMac ? 'upload' : 'download', APP_LAN);
+      if (srcMac) add(src, 'upload', APP_LAN);
+      else add(dst, 'download', APP_LAN);
       return;
     }
     if (srcLocal && !dstLocal) {
-      add(srcMac || CLIENT_UNKNOWN, 'upload', classifyApp(protocol, srcPort, dstPort));
+      add(src, 'upload', classifyApp(protocol, srcPort, dstPort));
       return;
     }
     if (!srcLocal && dstLocal) {
-      add(dstMac || CLIENT_UNKNOWN, 'download', classifyApp(protocol, dstPort, srcPort));
+      add(dst, 'download', classifyApp(protocol, dstPort, srcPort));
       return;
     }
     // Neither endpoint local — transit or post-NAT duplicate; drop.
   }
 
   private async refreshMaps(): Promise<void> {
-    // Exporters: management IP + every cached /ip/address (CIDR stripped)
-    const devices = await query<{ id: number; name: string; ip_address: string; ip_addresses_jsonb: { address: string }[] | null }>(
-      `SELECT id, name, ip_address, ip_addresses_jsonb FROM devices`
+    // Exporters: management IP + every cached /ip/address, with their site.
+    const devices = await query<DeviceRow>(
+      `SELECT id, name, site_id, ip_address, ip_addresses_jsonb FROM devices`
     );
-    const exporters = new Map<string, { deviceId: number; deviceName: string }>();
-    for (const d of devices) {
-      exporters.set(d.ip_address, { deviceId: d.id, deviceName: d.name });
-      for (const entry of d.ip_addresses_jsonb || []) {
-        const ip = (entry.address || '').split('/')[0];
-        if (ip && !exporters.has(ip)) exporters.set(ip, { deviceId: d.id, deviceName: d.name });
-      }
-    }
-    this.exporterByIp = exporters;
-
-    // Clients: newest MAC per IP wins (DHCP reuse)
-    const clients = await query<{ mac_address: string; ip_address: string }>(
-      `SELECT DISTINCT ON (ip_address) mac_address, ip_address
-       FROM clients
-       WHERE ip_address IS NOT NULL AND ip_address != ''
-       ORDER BY ip_address, last_seen DESC NULLS LAST`
+    // Clients, with the site of the device that saw them; newest holder of an
+    // address in a site first (DHCP reuse).
+    const clients = await query<ClientRow>(
+      `SELECT DISTINCT ON (d.site_id, c.ip_address) d.site_id, c.ip_address, c.mac_address
+         FROM clients c
+         JOIN devices d ON d.id = c.device_id
+        WHERE c.ip_address IS NOT NULL AND c.ip_address != ''
+        ORDER BY d.site_id, c.ip_address, c.last_seen DESC NULLS LAST`
     );
-    const clientMap = new Map<string, string>();
-    for (const c of clients) {
-      clientMap.set(c.ip_address, c.mac_address.toLowerCase());
-    }
-    // A device's own addresses are not client traffic endpoints we can bill
-    // to a MAC — exporter match takes priority over a stale client row.
-    for (const ip of exporters.keys()) clientMap.delete(ip);
-    this.clientMacByIp = clientMap;
+    this.maps = buildAttributionMaps(devices, clients);
   }
 
   private async flush(): Promise<void> {
     const rows = this.aggregator.drain(this.settings.topN);
-    if (rows.length === 0) return;
+    if (rows.length === 0 && this.pendingRollups.length === 0) return;
 
     const writeApi = getWriteApi();
     const now = new Date();
@@ -373,6 +421,7 @@ export class NetflowCollector {
       writeApi.writePoint(
         new Point('client_traffic')
           .tag('mac', row.clientKey)
+          .tag('site_id', row.siteId === null ? '' : String(row.siteId))
           .tag('direction', row.direction)
           .tag('app', row.app)
           .intField('bytes', row.bytes)
@@ -383,41 +432,59 @@ export class NetflowCollector {
     await writeApi.flush().catch((e) => console.error('[NetFlow] Influx write error:', e));
 
     // Daily rollups: totals per mac + per-app byte breakdown
-    const perClient = new Map<string, { upload: number; download: number; apps: Map<string, number> }>();
+    // Kept per site: the same MAC at two sites is two clients (J4).
+    const perClient = new Map<string, { mac: string; siteId: number; upload: number; download: number; apps: Map<string, number> }>();
     for (const row of rows) {
-      let entry = perClient.get(row.clientKey);
+      const key = `${row.siteId ?? 0}|${row.clientKey}`;
+      let entry = perClient.get(key);
       if (!entry) {
-        entry = { upload: 0, download: 0, apps: new Map() };
-        perClient.set(row.clientKey, entry);
+        entry = { mac: row.clientKey, siteId: row.siteId ?? 0, upload: 0, download: 0, apps: new Map() };
+        perClient.set(key, entry);
       }
       if (row.direction === 'upload') entry.upload += row.bytes;
       else entry.download += row.bytes;
       entry.apps.set(row.app, (entry.apps.get(row.app) || 0) + row.bytes);
     }
 
-    for (const [mac, entry] of perClient) {
+    // The day is fixed here, so a rollup retried after midnight still lands
+    // on the day its traffic happened.
+    const today = (await query<{ d: string }>(`SELECT CURRENT_DATE::text AS d`).catch(() => []))[0]?.d
+      ?? new Date().toISOString().slice(0, 10);
+    const batch = [
+      ...this.pendingRollups.splice(0),
+      ...[...perClient.values()].map((e) => ({
+        day: today, mac: e.mac, siteId: e.siteId, upload: e.upload, download: e.download, apps: Object.fromEntries(e.apps),
+      })),
+    ];
+    for (const entry of batch) {
       try {
-        await query(
-          `INSERT INTO client_traffic_daily (mac_address, day, upload_bytes, download_bytes, app_breakdown)
-           VALUES ($1, CURRENT_DATE, $2, $3, $4::jsonb)
-           ON CONFLICT (mac_address, day) DO UPDATE SET
-             upload_bytes   = client_traffic_daily.upload_bytes + EXCLUDED.upload_bytes,
-             download_bytes = client_traffic_daily.download_bytes + EXCLUDED.download_bytes,
-             app_breakdown  = (
-               SELECT COALESCE(jsonb_object_agg(k, v), '{}'::jsonb)
-               FROM (
-                 SELECT COALESCE(a.key, b.key) AS k,
-                        to_jsonb(COALESCE((a.value)::bigint, 0) + COALESCE((b.value)::bigint, 0)) AS v
-                 FROM jsonb_each_text(client_traffic_daily.app_breakdown) a
-                 FULL OUTER JOIN jsonb_each_text(EXCLUDED.app_breakdown) b ON a.key = b.key
-               ) merged
-             )`,
-          [mac, entry.upload, entry.download, JSON.stringify(Object.fromEntries(entry.apps))]
-        );
+        await this.writeRollup(entry);
       } catch (e) {
-        console.error('[NetFlow] Daily rollup error:', e);
+        // Kept for the next flush rather than lost (J5), within a bound.
+        if (this.pendingRollups.length < 20_000) this.pendingRollups.push(entry);
+        console.error('[NetFlow] Daily rollup error (will retry):', (e as Error).message);
       }
     }
+  }
+
+  private async writeRollup(entry: { day: string; mac: string; siteId: number; upload: number; download: number; apps: Record<string, number> }): Promise<void> {
+    await query(
+      `INSERT INTO client_traffic_daily (mac_address, day, site_id, upload_bytes, download_bytes, app_breakdown)
+       VALUES ($1, $6::date, $5, $2, $3, $4::jsonb)
+       ON CONFLICT (mac_address, day, site_id) DO UPDATE SET
+         upload_bytes   = client_traffic_daily.upload_bytes + EXCLUDED.upload_bytes,
+         download_bytes = client_traffic_daily.download_bytes + EXCLUDED.download_bytes,
+         app_breakdown  = (
+           SELECT COALESCE(jsonb_object_agg(k, v), '{}'::jsonb)
+           FROM (
+             SELECT COALESCE(a.key, b.key) AS k,
+                    to_jsonb(COALESCE((a.value)::bigint, 0) + COALESCE((b.value)::bigint, 0)) AS v
+             FROM jsonb_each_text(client_traffic_daily.app_breakdown) a
+             FULL OUTER JOIN jsonb_each_text(EXCLUDED.app_breakdown) b ON a.key = b.key
+           ) merged
+         )`,
+      [entry.mac, entry.upload, entry.download, JSON.stringify(entry.apps), entry.siteId, entry.day]
+    );
   }
 }
 

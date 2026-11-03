@@ -20,13 +20,29 @@ curl -sk https://manager.example.com/api/devices \
 ```
 
 A token with `read` scope is rejected on any mutating request, so a monitoring integration
-cannot change your network even if the token leaks.
+cannot change your network even if the token leaks. It is also refused on requests that make
+a device do something, such as a firmware check or a wireless scan, and it gets device secrets
+masked (see below).
+
+### What read-only access can see
+
+Viewers and `read` tokens see configuration, but not the secrets inside it. Wi-Fi keys,
+WireGuard private keys, SNMP communities and hotspot user passwords come back as
+`••••••••`, as do Slack and Discord webhook URLs for everyone. Operators and admins get the
+real values, because the edit forms need them.
 
 ## Session authentication
 
 The UI authenticates with a JWT obtained from `/api/auth/login`, optionally followed by
 `/api/auth/totp/verify` when two-factor is enabled. Tokens are bearer credentials and are
-sent in the same `Authorization` header.
+sent in the same `Authorization` header. The short-lived token `/login` returns while waiting
+for the two-factor code only works for `/api/auth/totp/verify`; it isn't a session. An account
+gets 5 wrong codes per 15 minutes, from any address, and each code signs in once; before 1.0.1
+only the per-address limit applied.
+
+Setting up two-factor again (`/api/auth/totp/setup`) doesn't touch the authenticator in use:
+the new secret replaces it only when `/api/auth/totp/confirm` accepts a code from it. Before
+0.24.50 starting setup and abandoning it locked the user out.
 
 For scripting, prefer an API token — it is scoped, revocable, and unaffected by password
 or 2FA changes.
@@ -39,10 +55,41 @@ or 2FA changes.
 | `POST /api/devices/:id/sync` | Force an immediate full collection for one device |
 | `GET /api/devices/:id/management-path` | How the manager reaches a device, with the reason for each hop |
 | `POST /api/devices/:id/preflight` | Analyse a change **without applying it** |
+| `POST /api/devices/:id/change-guard/check` | Can this device arm auto-revert right now? (`ready`, `reason`) |
 | `POST /api/devices/:id/change-guard/probe` | Report which safety mechanisms the device supports |
 | `GET /api/devices/:id/config-health` | Latest standing-audit findings |
+| `POST /api/devices/:id/check-api` | For a device added over SSH only: does the API answer now? If so it becomes an ordinary device (`api: true`); otherwise `reason` says why |
+| `GET /api/devices/:id/l3hw` | L3 hardware offloading state, routed VLANs and chip counters (`supported: false` on devices without a capable chip) |
+| `PUT /api/devices/:id/l3hw` | Turn offloading on or off (`{"enabled": true}`) under Change Guard; returns 409 with `needs_acknowledgement` when forward or NAT rules would be bypassed, so resend with `"acknowledge_firewall": true` |
 | `GET /api/topology` | Graph of devices, links, external nodes, and distrusted identifiers |
 | `GET /api/operations/insights` | The dashboard's "things to handle" feed |
+| `GET /api/sites` | Sites with device counts (see [Sites](sites.md)) |
+| `GET /api/metrics/resources/latest` | Newest CPU and memory point per device: `{"devices": {"<deviceId>": {"cpu_load", "memory_used", "memory_total", "time"}}}`. `cpu_load` is a percentage, memory is in bytes, `time` is ISO 8601. Devices with no point in the last 15 minutes are omitted. Returns `503` if the metrics database cannot be read. Read-only; honours site scoping |
+| `GET /api/metrics/interfaces/latest` | Newest byte counters per device and interface: `{"devices": {"<deviceId>": {"<interface>": {"rx_bytes", "tx_bytes", "time"}}}}`. See [Interface counters](#interface-counters). Returns `503` if the metrics database cannot be read. Read-only; honours site scoping |
+
+### Interface counters
+
+`rx_bytes` and `tx_bytes` from `/api/metrics/interfaces/latest` are the router's **cumulative counters** (`rx-byte` / `tx-byte` from `/interface/print stats`), not per-interval deltas. They only grow, and reset to zero when the device reboots or the interface is recreated. Each value is the newest sample in the last 15 minutes, and `time` is when that sample was collected.
+
+To get a rate, poll the endpoint, keep the previous `rx_bytes` and `time` for each interface, and compute `(rx_now - rx_prev) / seconds_between_times`. Take the interval from the two `time` values, not from when you polled, and if the counter went down treat it as a reset and discard that interval. Multiply by 8 for bits per second.
+
+### Scoping a request to one site
+
+Collection endpoints accept an `X-Site-Id` header (or `?site_id=`) that limits the
+response to devices in that site:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "X-Site-Id: 2" \
+     https://mtm.example.com/api/devices
+```
+
+**Omitting it means unscoped**, returning the whole fleet exactly as before sites
+existed — existing scripts and tokens need no change. Per-device endpoints
+(`/api/devices/:id/...`) are already scoped by the device itself and ignore the header.
+
+One thing to know if you create devices via the API: a device joins the site the
+request was scoped to, falling back to the default site. A device belonging to no site
+is invisible whenever a site is selected, so this is set rather than left null.
 
 `preflight` is the useful one for automation: it returns the same verdict the UI shows,
 so a pipeline can refuse its own change before touching the device. See
@@ -66,9 +113,74 @@ curl -sk -X PUT https://manager.example.com/api/devices/8/ports/ether1/vlan \
   -d '{"pvid":99,"tagged_vlans":[],"untagged_vlans":[99],"confirm_lockout":true}'
 ```
 
-A successful guarded change returns a `guard` block describing what happened —
-`confirmed`, `auto_reverting`, or an `unprotected_reason` when the safety net could not be
-armed. Check it rather than relying on the HTTP status alone.
+A confirmed override requires auto-revert. If the device can't arm it, the request fails
+with **422** and `code: "guard_required"`, and nothing is applied. The same applies when
+the prediction flagged a warning or couldn't read the device.
+
+For a DELETE, which has no body, send `?confirm_lockout=true` instead.
+
+Writes to one device run one at a time. While another change to the same device is being
+applied or verified, a write returns **409** with `code: "device_busy"`; retry after a few
+seconds. It is told apart from a lockout by `code`, and a lockout always carries
+`lockout: true`.
+
+`POST /api/devices/:id/routing` takes `dst_address`, `gateway`, optional `distance`,
+`comment` and `routing_table`. `routing_table` must be a table that exists on the device
+(`/routing/table`); omit it for the `main` table. `GET /api/devices/:id/routing` rows
+include `routing-table`, `vrf-interface` and `type`.
+
+Firewall, NAT, address-list, routing and WireGuard writes return a short `message` and the
+`guard` block rather than the updated table; read the table again with the matching GET.
+
+A successful guarded change returns a `guard` block describing what happened:
+`confirmed`, `auto_reverting`, an `unprotected_reason` when a routine change ran without
+the safety net, or `revert_may_fire_at` when the change was kept but its revert couldn't be
+confirmed removed. Check it rather than relying on the HTTP status alone.
+
+Restores (`POST /api/backups/:id/restore`, and Config History rollback) return a `status`
+of `applied`, `reverting`, `nothing_applied` or `partial`, with a `message`. The last two
+come with HTTP 422, plus `failedLine` and `error` saying where RouterOS stopped. See
+[Backups → Restoring](backups.md#restoring).
+
+## Previewing a change
+
+Send an edit request with the header `X-Preview-Changes: 1` to see what it would do without
+applying it. This is what the [Review changes](change-guard.md#reviewing-a-change-before-applying-it)
+button uses. The request is validated and run against the live device as usual, but no
+RouterOS write is sent and nothing is saved. The reply is:
+
+```json
+{
+  "preview": {
+    "steps": [
+      {
+        "action": "set",
+        "path": "/ip/dns",
+        "host": "192.168.0.51",
+        "params": { "servers": "1.1.1.1,9.9.9.9" },
+        "target": { "servers": "172.24.1.15,172.24.1.16", "allow-remote-requests": "false" },
+        "changes": [{ "field": "servers", "from": "172.24.1.15,172.24.1.16", "to": "1.1.1.1,9.9.9.9" }],
+        "unchanged": [],
+        "cli": "/ip dns set servers=1.1.1.1,9.9.9.9"
+      }
+    ],
+    "verdict": null
+  }
+}
+```
+
+`verdict` carries Change Guard's lockout prediction for the changes it analyses, including a
+`critical` one, which a preview reports rather than refusing. Secrets come back as
+`(hidden)`. An invalid request returns its usual error. Requests that can't be previewed,
+because they act rather than configure (reboot, flush, tools) or don't go through the
+RouterOS API, return 400 with `code: "preview_unsupported"`.
+
+```bash
+curl -sk -X PUT 'https://manager.example.com/api/network-services/dns?deviceId=8' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'X-Preview-Changes: 1' \
+  -d '{"servers":["1.1.1.1","9.9.9.9"]}'
+```
 
 ## Webhooks
 

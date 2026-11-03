@@ -3,11 +3,12 @@ import { Link } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   FileText, RefreshCw, AlertTriangle, Plus, Pencil, Trash2, X, Save,
-  CheckCircle, XCircle,
+  CheckCircle, XCircle, Power,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { networkServicesApi, devicesApi } from '../services/api';
 import { useCanWrite } from '../hooks/useCanWrite';
+import DevicePicker from '../components/common/DevicePicker';
 
 type NS = Record<string, string>;
 
@@ -34,6 +35,16 @@ const SYSLOG_SEVERITIES = [
 ];
 
 const ACTION_TYPES = ['remote', 'memory', 'disk', 'echo'];
+
+/**
+ * BSD-style syslog, in either schema: older RouterOS has bsd-syslog=yes;
+ * current RouterOS 7 has remote-log-format=syslog with
+ * syslog-time-format=bsd-syslog (the backend translates on write).
+ */
+function isBsdSyslog(a: Record<string, string>): boolean {
+  if ('remote-log-format' in a) return a['syslog-time-format'] === 'bsd-syslog';
+  return a['bsd-syslog'] === 'yes' || a['bsd-syslog'] === 'true';
+}
 
 const COMMON_TOPICS = 'account, caps, bridge, ddns, dhcp, dns, error, firewall, hotspot, info, interface, ipsec, ntp, ospf, ppp, radius, rip, route, script, snmp, system, warning, wireless';
 
@@ -125,13 +136,15 @@ function ActionForm({ existing, allDevices, targetName, onSave, onClose, isPendi
   const isBuiltin = existing ? BUILTIN_ACTION_NAMES.includes(existing['name'] ?? '') : false;
 
   const [name, setName]         = useState(existing?.['name'] ?? '');
-  const [type, setType]         = useState(existing?.['type'] ?? 'remote');
+  // RouterOS calls the action's kind `target`, not `type` (outside review C7):
+  // sending `type` failed every new action with "bad parameter type".
+  const [type, setType]         = useState(existing?.['target'] ?? 'remote');
   const [remote, setRemote]     = useState(existing?.['remote'] ?? '');
   const [port, setPort]         = useState(existing?.['remote-port'] ?? '514');
   const [srcAddr, setSrcAddr]   = useState(existing?.['src-address'] ?? '');
   const [facility, setFacility] = useState(existing?.['syslog-facility'] ?? 'daemon');
   const [severity, setSeverity] = useState(existing?.['syslog-severity'] ?? 'auto');
-  const [bsd, setBsd]           = useState((existing?.['bsd-syslog'] ?? 'no') === 'yes');
+  const [bsd, setBsd]           = useState(existing ? isBsdSyslog(existing) : false);
 
   const canSave = name.trim() !== '' && (type !== 'remote' || remote.trim() !== '');
 
@@ -142,8 +155,14 @@ function ActionForm({ existing, allDevices, targetName, onSave, onClose, isPendi
       : allDevices ? 'Add Logging Action — All Devices' : 'Add Logging Action';
 
   function handleSubmit() {
-    const data: NS = { name: name.trim(), type };
+    // An edit sends name and type only when they change, and never for the
+    // built-in actions, whose name and type RouterOS won't let you set
+    // (outside review C7).
+    const data: NS = {};
+    if (!existing || (!isBuiltin && name.trim() !== existing['name'])) data['name'] = name.trim();
+    if (!existing || (!isBuiltin && type !== existing['target'])) data['target'] = type;
     if (srcAddr.trim()) data['src-address'] = srcAddr.trim();
+    else if (existing) data['src-address'] = '0.0.0.0';   // RouterOS's "none"; it rejects an empty value
     if (type === 'remote') {
       data['remote'] = remote.trim();
       data['remote-port'] = port || '514';
@@ -261,6 +280,7 @@ function RuleForm({ existing, actions, allDevices, targetName, onSave, onClose, 
   function handleSubmit() {
     const data: NS = { topics: topics.trim(), action: action.trim() };
     if (prefix.trim()) data['prefix'] = prefix.trim();
+    else if (existing) data['prefix'] = '';   // cleared on the device
     data['disabled'] = disabled ? 'yes' : 'no';
     onSave(data);
   }
@@ -293,7 +313,7 @@ function RuleForm({ existing, actions, allDevices, targetName, onSave, onClose, 
               </>
             ) : (
               <select className="input w-full" value={action} onChange={e => setAction(e.target.value)}>
-                {actions.map(a => <option key={a['.id']} value={a['name']}>{a['name']} ({a['type']})</option>)}
+                {actions.map(a => <option key={a['.id']} value={a['name']}>{a['name']} ({a['target']})</option>)}
               </select>
             )}
           </div>
@@ -331,14 +351,11 @@ function AddToDevice({
 }) {
   return (
     <div className="flex items-center gap-1">
-      <select
-        value={value}
-        onChange={e => onChange(Number(e.target.value))}
-        className="text-xs rounded-lg border border-gray-300 dark:border-slate-600 bg-white dark:bg-slate-700 text-gray-700 dark:text-slate-200 px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-500 max-w-[10rem]"
-        title="Choose a device to add to"
-      >
-        {devices.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
-      </select>
+      <DevicePicker
+        variant="filter" className="max-w-[10rem]" title="Choose a device to add to"
+        devices={devices} value={value === '' ? null : value}
+        onChange={(id) => { if (id != null) onChange(id); }}
+      />
       <button onClick={onAdd}
         className="flex items-center gap-1 px-2.5 py-1 border border-blue-600 text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-slate-700 text-xs font-medium rounded-lg transition-colors whitespace-nowrap">
         <Plus className="w-3.5 h-3.5" />Add to device
@@ -592,19 +609,19 @@ export default function NetworkServicesSyslogPage() {
                             </td>
                             <td className="px-4 py-3">
                               <span className={clsx('inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium',
-                                sample['type'] === 'remote'
+                                sample['target'] === 'remote'
                                   ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400'
                                   : 'bg-gray-100 dark:bg-slate-700 text-gray-600 dark:text-slate-400')}>
-                                {sample['type']}
+                                {sample['target']}
                               </span>
                             </td>
                             <td className="px-4 py-3 text-gray-700 dark:text-slate-300">
-                              {sample['type'] === 'remote' ? (
+                              {sample['target'] === 'remote' ? (
                                 <div>
                                   <span className="font-mono text-xs">{sample['remote'] || '—'}:{sample['remote-port'] || '514'}</span>
                                   <div className="text-xs text-gray-400 dark:text-slate-500 mt-0.5">
                                     {sample['syslog-facility'] || 'daemon'} / {sample['syslog-severity'] || 'auto'}
-                                    {sample['bsd-syslog'] === 'yes' && ' · BSD'}
+                                    {isBsdSyslog(sample) && ' · BSD'}
                                   </div>
                                 </div>
                               ) : '—'}
@@ -708,9 +725,12 @@ export default function NetworkServicesSyslogPage() {
                                   <button
                                     onClick={() => handleToggleRuleAll(coverage, !isDisabled)}
                                     disabled={togglePending}
-                                    className="p-1.5 rounded-lg text-gray-400 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-slate-700 transition-colors disabled:opacity-50"
+                                    className={clsx('p-1.5 rounded-lg transition-colors disabled:opacity-50',
+                                      isDisabled ? 'text-gray-400 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20'
+                                        : 'text-green-600 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-900/20')}
                                     title={isDisabled ? 'Enable on covered devices' : 'Disable on covered devices'}>
-                                    <span className="text-xs font-medium">{isDisabled ? 'En' : 'Dis'}</span>
+                                    {/* The same power toggle as WireGuard interfaces (#210). */}
+                                    <Power className="w-3.5 h-3.5" />
                                   </button>
                                 )}
                                 {canWrite && (

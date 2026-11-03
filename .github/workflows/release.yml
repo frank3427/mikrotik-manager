@@ -1,0 +1,84 @@
+# Cut a GitHub Release whenever the shipped version changes.
+#
+# The dashboard links users to the releases page, and that page held a single
+# entry from five months earlier while the product shipped daily — which tells a
+# visitor the project is abandoned. Commit messages here already read as release
+# notes, so the note is the commit body rather than a generated list of subjects.
+name: Release
+
+# main is the stable line (1.0.x); dev carries the next minor as betas, which
+# are marked pre-release below and never become GitHub's "Latest".
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history and tags: the check below asks whether this version has
+          # already been released, which needs both.
+          fetch-depth: 0
+
+      - name: Read version, and stop if it is already released
+        id: v
+        run: |
+          VERSION=$(node -p "require('./frontend/package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Asking "does a tag for this version exist?" rather than "did the
+          # version change since the previous commit?".
+          #
+          # The old comparison was against HEAD~1, which silently skipped the
+          # release whenever a version bump was pushed together with any
+          # follow-up commit — the bump was no longer the tip, so nothing looked
+          # changed. v0.24.3 was lost exactly that way. This form does not care
+          # how commits are batched, and is safe to re-run.
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "unchanged=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION is already tagged — nothing to release."
+          fi
+
+      - name: Compose notes from the commit that shipped it
+        if: steps.v.outputs.unchanged != 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          # Written to a file rather than passed through a step output. Commit
+          # messages here routinely contain backticks, and interpolating one into
+          # a shell command lets the shell evaluate it — which is both why the
+          # first attempt failed and a way to run arbitrary code in CI from a
+          # commit message.
+          # The commit that last touched the version, not necessarily the tip:
+          # a version bump is often followed by docs or CI commits.
+          SHIP=$(git log -1 --format=%H -- frontend/package.json)
+          {
+            git log -1 --pretty=%B "$SHIP"
+            printf '\n---\n'
+            BT=$(printf '\140')   # a markdown backtick, kept out of shell quoting
+            IMG=ghcr.io/2gt-media-group-llc/mikrotik-manager
+            printf 'Container images (published once CI passes):\n'
+            printf -- "- ${BT}%s-backend:%s${BT}\n" "$IMG" "$VERSION"
+            printf -- "- ${BT}%s-nginx:%s${BT}\n\n" "$IMG" "$VERSION"
+            printf 'Documentation: https://2gt-media-group-llc.github.io/mikrotik-manager/\n'
+          } > /tmp/release-notes.md
+
+      - name: Publish
+        if: steps.v.outputs.unchanged != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          TAG="v$VERSION"
+          # Betas are marked pre-release so nobody is pointed at one by accident.
+          PRERELEASE=""
+          case "$TAG" in *beta*|*alpha*|*rc*) PRERELEASE="--prerelease" ;; esac
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/release-notes.md \
+            $PRERELEASE

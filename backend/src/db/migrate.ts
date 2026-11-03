@@ -1,5 +1,6 @@
 import { pool } from '../config/database';
 import bcrypt from 'bcryptjs';
+import { backfillProxyConnections } from '../services/ProxyLogService';
 
 const MIGRATION_SQL = `
 -- Users
@@ -267,6 +268,18 @@ ALTER TABLE device_configs ADD CONSTRAINT device_configs_backup_id_fkey
 -- when the address is not the device's management IP.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS ip_addresses_jsonb JSONB;
 
+-- The management address can now be a hostname (DDNS name, public FQDN), not
+-- only a LAN IP, so 45 chars (enough for an IPv6 literal) is too narrow —
+-- widen to fit a full DNS name. A no-op if already this size or larger.
+ALTER TABLE devices ALTER COLUMN ip_address TYPE VARCHAR(253);
+
+-- Whether the name column should keep following the router's own
+-- /system/identity on every poll (DeviceCollector.collectSystemInfo), or was
+-- set deliberately by an operator and must be left alone until they choose to
+-- follow it again. Defaults false for every existing row, so nothing already
+-- relying on the old always-follow behaviour changes.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS name_locked BOOLEAN NOT NULL DEFAULT false;
+
 -- Allow multiple neighbors per interface (one row per neighbor, not per port)
 ALTER TABLE topology_links DROP CONSTRAINT IF EXISTS topology_links_from_device_id_from_interface_key;
 
@@ -283,7 +296,7 @@ CREATE TABLE IF NOT EXISTS alert_rules (
 CREATE TABLE IF NOT EXISTS alert_channels (
   id          SERIAL PRIMARY KEY,
   name        VARCHAR(100) NOT NULL,
-  type        VARCHAR(20)  NOT NULL CHECK (type IN ('email','slack','discord','telegram','ntfy')),
+  type        VARCHAR(20)  NOT NULL CHECK (type IN ('email','slack','discord','telegram','ntfy','gotify')),
   enabled     BOOLEAN      NOT NULL DEFAULT true,
   config      JSONB        NOT NULL DEFAULT '{}',
   created_at  TIMESTAMPTZ  DEFAULT NOW(),
@@ -427,16 +440,8 @@ CREATE TABLE IF NOT EXISTS device_availability (
 CREATE INDEX IF NOT EXISTS idx_device_availability_device ON device_availability(device_id, went_offline_at DESC);
 
 -- Manual topology links — user-drawn connections for devices with no auto-discovery
-CREATE TABLE IF NOT EXISTS manual_topology_links (
-  id               SERIAL PRIMARY KEY,
-  from_device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  to_device_id     INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-  label            VARCHAR(100),
-  created_at       TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(from_device_id, to_device_id)
-);
-CREATE INDEX IF NOT EXISTS idx_manual_topology_links_from ON manual_topology_links(from_device_id);
-CREATE INDEX IF NOT EXISTS idx_manual_topology_links_to   ON manual_topology_links(to_device_id);
+-- manual_topology_links (links between two managed devices) was replaced by
+-- topology_hand_links (#147); its rows are copied there below.
 
 -- Configuration templates (reusable config sets pushed to devices or groups)
 CREATE TABLE IF NOT EXISTS config_templates (
@@ -608,6 +613,13 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS wifi_package VARCHAR(16);
 -- now meant visiting every device by hand — the exact task staged rollouts exist to
 -- remove.
 ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS routerboot_after BOOLEAN NOT NULL DEFAULT FALSE;
+-- What a rollout upgrades (#262): 'routeros' (with RouterBOOT after, if asked),
+-- or 'routerboot' alone, for a fleet already on the RouterOS it wants.
+ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'routeros';
+-- How many devices in a wave may upgrade at once (issue #135). Default 1 keeps
+-- the sequential behaviour every existing rollout was built around; raising it
+-- trades canary strictness for wall-clock time, which is the operator's call.
+ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS wave_concurrency INTEGER NOT NULL DEFAULT 1;
 
 -- Temporarily dismissed "Things to handle" items (github issue #102).
 --
@@ -625,11 +637,13 @@ CREATE TABLE IF NOT EXISTS insight_dismissals (
 );
 CREATE INDEX IF NOT EXISTS idx_insight_dismissals_expiry ON insight_dismissals(expires_at);
 
--- ntfy.sh notification channel (github issue #93). The channel type is a CHECK
--- constraint rather than a lookup table, so widening it means replacing it.
+-- ntfy.sh notification channel (github issue #93), Gotify (#169). The channel
+-- type is a CHECK constraint rather than a lookup table, so widening it means
+-- replacing it -- here, in this one statement. A second, later replacement would
+-- have this one re-add the narrower list first and fail on existing rows.
 ALTER TABLE alert_channels DROP CONSTRAINT IF EXISTS alert_channels_type_check;
 ALTER TABLE alert_channels ADD CONSTRAINT alert_channels_type_check
-  CHECK (type IN ('email','slack','discord','telegram','ntfy'));
+  CHECK (type IN ('email','slack','discord','telegram','ntfy','gotify'));
 
 -- Change Guard ledger: committed_at used to be stamped for every terminal status,
 -- so an abandoned or failed guard read as though the change had been kept. It now
@@ -711,6 +725,14 @@ CREATE TABLE IF NOT EXISTS wireless_security_profiles (
 -- and probing every device on every fast poll to find out costs more than
 -- remembering the answer.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS has_lte BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- The device's own clock settings (#117).
+--
+-- RouterOS writes log timestamps in the device's local time and never says so.
+-- Without knowing the zone, an event can only be stored at the moment it was
+-- collected — which looks right on a live poll and is badly wrong for a backlog.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS time_zone_name VARCHAR(64);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS gmt_offset VARCHAR(16);
 
 -- Latest state of each LTE interface. One row per interface, overwritten on each
 -- poll; the time series lives in InfluxDB and the movement history below.
@@ -812,6 +834,947 @@ CREATE TABLE IF NOT EXISTS device_poll_stats (
   PRIMARY KEY (device_id, kind)
 );
 CREATE INDEX IF NOT EXISTS idx_poll_stats_attempt ON device_poll_stats(last_attempt_at DESC);
+
+-- Cellular data-cap SMS (discussion #85).
+--
+-- Several EU carriers throttle "unlimited" plans past a daily allowance and lift
+-- the throttle when the subscriber texts a short code. period_bytes is our own
+-- reconstruction of usage, accumulated from poll to poll, because the interface
+-- byte counters do not survive a reboot; last_rx/last_tx hold the previous
+-- sample so a counter that goes backwards is read as a reboot rather than as
+-- negative usage.
+--
+-- period_key is a local date string rather than a timestamp. Comparing keys is
+-- how a reset is detected without converting local wall-clock back to UTC, which
+-- is where daylight saving usually goes wrong.
+CREATE TABLE IF NOT EXISTS lte_data_cap_rules (
+  id               SERIAL PRIMARY KEY,
+  device_id        INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  interface_name   VARCHAR(64) NOT NULL,
+  enabled          BOOLEAN NOT NULL DEFAULT FALSE,
+  phone_number     VARCHAR(32) NOT NULL,
+  message          TEXT NOT NULL DEFAULT '',
+  threshold_bytes  BIGINT NOT NULL,
+  -- We fire below the configured allowance on purpose; our count undercounts.
+  margin_pct       INTEGER NOT NULL DEFAULT 5,
+  reset_hour       INTEGER NOT NULL DEFAULT 0,
+  reset_minute     INTEGER NOT NULL DEFAULT 0,
+  timezone         VARCHAR(64) NOT NULL DEFAULT 'UTC',
+  cooldown_minutes INTEGER NOT NULL DEFAULT 60,
+  period_key       VARCHAR(10),
+  period_bytes     BIGINT NOT NULL DEFAULT 0,
+  last_rx          BIGINT,
+  last_tx          BIGINT,
+  last_sent_at     TIMESTAMPTZ,
+  updated_at       TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE(device_id, interface_name)
+);
+
+-- Every send, with the counter reading at the time, so a misfire is explainable
+-- rather than mysterious.
+CREATE TABLE IF NOT EXISTS lte_data_cap_sends (
+  id             SERIAL PRIMARY KEY,
+  device_id      INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  interface_name VARCHAR(64) NOT NULL,
+  at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  trigger        VARCHAR(16) NOT NULL,
+  phone_number   VARCHAR(32),
+  period_bytes   BIGINT,
+  ok             BOOLEAN NOT NULL,
+  error          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_data_cap_sends ON lte_data_cap_sends(device_id, at DESC);
+
+-- Per-device SSH keypairs (#110).
+--
+-- One key per device, never a fleet key: a shared key makes any single
+-- compromise fleet-wide and makes rotating one device impossible without
+-- touching all of them.
+--
+-- status is deliberately not a boolean. A key that has been generated, a key
+-- that has been pushed to the device, and a key that has been *proved* to
+-- authenticate on a fresh connection are three different states, and only the
+-- last is safe to rely on. Collapsing them is how a device ends up unreachable
+-- because something looked applied.
+--
+-- The password is retained alongside. Key auth falling back to a password is a
+-- degraded state worth knowing about; key auth failing with no fallback is an
+-- outage.
+-- What each bridge says about the spanning tree (#131).
+--
+-- The root bridge used to be *inferred* from port roles, which never worked: the
+-- code compared against 'root' while RouterOS reports 'root-port', so no device
+-- ever matched and the topology simply crowned whichever device sorted first.
+--
+-- RouterOS answers the question directly, so we ask instead of deducing.
+-- root_bridge is the device's own verdict; root_bridge_id names the actual root
+-- as priority.MAC, which is how a root outside the managed fleet stays
+-- identifiable rather than being misattributed to something we do manage.
+CREATE TABLE IF NOT EXISTS device_bridges (
+  device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  bridge_name     VARCHAR(64) NOT NULL,
+  -- This bridge's own identifier, e.g. "0x8000.F4:1E:57:51:74:1E".
+  bridge_id       VARCHAR(64),
+  root_bridge     BOOLEAN,
+  root_bridge_id  VARCHAR(64),
+  root_port       VARCHAR(64),
+  root_path_cost  INTEGER,
+  protocol_mode   VARCHAR(16),
+  updated_at      TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (device_id, bridge_name)
+);
+CREATE INDEX IF NOT EXISTS idx_device_bridges_rootid ON device_bridges(root_bridge_id);
+-- The bridge at the far end of the root port, from spanning tree: the exact
+-- upstream, managed or not (#260).
+ALTER TABLE device_bridges ADD COLUMN IF NOT EXISTS designated_bridge_id VARCHAR(64);
+ALTER TABLE device_bridges ADD COLUMN IF NOT EXISTS designated_port_id VARCHAR(16);
+ALTER TABLE device_bridges ADD COLUMN IF NOT EXISTS designated_cost INTEGER;
+
+-- Bulk command execution (#118).
+--
+-- Waves are not a nicety. Running one command across sixty devices in parallel
+-- means a mistake reaches all sixty before the first failure is visible, and the
+-- whole reason to do this here rather than in a shell loop is that this one can
+-- stop. wave_size and halt_on_failure are what make that possible.
+CREATE TABLE IF NOT EXISTS command_runs (
+  id               SERIAL PRIMARY KEY,
+  name             VARCHAR(120) NOT NULL,
+  command          TEXT NOT NULL,
+  wave_size        INTEGER NOT NULL DEFAULT 1,
+  halt_on_failure  BOOLEAN NOT NULL DEFAULT TRUE,
+  -- Change Guard restores a device that stops answering after the command.
+  -- Defaults on; an operator may turn it off deliberately, per run.
+  use_change_guard BOOLEAN NOT NULL DEFAULT TRUE,
+  -- pending | running | completed | failed | halted | cancelled
+  status           VARCHAR(16) NOT NULL DEFAULT 'pending',
+  created_by       VARCHAR(50),
+  created_at       TIMESTAMPTZ DEFAULT NOW(),
+  started_at       TIMESTAMPTZ,
+  finished_at      TIMESTAMPTZ
+);
+
+-- Output is kept per device because "it failed" without the device's own words
+-- is not actionable, and because some commands exist purely for their output.
+CREATE TABLE IF NOT EXISTS command_run_devices (
+  id           SERIAL PRIMARY KEY,
+  run_id       INTEGER NOT NULL REFERENCES command_runs(id) ON DELETE CASCADE,
+  device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  wave         INTEGER NOT NULL DEFAULT 1,
+  -- pending | running | success | failed | skipped | reverted
+  status       VARCHAR(16) NOT NULL DEFAULT 'pending',
+  output       TEXT,
+  error        TEXT,
+  guarded      BOOLEAN NOT NULL DEFAULT FALSE,
+  auto_reverted BOOLEAN NOT NULL DEFAULT FALSE,
+  started_at   TIMESTAMPTZ,
+  finished_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_command_run_devices ON command_run_devices(run_id, wave);
+
+CREATE TABLE IF NOT EXISTS device_ssh_keys (
+  device_id        INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  key_type         VARCHAR(24) NOT NULL DEFAULT 'ed25519',
+  public_key       TEXT NOT NULL,
+  private_key_encrypted TEXT NOT NULL,
+  fingerprint      VARCHAR(80),
+  ssh_username     VARCHAR(50),
+  -- pending | deployed | verified | failed
+  status           VARCHAR(16) NOT NULL DEFAULT 'pending',
+  last_error       TEXT,
+  last_verified_at TIMESTAMPTZ,
+  deployed_at      TIMESTAMPTZ,
+  created_at       TIMESTAMPTZ DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Multi-site (issue #130). A site is a named collection of devices whose data
+-- is viewed separately. Because ~25 tables hang off devices(id), a single
+-- site_id on devices scopes clients, events, topology, backups and the rest
+-- transitively -- no other table needs a site column.
+CREATE TABLE IF NOT EXISTS sites (
+  id            SERIAL PRIMARY KEY,
+  name          VARCHAR(120) NOT NULL UNIQUE,
+  address       TEXT,
+  location_lat  NUMERIC(10,7),
+  location_lng  NUMERIC(10,7),
+  notes         TEXT,
+  is_default    BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at    TIMESTAMPTZ DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Deliberately NOT "ON DELETE CASCADE": removing a site must never remove the
+-- devices in it. The delete endpoint refuses while devices remain.
+-- Certificates held on each device (#143).
+--
+-- An expired certificate does not announce itself: the tunnel simply stops
+-- working. The cert_expiry alert has existed, fully wired, since before there
+-- was anything to read -- this is the data it was always waiting for.
+CREATE TABLE IF NOT EXISTS device_certificates (
+  device_id        INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  name             VARCHAR(128) NOT NULL,
+  common_name      VARCHAR(255),
+  serial_number    VARCHAR(64),
+  fingerprint      VARCHAR(160),
+  key_type         VARCHAR(16),
+  key_size         INTEGER,
+  invalid_before   TIMESTAMPTZ,
+  invalid_after    TIMESTAMPTZ,
+  is_authority     BOOLEAN NOT NULL DEFAULT FALSE,
+  has_private_key  BOOLEAN NOT NULL DEFAULT FALSE,
+  trusted          BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at       TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (device_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_device_certs_expiry ON device_certificates(invalid_after);
+-- Revocation is not derivable from dates: a revoked certificate keeps a valid
+-- invalid-after and would otherwise read as healthy (#143).
+ALTER TABLE device_certificates ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE;
+-- RouterOS keeps the factory port name alongside the current one, and it is the
+-- only field that survives a rename. Port classification was keyed on the
+-- display name, so renaming ether5 to "starlink1" moved it into the SFP group
+-- (#146). Nullable: existing rows have no factory name until the next slow
+-- poll, and classification falls back to the display name, which is exactly
+-- the old behaviour.
+ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS default_name VARCHAR(64);
+-- Negotiated link rate and SFP module facts, from /interface/ethernet/monitor.
+-- The speed column above it was read from /interface/print, which has no such
+-- field on any RouterOS version tested -- so it had been null for every
+-- interface on every device since it was added (#146).
+--
+-- sfp_present is deliberately tri-state: NULL means the port is not an SFP cage
+-- at all (RouterOS omits the field entirely on copper), false means an empty
+-- cage, true means a module is seated. That distinction is what tells copper
+-- from fibre, which nothing we collected previously could do.
+ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS link_rate VARCHAR(24);
+ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS sfp_present BOOLEAN;
+ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS sfp_type VARCHAR(48);
+ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS sfp_connector VARCHAR(48);
+ALTER TABLE interfaces ADD COLUMN IF NOT EXISTS sfp_vendor VARCHAR(64);
+-- RouterOS update channel (#162). update_channel is an override set in the
+-- manager (NULL = follow the fleet setting); reported_update_channel is what the
+-- device last said it was on, read during each update check.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS update_channel VARCHAR(16);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS reported_update_channel VARCHAR(16);
+-- Hardware health (#168): 'ok' | 'degraded' | 'unknown', from /system/health on
+-- the slow poll. health_ignored lists readings this device should not be judged
+-- on (a dual-PSU switch deliberately fed from one supply).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS health_status VARCHAR(12);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS health_issues JSONB;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS health_checked_at TIMESTAMPTZ;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS health_ignored TEXT[] NOT NULL DEFAULT '{}';
+-- Devices expected to drop out, e.g. solar powered (#168). They alert only when
+-- offline longer than intermittent_alert_after_min (0 = never).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS intermittent BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS intermittent_alert_after_min INTEGER NOT NULL DEFAULT 1440;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS intermittent_alerted_at TIMESTAMPTZ;
+-- Saved command templates for Bulk Commands (#163). Post-upgrade commands will
+-- use the same library when that work is done.
+CREATE TABLE IF NOT EXISTS command_templates (
+  id          SERIAL PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL UNIQUE,
+  description TEXT,
+  command     TEXT NOT NULL,
+  created_by  VARCHAR(100),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Config Templates are merged into command templates (#163). Rows are converted
+-- once at startup (services/convertConfigTemplates.ts) and marked here; the old
+-- table is kept rather than dropped so nothing is lost.
+ALTER TABLE config_templates ADD COLUMN IF NOT EXISTS converted_at TIMESTAMPTZ;
+-- Backups that hold passwords and keys (#172): opted in on v7 (show-sensitive),
+-- or any v6 export. Their files are encrypted with ENCRYPTION_KEY and only
+-- admins can view or download them.
+ALTER TABLE backups ADD COLUMN IF NOT EXISTS contains_secrets BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE backups ADD COLUMN IF NOT EXISTS encrypted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE device_certificates ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS site_id INTEGER REFERENCES sites(id);
+
+-- Credential presets can belong to one site (#228); NULL keeps one fleet-wide.
+-- A site's presets go with the site: they must never turn into fleet-wide ones.
+ALTER TABLE credential_presets ADD COLUMN IF NOT EXISTS site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE;
+-- Names are unique within a site (or fleet-wide), not across every site.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'credential_presets_name_key') THEN
+    ALTER TABLE credential_presets DROP CONSTRAINT credential_presets_name_key;
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_credential_presets_site_name ON credential_presets (COALESCE(site_id, 0), name);
+CREATE INDEX IF NOT EXISTS idx_devices_site ON devices(site_id);
+
+-- Config History snapshots that may hold secrets. RouterOS v6 exported them by
+-- default, so snapshots taken from v6 (or a device whose version was unknown)
+-- before hide-sensitive was used can contain passwords; only admins may read
+-- those. The column is nullable with no default so this classification runs
+-- once, on rows that existed before it; new rows always set it.
+ALTER TABLE device_configs ADD COLUMN IF NOT EXISTS contains_secrets BOOLEAN;
+UPDATE device_configs dc
+   SET contains_secrets = (COALESCE(d.ros_version, '') !~ '^7[.]')
+  FROM devices d
+ WHERE d.id = dc.device_id AND dc.contains_secrets IS NULL;
+UPDATE device_configs SET contains_secrets = TRUE WHERE contains_secrets IS NULL;
+
+-- Forced password change (P1-3): the seeded admin/admin must be changed at
+-- first login before anything else works.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- RouterOS vulnerabilities (#175): from NIST's NVD, refreshed daily, with the
+-- ones CISA lists as actively exploited marked. Replaced as a whole on refresh.
+CREATE TABLE IF NOT EXISTS ros_cves (
+  cve_id            VARCHAR(32) PRIMARY KEY,
+  published         TIMESTAMPTZ,
+  last_modified     TIMESTAMPTZ,
+  summary           TEXT NOT NULL DEFAULT '',
+  score             NUMERIC(3,1),
+  severity          VARCHAR(16),
+  cvss_version      VARCHAR(8),
+  ranges            JSONB NOT NULL DEFAULT '[]',
+  unranged          BOOLEAN NOT NULL DEFAULT FALSE,
+  hardware_specific BOOLEAN NOT NULL DEFAULT FALSE,
+  known_exploited   BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- A scheduled rollout starts only inside its window (P2-9); one that misses it
+-- is marked 'missed' rather than started late. NULL means the default window.
+ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS scheduled_until TIMESTAMPTZ;
+
+-- API tokens are recorded as "token:<name>" with names up to 100 characters;
+-- at 50 the insert failed and the write went unrecorded.
+ALTER TABLE audit_log ALTER COLUMN username TYPE VARCHAR(150);
+
+-- Proxy access logs written by RouterOS containers (3proxy JSON lines), parsed out
+-- of the device log so the dashboard can rank clients, users and destinations.
+CREATE TABLE IF NOT EXISTS proxy_connections (
+  id             BIGSERIAL PRIMARY KEY,
+  device_id      INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  log_id         VARCHAR(20) NOT NULL,
+  event_time     TIMESTAMPTZ NOT NULL,
+  source         VARCHAR(64) NOT NULL,
+  proxy_type     VARCHAR(16) NOT NULL,
+  proxy_port     INTEGER,
+  client_ip      VARCHAR(45) NOT NULL,
+  client_port    INTEGER,
+  server_ip      VARCHAR(45),
+  server_port    INTEGER,
+  auth_user      VARCHAR(255),
+  hostname       VARCHAR(255),
+  method         VARCHAR(16),
+  bytes_sent     BIGINT NOT NULL DEFAULT 0,
+  bytes_received BIGINT NOT NULL DEFAULT 0,
+  error_code     VARCHAR(8),
+  status         VARCHAR(8) NOT NULL DEFAULT 'ok'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proxy_conn_device_log ON proxy_connections(device_id, log_id);
+CREATE INDEX IF NOT EXISTS idx_proxy_conn_time ON proxy_connections(event_time DESC);
+CREATE INDEX IF NOT EXISTS idx_proxy_conn_client ON proxy_connections(client_ip, event_time DESC);
+-- Covering partial indexes tried for the dashboard rankings were never chosen on real
+-- (time-ordered) data: the planner kept the plain event_time index, which the retention
+-- purge needs anyway. Drop them where an earlier build created them.
+DROP INDEX IF EXISTS idx_proxy_conn_ok_cov;
+DROP INDEX IF EXISTS idx_proxy_conn_denied_cov;
+-- One row per proxy instance per device, kept up to date as logs arrive, so the
+-- instance selector does not have to aggregate the whole of proxy_connections.
+-- proxy_port is 0 where a log line carried none (a key column cannot be NULL).
+CREATE TABLE IF NOT EXISTS proxy_sources (
+  device_id  INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  source     VARCHAR(64) NOT NULL,
+  proxy_type VARCHAR(16) NOT NULL,
+  proxy_port INTEGER NOT NULL DEFAULT 0,
+  last_seen  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (device_id, source, proxy_type, proxy_port)
+);
+-- Hourly rollup behind the proxy usage rankings: one row per (hour, device, source,
+-- port, key, peer) for each tab (kind 1 clients, 2 users, 3 destinations, 4 denied).
+-- proxy_port is 0 and peer is '' where a log line carried none (key columns cannot be NULL).
+CREATE TABLE IF NOT EXISTS proxy_usage_hourly (
+  kind       SMALLINT NOT NULL,
+  bucket     TIMESTAMPTZ NOT NULL,
+  device_id  INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  source     VARCHAR(64) NOT NULL,
+  proxy_port INTEGER NOT NULL DEFAULT 0,
+  key        VARCHAR(255) NOT NULL,
+  peer       VARCHAR(255) NOT NULL DEFAULT '',
+  requests   BIGINT NOT NULL,
+  bytes_in   BIGINT NOT NULL DEFAULT 0,
+  bytes_out  BIGINT NOT NULL DEFAULT 0,
+  last_seen  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (kind, bucket, device_id, source, proxy_port, key, peer)
+);
+CREATE INDEX IF NOT EXISTS idx_proxy_usage_hourly_bucket ON proxy_usage_hourly(bucket);
+-- Fold per-worker suffixes (3proxy-b-32 -> 3proxy) on rows stored before they were stripped.
+UPDATE proxy_connections SET source = COALESCE(NULLIF(regexp_replace(source, '(-[a-zA-Z])?-[0-9]+$', ''), ''), 'proxy')
+  WHERE source ~ '-[0-9]+$';
+
+-- Session revocation (outside review P2-1): every session carries the account's
+-- session_version, which goes up when the role or password changes, ending
+-- every session issued before.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0;
+
+-- Device identity pinning (outside review P1-4): the API-SSL certificate and SSH
+-- host key a device presented the first time, so a different one is caught
+-- before credentials are sent to it. seen_fingerprint holds a changed one until
+-- an admin trusts it.
+CREATE TABLE IF NOT EXISTS device_identity_pins (
+  device_id        INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  kind             VARCHAR(16) NOT NULL,          -- 'api-tls' | 'ssh-host'
+  fingerprint      VARCHAR(128) NOT NULL,
+  pinned_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  seen_fingerprint VARCHAR(128),
+  mismatch_at      TIMESTAMPTZ,
+  PRIMARY KEY (device_id, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_devices_ip_address ON devices(ip_address);
+
+-- Per-site roles (outside review P1-7). A user with no rows here has fleet-wide
+-- access under users.role, which is every user until an admin assigns sites.
+-- A user with rows sees and acts only in those sites, with the role given for each.
+CREATE TABLE IF NOT EXISTS user_site_roles (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  site_id    INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  role       VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, site_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_site_roles_site ON user_site_roles(site_id);
+
+-- TOTP setup in progress (outside review S1): the new secret waits here until a
+-- code from it is confirmed, so the active one keeps working meanwhile.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret VARCHAR(64);
+
+-- One record per serial number (outside review C3). Skipped, with a notice,
+-- if duplicates already exist, so startup never fails on old data; the
+-- duplicate-serial check on add still applies either way.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM devices WHERE serial_number IS NOT NULL AND serial_number <> ''
+     GROUP BY serial_number HAVING COUNT(*) > 1
+  ) THEN
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_serial_unique ON devices(serial_number)
+      WHERE serial_number IS NOT NULL AND serial_number <> '';
+  ELSE
+    RAISE NOTICE 'devices has duplicate serial numbers; idx_devices_serial_unique not created';
+  END IF;
+END $$;
+
+-- Hot per-device paths (outside review J11): topology_links lost its only
+-- index on from_device_id with an old constraint, and per-device event reads
+-- by id had none.
+CREATE INDEX IF NOT EXISTS idx_topology_links_from_device ON topology_links(from_device_id);
+CREATE INDEX IF NOT EXISTS idx_events_device_id_id ON events(device_id, id DESC);
+
+-- Traffic per site (outside review J4, P2-23). A client's daily traffic is kept
+-- per site, the site of the exporter that saw it, so the same MAC or a reused
+-- address at two customers is never added together. 0 = no site could be
+-- determined (an unidentified exporter at a multi-site install) and rows from
+-- before this change.
+ALTER TABLE client_traffic_daily ADD COLUMN IF NOT EXISTS site_id INTEGER NOT NULL DEFAULT 0;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = 'client_traffic_daily'::regclass AND contype = 'p'
+       AND array_length(conkey, 1) = 2
+  ) THEN
+    ALTER TABLE client_traffic_daily DROP CONSTRAINT client_traffic_daily_pkey;
+    ALTER TABLE client_traffic_daily ADD PRIMARY KEY (mac_address, day, site_id);
+  END IF;
+END $$;
+
+-- Local firmware mirror (#193). What the fleet runs, so the mirror fetches only
+-- the architecture and package combinations in use.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS architecture VARCHAR(32);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS installed_packages TEXT[];
+
+-- A package server: a RouterOS device the manager keeps stocked with packages
+-- that other devices pull through /system/package/local-update (7.17+). One
+-- for the whole fleet (site_id NULL), and optionally one per site.
+CREATE TABLE IF NOT EXISTS firmware_mirrors (
+  id                  SERIAL PRIMARY KEY,
+  device_id           INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  site_id             INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+  folder              VARCHAR(64) NOT NULL DEFAULT 'mtm-packages',
+  -- The address devices reach the package server on, when it isn't the one
+  -- the manager uses (NAT, a VPN, another interface). NULL: the device's own.
+  serve_address       VARCHAR(255),
+  username            VARCHAR(32) NOT NULL DEFAULT 'mtm-mirror',
+  password_encrypted  TEXT,
+  keep_versions       INTEGER NOT NULL DEFAULT 3,
+  auto_sync           BOOLEAN NOT NULL DEFAULT TRUE,
+  channel             VARCHAR(16) NOT NULL DEFAULT 'stable',
+  status              VARCHAR(16) NOT NULL DEFAULT 'new',
+  last_error          TEXT,
+  last_sync_at        TIMESTAMPTZ,
+  free_bytes          BIGINT,
+  total_bytes         BIGINT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_firmware_mirrors_site ON firmware_mirrors (COALESCE(site_id, 0));
+
+-- The files on a package server, as uploaded and verified.
+CREATE TABLE IF NOT EXISTS firmware_mirror_files (
+  mirror_id    INTEGER NOT NULL REFERENCES firmware_mirrors(id) ON DELETE CASCADE,
+  version      VARCHAR(20) NOT NULL,
+  package      VARCHAR(40) NOT NULL,
+  architecture VARCHAR(32) NOT NULL,
+  filename     VARCHAR(100) NOT NULL,
+  size_bytes   BIGINT NOT NULL,
+  sha256       CHAR(64) NOT NULL,
+  uploaded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (mirror_id, filename)
+);
+
+-- Devices pointed at a package server, and how that went.
+CREATE TABLE IF NOT EXISTS firmware_mirror_clients (
+  device_id   INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  mirror_id   INTEGER NOT NULL REFERENCES firmware_mirrors(id) ON DELETE CASCADE,
+  status      VARCHAR(16) NOT NULL DEFAULT 'pending',
+  error       TEXT,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- WireGuard peers as last polled (#208): the last handshake, in seconds before
+-- updated_at (NULL: never), for the stale-peer alert.
+CREATE TABLE IF NOT EXISTS wireguard_peers (
+  device_id          INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  peer_id            VARCHAR(16) NOT NULL,
+  interface          VARCHAR(64),
+  name               VARCHAR(128),
+  public_key         VARCHAR(64),
+  endpoint           VARCHAR(128),
+  allowed_address    TEXT,
+  last_handshake_sec INTEGER,
+  disabled           BOOLEAN NOT NULL DEFAULT FALSE,
+  interface_disabled BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (device_id, peer_id)
+);
+
+-- Where a rollout's devices get their packages: 'mirror' or 'mikrotik'.
+ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS package_source VARCHAR(10) NOT NULL DEFAULT 'mikrotik';
+
+-- Interface errors and link flaps (#249): one row per poll interval in which a
+-- port's error counters or link-downs grew. Quiet intervals aren't stored.
+CREATE TABLE IF NOT EXISTS interface_error_events (
+  id           BIGSERIAL PRIMARY KEY,
+  device_id    INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  interface    VARCHAR(64) NOT NULL,
+  at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  interval_sec INTEGER NOT NULL,
+  fcs          BIGINT NOT NULL DEFAULT 0,
+  align        BIGINT NOT NULL DEFAULT 0,
+  overflow     BIGINT NOT NULL DEFAULT 0,
+  other        BIGINT NOT NULL DEFAULT 0,
+  link_downs   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_interface_error_events_at ON interface_error_events (at);
+CREATE INDEX IF NOT EXISTS idx_interface_error_events_device ON interface_error_events (device_id, at);
+
+-- Optic light levels from each slow poll, for modules that report diagnostics
+-- (copper DAC cables don't). rx_lanes holds per-lane receive power when a
+-- module reports more than one. Kept two weeks.
+CREATE TABLE IF NOT EXISTS optic_readings (
+  id         BIGSERIAL PRIMARY KEY,
+  device_id  INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  interface  VARCHAR(64) NOT NULL,
+  at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  rx_dbm     REAL,
+  tx_dbm     REAL,
+  temp_c     REAL,
+  bias_ma    REAL,
+  voltage    REAL,
+  rx_lanes   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_optic_readings_port ON optic_readings (device_id, interface, at);
+CREATE INDEX IF NOT EXISTS idx_optic_readings_at ON optic_readings (at);
+
+-- Legacy CAPsMAN (#250). capsman_flavor says which CAPsMAN a controller runs:
+-- 'wifi' (/interface/wifi/capsman) or 'legacy' (/caps-man). wifi_role_probe is
+-- the version of the role check a device was last classified with; devices
+-- checked by an older version are probed once more, so a legacy controller
+-- recorded as 'none' before #250 is found.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS capsman_flavor VARCHAR(8);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS wifi_role_probe SMALLINT NOT NULL DEFAULT 0;
+-- When the role was last checked: a device with none is checked again about
+-- once a day, so CAPsMAN switched on after it was added is found (#365).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS wifi_role_checked_at TIMESTAMPTZ;
+
+-- The disk a mirror keeps its packages on (Discussion #85): a mount point such
+-- as sd1 or usb1. NULL: internal storage.
+ALTER TABLE firmware_mirrors ADD COLUMN IF NOT EXISTS disk VARCHAR(64);
+
+-- A Wi-Fi client's link rates (#252), bits per second, from the access point's
+-- side: tx is what it sends the client, rx what it receives. NULL for wired.
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS tx_rate_bps BIGINT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS rx_rate_bps BIGINT;
+
+-- Does the device run User Manager, RouterOS's RADIUS server (#251)? NULL:
+-- not checked yet. Rechecked daily; what it holds is read live, not stored.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS user_manager BOOLEAN;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS user_manager_checked_at TIMESTAMPTZ;
+
+-- The router's own name (/system/identity), read every poll whether or not the
+-- manager's name is locked (#253), so a mismatch can be shown and fixed.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS ros_identity VARCHAR(255);
+
+-- Added over SSH only (#174): the RouterOS API isn't enabled on the device yet.
+-- It is reached over SSH, the API is retried, and once it answers the flag is
+-- cleared and the device is polled normally. api_check_error says why the last
+-- check failed.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS ssh_only BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS api_checked_at TIMESTAMPTZ;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS api_check_error TEXT;
+
+-- api-ssl on a port other than 8729 (#257): behind NAT, or where 8729 is
+-- blocked. NULL keeps the old rule, TLS exactly when the port is 8729.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS api_tls BOOLEAN;
+
+-- RouterOS release notes, read for the CVEs they name (discussion #85). NVD can
+-- take weeks to give a new CVE its affected versions; MikroTik's notes say which
+-- release fixed it at once. A release's notes never change, so found ones are
+-- read once; a missing one (not released yet) is tried again the next day.
+CREATE TABLE IF NOT EXISTS ros_release_notes (
+  version     VARCHAR(20) PRIMARY KEY,
+  found       BOOLEAN NOT NULL,
+  cves        JSONB NOT NULL DEFAULT '[]',
+  fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Your own topology nodes (#147): an ISP modem, a server, a NAS, an unmanaged
+-- switch... anything the manager doesn't manage but belongs on the map. Linked
+-- to a managed device or to another node; deleting either removes the link.
+CREATE TABLE IF NOT EXISTS topology_nodes (
+  id          SERIAL PRIMARY KEY,
+  site_id     INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+  name        VARCHAR(100) NOT NULL,
+  kind        VARCHAR(20) NOT NULL DEFAULT 'other',
+  address     VARCHAR(255),
+  notes       TEXT,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+-- Links drawn by hand (#147). Each end is a managed device, one of your nodes,
+-- or a neighbour discovery saw but the manager doesn't manage (by the id the map
+-- gives it, with its name kept in case discovery stops seeing it). Deleting a
+-- device or node removes its links.
+CREATE TABLE IF NOT EXISTS topology_hand_links (
+  id              SERIAL PRIMARY KEY,
+  site_id         INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+  a_device_id     INTEGER REFERENCES devices(id) ON DELETE CASCADE,
+  a_node_id       INTEGER REFERENCES topology_nodes(id) ON DELETE CASCADE,
+  a_external      VARCHAR(160),
+  a_external_name VARCHAR(255),
+  b_device_id     INTEGER REFERENCES devices(id) ON DELETE CASCADE,
+  b_node_id       INTEGER REFERENCES topology_nodes(id) ON DELETE CASCADE,
+  b_external      VARCHAR(160),
+  b_external_name VARCHAR(255),
+  label           VARCHAR(100),
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  CHECK (num_nonnulls(a_device_id, a_node_id, a_external) = 1),
+  CHECK (num_nonnulls(b_device_id, b_node_id, b_external) = 1)
+);
+-- One link per pair of ends, whichever way round it was drawn.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_topology_hand_links_pair ON topology_hand_links (
+  LEAST(COALESCE('d' || a_device_id::text, 'n' || a_node_id::text, 'e' || a_external),
+        COALESCE('d' || b_device_id::text, 'n' || b_node_id::text, 'e' || b_external)),
+  GREATEST(COALESCE('d' || a_device_id::text, 'n' || a_node_id::text, 'e' || a_external),
+           COALESCE('d' || b_device_id::text, 'n' || b_node_id::text, 'e' || b_external))
+);
+-- Carry over links drawn before, then retire the old tables.
+DO $$ BEGIN
+  IF to_regclass('public.manual_topology_links') IS NOT NULL THEN
+    INSERT INTO topology_hand_links (site_id, a_device_id, b_device_id, label, created_at)
+      SELECT d.site_id, ml.from_device_id, ml.to_device_id, ml.label, ml.created_at
+        FROM manual_topology_links ml JOIN devices d ON d.id = ml.from_device_id
+      ON CONFLICT DO NOTHING;
+    DROP TABLE manual_topology_links;
+  END IF;
+  IF to_regclass('public.topology_node_links') IS NOT NULL THEN
+    INSERT INTO topology_hand_links (site_id, a_node_id, b_device_id, b_node_id, label, created_at)
+      SELECT n.site_id, nl.node_id, nl.device_id, nl.other_node_id, nl.label, nl.created_at
+        FROM topology_node_links nl JOIN topology_nodes n ON n.id = nl.node_id
+      ON CONFLICT DO NOTHING;
+    DROP TABLE topology_node_links;
+  END IF;
+END $$;
+
+-- Where each node sits on the topology map, and which side of a node each link
+-- attaches to, when someone has arranged it (#147). Shared by everyone: the map
+-- is the network's drawing, not a personal view. Keyed by the ids the map uses
+-- ("12", "node-3", "ext-…", "cable:…"); a missing entry is placed automatically.
+CREATE TABLE IF NOT EXISTS topology_positions (
+  node_key    VARCHAR(200) PRIMARY KEY,
+  x           DOUBLE PRECISION NOT NULL,
+  y           DOUBLE PRECISION NOT NULL,
+  updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS topology_edge_anchors (
+  edge_key       VARCHAR(400) PRIMARY KEY,
+  source_handle  VARCHAR(8),
+  target_handle  VARCHAR(8),
+  updated_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Secret values for commands (#259): {{secret:name}} is filled in on the
+-- server when a command runs, so a password in a command never shows.
+CREATE TABLE IF NOT EXISTS command_secrets (
+  id               SERIAL PRIMARY KEY,
+  name             VARCHAR(64) NOT NULL UNIQUE,
+  value_encrypted  TEXT NOT NULL,
+  created_by       VARCHAR(100),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Settings a site or a device overrides (#261): poll intervals, MAC scan,
+-- config snapshots, secrets in backups. Global, then site, then device.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS poll_overrides JSONB;
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS poll_overrides JSONB;
+-- Outages before this don't count toward "had N outages this week" (#85).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS outages_reset_at TIMESTAMPTZ;
+-- Platform backup of MikroTik Manager itself: the schedule (one row), the
+-- off-box destinations, and the backups made. Never part of a platform
+-- backup's restore: each server keeps its own.
+CREATE TABLE IF NOT EXISTS platform_backup_settings (
+  id                   INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  enabled              BOOLEAN NOT NULL DEFAULT FALSE,
+  frequency            VARCHAR(10) NOT NULL DEFAULT 'daily',
+  time_of_day          VARCHAR(5) NOT NULL DEFAULT '02:30',
+  weekday              INTEGER NOT NULL DEFAULT 0,
+  monthday             INTEGER NOT NULL DEFAULT 1,
+  contents             VARCHAR(20) NOT NULL DEFAULT 'config',
+  keep                 INTEGER NOT NULL DEFAULT 14,
+  passphrase_encrypted TEXT,
+  destination_ids      INTEGER[] NOT NULL DEFAULT '{}',
+  last_run_at          TIMESTAMPTZ,
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS platform_backup_destinations (
+  id               SERIAL PRIMARY KEY,
+  type             VARCHAR(10) NOT NULL,
+  name             VARCHAR(100) NOT NULL,
+  enabled          BOOLEAN NOT NULL DEFAULT TRUE,
+  keep             INTEGER NOT NULL DEFAULT 14,
+  config           JSONB NOT NULL DEFAULT '{}',
+  secret_encrypted TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS platform_backups (
+  id           SERIAL PRIMARY KEY,
+  file_name    VARCHAR(200) NOT NULL UNIQUE,
+  contents     VARCHAR(20) NOT NULL,
+  trigger      VARCHAR(20) NOT NULL,
+  status       VARCHAR(10) NOT NULL DEFAULT 'running',
+  size_bytes   BIGINT,
+  app_version  VARCHAR(40),
+  error        TEXT,
+  destinations JSONB NOT NULL DEFAULT '[]',
+  created_by   INTEGER,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_platform_backups_created ON platform_backups (created_at DESC);
+
+-- Where a poll's time went (#301): opening or reusing the API session, and the work.
+ALTER TABLE device_poll_stats ADD COLUMN IF NOT EXISTS last_connect_ms INTEGER;
+ALTER TABLE device_poll_stats ADD COLUMN IF NOT EXISTS last_collect_ms INTEGER;
+ALTER TABLE device_poll_stats ADD COLUMN IF NOT EXISTS last_session_reused BOOLEAN;
+-- Of the collecting, the time spent waiting on the device's answers; the rest is the database and processing.
+ALTER TABLE device_poll_stats ADD COLUMN IF NOT EXISTS last_device_ms INTEGER;
+
+-- When each device last booted, worked out from its uptime on every fast
+-- poll, and the reboots that implies (#326): a reboot quicker than the poll
+-- interval never shows as an outage, so availability alone missed it.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS boot_at TIMESTAMPTZ;
+-- The newest log line seen on the device, kept on the device rather than read
+-- back from events, so clearing events (or firewall logs) doesn't make the
+-- next poll re-import the router's whole log buffer (#361).
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS log_watermark_id BIGINT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS log_watermark_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS device_reboots (
+  id          BIGSERIAL PRIMARY KEY,
+  device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  boot_at     TIMESTAMPTZ NOT NULL,
+  detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_device_reboots_device ON device_reboots(device_id, boot_at DESC);
+
+-- Groups of sites (#306): a customer with several sites. A site belongs to at
+-- most one group; devices belong through their site. Access can be given per
+-- group, which reaches every site in it, including sites added later.
+CREATE TABLE IF NOT EXISTS site_groups (
+  id         SERIAL PRIMARY KEY,
+  name       VARCHAR(120) NOT NULL UNIQUE,
+  notes      TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS group_id INTEGER REFERENCES site_groups(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_sites_group ON sites(group_id);
+-- An account with rows here or in user_site_roles is limited to those sites.
+CREATE TABLE IF NOT EXISTS user_group_roles (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  group_id   INTEGER NOT NULL REFERENCES site_groups(id) ON DELETE CASCADE,
+  role       VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_group_roles_group ON user_group_roles(group_id);
+
+-- RoMON per site or group, with a fleet default (#311): keep it on, and the
+-- secret devices use (encrypted; NULL leaves devices' secrets alone).
+CREATE TABLE IF NOT EXISTS romon_settings (
+  id               SERIAL PRIMARY KEY,
+  site_id          INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+  group_id         INTEGER REFERENCES site_groups(id) ON DELETE CASCADE,
+  enabled          BOOLEAN NOT NULL DEFAULT TRUE,
+  secret_encrypted TEXT,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (site_id IS NULL OR group_id IS NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_romon_site ON romon_settings(site_id) WHERE site_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_romon_group ON romon_settings(group_id) WHERE group_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_romon_fleet ON romon_settings((TRUE)) WHERE site_id IS NULL AND group_id IS NULL;
+
+
+-- What fleet pages show per device that only the device can tell (#302):
+-- the last answer and when it was read, refreshed a few at a time in the
+-- background instead of contacting every device on every page load.
+CREATE TABLE IF NOT EXISTS device_live_cache (
+  device_id  INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  kind       VARCHAR(40) NOT NULL,
+  data       JSONB,
+  fetched_at TIMESTAMPTZ,
+  error      TEXT,
+  PRIMARY KEY (device_id, kind)
+);
+
+-- The manager's own certificate authority (#200): one row, made here or
+-- imported, with the device-certificate defaults. The key is encrypted with
+-- the manager's key. Devices carrying a certificate it issued are listed in
+-- managed_device_certs; no row means the device isn't enrolled.
+CREATE TABLE IF NOT EXISTS device_ca (
+  id                INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  cert_pem          TEXT NOT NULL,
+  key_encrypted     TEXT NOT NULL,
+  imported          BOOLEAN NOT NULL DEFAULT FALSE,
+  default_days      INTEGER NOT NULL DEFAULT 365,
+  renew_before_days INTEGER NOT NULL DEFAULT 30,
+  auto_renew        BOOLEAN NOT NULL DEFAULT TRUE,
+  default_www       BOOLEAN NOT NULL DEFAULT TRUE,
+  created_by        VARCHAR(100),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS managed_device_certs (
+  device_id         INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  cert_name         VARCHAR(64) NOT NULL,
+  ca_cert_name      VARCHAR(64),
+  serial            VARCHAR(64) NOT NULL,
+  fingerprint       CHAR(64) NOT NULL,
+  ca_fingerprint    CHAR(64) NOT NULL,
+  sans              TEXT[] NOT NULL DEFAULT '{}',
+  -- Names beyond the management address, kept for renewals.
+  extra_names       TEXT[] NOT NULL DEFAULT '{}',
+  days              INTEGER NOT NULL,
+  apply_www         BOOLEAN NOT NULL DEFAULT TRUE,
+  not_before        TIMESTAMPTZ NOT NULL,
+  not_after         TIMESTAMPTZ NOT NULL,
+  previous_api_cert VARCHAR(128),
+  previous_www_cert VARCHAR(128),
+  last_error        TEXT,
+  last_attempt_at   TIMESTAMPTZ,
+  issued_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  renewed_at        TIMESTAMPTZ
+);
+
+-- BGP peers and OSPF neighbours across the fleet, for the Routing page and
+-- the routing-peer-down alert (#279). An OSPF neighbour that drops vanishes
+-- from RouterOS, so its last row is kept and marked down.
+CREATE TABLE IF NOT EXISTS routing_peers (
+  device_id      INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  protocol       VARCHAR(8) NOT NULL,
+  peer_key       VARCHAR(160) NOT NULL,
+  name           VARCHAR(128),
+  remote_address VARCHAR(64),
+  remote_as      VARCHAR(16),
+  remote_id      VARCHAR(64),
+  instance       VARCHAR(64),
+  detail         VARCHAR(160),
+  state          VARCHAR(32) NOT NULL,
+  up             BOOLEAN NOT NULL DEFAULT FALSE,
+  disabled       BOOLEAN NOT NULL DEFAULT FALSE,
+  uptime         VARCHAR(32),
+  prefix_count   INTEGER,
+  last_up_at     TIMESTAMPTZ,
+  last_change_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (device_id, protocol, peer_key)
+);
+
+-- Editing the map by hand (#260): a name and type for a neighbour discovery
+-- found (a PC it labelled a switch), the ports at each end of a hand-drawn
+-- link, and a colour for any link.
+CREATE TABLE IF NOT EXISTS topology_neighbour_overrides (
+  ext_id      VARCHAR(160) PRIMARY KEY,
+  name        VARCHAR(255),
+  kind        VARCHAR(32),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE topology_hand_links ADD COLUMN IF NOT EXISTS a_port VARCHAR(64);
+ALTER TABLE topology_hand_links ADD COLUMN IF NOT EXISTS b_port VARCHAR(64);
+ALTER TABLE topology_edge_anchors ADD COLUMN IF NOT EXISTS color VARCHAR(16);
+
+-- Discovered links hidden by hand (discussion #85): discovery can be wrong (a
+-- switch heard through forwarded LLDP), and someone who knows the cabling can
+-- hide a link it reports. Keyed by the link's stable id, so a hidden link stays
+-- hidden across polls; label is what the list of hidden links shows.
+CREATE TABLE IF NOT EXISTS topology_hidden_links (
+  edge_key   TEXT PRIMARY KEY,
+  label      TEXT,
+  hidden_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  hidden_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- NVD's entry for a CVE only the release notes name, looked up by id: it often
+-- has a description and score well before it lists affected versions.
+CREATE TABLE IF NOT EXISTS ros_cve_details (
+  cve_id      VARCHAR(32) PRIMARY KEY,
+  found       BOOLEAN NOT NULL,
+  summary     TEXT,
+  score       NUMERIC(3,1),
+  severity    VARCHAR(16),
+  published   TIMESTAMPTZ,
+  fetched_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- How full each IPv4 address pool is (#156), from the slow poll. An exhausted
+-- pool is the quiet DHCP failure: clients connect and get no address.
+-- Post-upgrade commands (#163): a command template run on each device after
+-- its upgrade is verified. The command is copied in when the rollout is made,
+-- so editing the template later doesn't change a scheduled rollout.
+ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS post_command TEXT;
+ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS post_template_name VARCHAR(100);
+ALTER TABLE firmware_rollout_devices ADD COLUMN IF NOT EXISTS post_status VARCHAR(12);
+ALTER TABLE firmware_rollout_devices ADD COLUMN IF NOT EXISTS post_output TEXT;
+ALTER TABLE firmware_rollout_devices ADD COLUMN IF NOT EXISTS post_error TEXT;
+
+CREATE TABLE IF NOT EXISTS dhcp_pool_usage (
+  device_id  INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  name       VARCHAR(64) NOT NULL,
+  ranges     TEXT,
+  size       INTEGER,
+  used       INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (device_id, name)
+);
+
+-- When the configuration was last read and found already backed up (#377).
+-- A snapshot is only stored when the config changes, so an unchanged device's
+-- newest backup gets old while it's still current.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS config_checked_at TIMESTAMPTZ;
 `;
 
 const DEFAULT_SETTINGS = [
@@ -819,12 +1782,24 @@ const DEFAULT_SETTINGS = [
   { key: 'polling_slow_interval', value: 300 },
   { key: 'polling_logs_interval', value: 60 },
   { key: 'retention_events_days', value: 30 },
+  { key: 'retention_firewall_events_days', value: 7 },
+  { key: 'retention_proxy_days', value: 30 },
   { key: 'backup_schedule_enabled', value: false },
   { key: 'backup_schedule_cron', value: '0 2 * * *' },
+  // Scheduled work was evaluated against the container clock, which is UTC in
+  // the shipped image. A "02:00" backup therefore fired at 02:00 UTC regardless
+  // of where the operator was — seven hours out on the US west coast (#117).
+  { key: 'app_timezone', value: 'UTC' },
   { key: 'mac_scan_enabled', value: true },
   { key: 'mac_scan_interval', value: 300 },
   { key: 'reverse_dns_enabled', value: false },
   { key: 'retention_clients_days', value: 7 },
+  // History tables that used to grow without limit (outside review J11).
+  { key: 'retention_scan_days', value: 30 },
+  { key: 'retention_lte_history_days', value: 90 },
+  { key: 'retention_alert_history_days', value: 180 },
+  { key: 'retention_audit_days', value: 365 },
+  { key: 'retention_availability_days', value: 400 },
   { key: 'spectral_scan_enabled', value: false },
   { key: 'spectral_scan_interval_hours', value: 24 },
   { key: 'ap_scan_enabled', value: false },
@@ -841,17 +1816,38 @@ const DEFAULT_SETTINGS = [
   { key: 'netflow_active_timeout', value: '1m' },
   { key: 'netflow_inactive_timeout', value: '15s' },
   { key: 'netflow_topn_clients', value: 50 },
-  { key: 'netflow_accept_unknown', value: true },
+  // New installs only accept flows from managed devices (outside review P2-23).
+  // Existing installs keep the value they have; see docs/traffic.md.
+  { key: 'netflow_accept_unknown', value: false },
   { key: 'netflow_retention_days', value: 30 },
   { key: 'netflow_daily_retention_days', value: 365 },
   { key: 'change_guard_enabled', value: true },
   { key: 'change_guard_mode', value: 'binary' },
   { key: 'change_guard_timeout_sec', value: 120 },
+  // Firmware timeouts. Hardcoded until a user pointed out that CRS switches can
+  // take a full 12 minutes to come back, which is exactly the old ceiling, and
+  // that MikroTik's download servers intermittently stall (#141).
+  { key: 'firmware_download_timeout_min', value: 10 },
+  { key: 'firmware_reboot_timeout_min', value: 12 },
+  // Collector toggles. A fleet doing firmware and configuration management has
+  // no use for per-client tracking, and every collector is a round trip per
+  // device per cycle -- the lever that matters at scale (#85, henkb-gh).
+  { key: 'poll_clients_enabled', value: true },
+  { key: 'poll_neighbors_enabled', value: true },
+  { key: 'poll_logs_enabled', value: true },
+  { key: 'poll_certificates_enabled', value: true },
   { key: 'config_health_enabled', value: true },
   { key: 'config_health_interval_min', value: 60 },
   // Geocoding and map tiles are third-party requests that also disclose device
   // locations. Off-switch for isolated networks (issue #106).
   { key: 'maps_enabled', value: true },
+  // Dark Site Mode: every other feature that reaches the internet. All on by
+  // default; an isolated site turns off what it needs to (#159).
+  { key: 'update_check_enabled', value: true },
+  { key: 'device_update_check_enabled', value: true },
+  { key: 'firmware_changelog_enabled', value: true },
+  { key: 'oui_download_enabled', value: true },
+  { key: 'docs_link_enabled', value: true },
 ];
 
 export async function runMigrations(): Promise<void> {
@@ -869,17 +1865,59 @@ export async function runMigrations(): Promise<void> {
       );
     }
 
+    // Multi-site backfill. Existing single-network installs must come out of
+    // this indistinguishable from how they went in: one site, every device in
+    // it, nothing moved. Idempotent -- reruns are a no-op.
+    const siteCount = await client.query('SELECT COUNT(*) FROM sites');
+    if (parseInt(siteCount.rows[0].count, 10) === 0) {
+      await client.query(
+        `INSERT INTO sites (name, is_default) VALUES ($1, TRUE)`,
+        ['Default Site']
+      );
+      console.log('Default Site created');
+    }
+    // Adopt any device without a site (covers both the initial backfill and
+    // devices added by an older build mid-upgrade).
+    const adopted = await client.query(
+      `UPDATE devices SET site_id = (SELECT id FROM sites WHERE is_default = TRUE ORDER BY id LIMIT 1)
+       WHERE site_id IS NULL`
+    );
+    if (adopted.rowCount) console.log(`Assigned ${adopted.rowCount} device(s) to the default site`);
+
     // Create default admin user if no users exist
     const userCount = await client.query('SELECT COUNT(*) FROM users');
     if (parseInt(userCount.rows[0].count, 10) === 0) {
       const hash = await bcrypt.hash('admin', 12);
       await client.query(
-        `INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)`,
+        `INSERT INTO users (username, password_hash, role, must_change_password) VALUES ($1, $2, $3, TRUE)`,
         ['admin', hash, 'admin']
       );
       console.log('Default admin user created (username: admin, password: admin)');
-      console.log('⚠️  Please change the default password after first login!');
+      console.log('The password must be changed at first login.');
     }
+
+    // Existing installs still on admin/admin get the same forced change. Checked
+    // against the hash, so it clears itself once the password is changed.
+    const admin = await client.query<{ id: number; password_hash: string | null; must_change_password: boolean }>(
+      `SELECT id, password_hash, must_change_password FROM users WHERE username = 'admin' LIMIT 1`
+    );
+    const a = admin.rows[0];
+    if (a?.password_hash && !a.must_change_password && (await bcrypt.compare('admin', a.password_hash))) {
+      await client.query(`UPDATE users SET must_change_password = TRUE WHERE id = $1`, [a.id]);
+      console.log('The admin account still uses the default password; it must be changed at next login.');
+    }
+
+    // One-time backfill of proxy connections from events already collected.
+    try {
+      const n = await backfillProxyConnections(client);
+      if (n > 0) console.log(`Backfilled ${n} proxy connection(s) from events`);
+    } catch (err) {
+      console.error('Proxy connection backfill failed (non-fatal):', err);
+    }
+
+    // The proxy_sources and proxy_usage_hourly backfills scan proxy_connections, which
+    // can take minutes on a large install, so they run in the background after startup
+    // (ProxyBackfillService) rather than holding up the health check here.
 
     console.log('Database migrations completed successfully');
   } finally {

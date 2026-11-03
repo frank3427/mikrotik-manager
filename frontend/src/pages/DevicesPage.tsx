@@ -1,87 +1,54 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode, type MouseEvent as ReactMouseEvent } from 'react';
+import { usesApiTls } from '../utils/apiTls';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  Plus, RefreshCw, Router, Wifi, Trash2, ChevronRight, Search,
-  Radar, ArrowUpCircle, Cpu, Pencil, ArrowUpDown, ArrowUp, ArrowDown,
-} from 'lucide-react';
-import { devicesApi, topologyApi, metricsApi, tagsApi } from '../services/api';
+  Plus, RefreshCw, Router, Trash2, ChevronRight,
+  Radar, Pencil, ShieldQuestion, Upload, Power} from 'lucide-react';
+import { devicesApi, topologyApi, metricsApi, tagsApi, adoptionApi} from '../services/api';
 import type { Device } from '../types';
-import type { DiscoveredDevice } from '../services/api';
+import type { DiscoveredDevice, AdoptionCandidate} from '../services/api';
 import { useCanWrite } from '../hooks/useCanWrite';
+import { useSocket } from '../hooks/useSocket';
 import clsx from 'clsx';
 import AddDeviceModal from '../components/devices/AddDeviceModal';
+import AdoptDeviceModal from '../components/devices/AdoptDeviceModal';
 import EditDeviceModal from '../components/devices/EditDeviceModal';
+import BulkCredentialsModal from '../components/devices/BulkCredentialsModal';
 import TryAllDiscoveredModal from '../components/devices/TryAllDiscoveredModal';
+import CsvImportModal from '../components/devices/CsvImportModal';
+import BulkTagBar from '../components/devices/BulkTagBar';
+import ColumnPicker from '../components/devices/ColumnPicker';
+import { invalidateDevice } from '../utils/invalidateDevice';
+import { loadColumnPrefs, saveColumnPrefs, visibleColumns, clampWidth, type ColumnPrefs, type DeviceColumnId } from '../utils/deviceColumns';
+import { displayState, STATE_COLOR } from '../utils/deviceState';
+import DeviceTypePill from '../components/devices/DeviceTypePill';
+import SortableHeader, { type SortDir } from '../components/common/SortableHeader';
+import { FilterBar, FilterSearch, FilterSelect } from '../components/common/FilterBar';
 
-type DeviceSortKey = 'name' | 'ip_address' | 'model' | 'serial_number' | 'ros_version' | 'status' | 'last_seen' | 'rack_name' | 'location_address';
+type DeviceSortKey = 'name' | 'ip_address' | 'model' | 'serial_number' | 'ros_version' | 'status' | 'last_seen' | 'rack_name' | 'location_address'
+  | 'device_type' | 'api' | 'login';
 type DiscoveredSortKey = 'identity' | 'address' | 'mac_address' | 'seen_by' | 'discovered_at';
-type SortDir = 'asc' | 'desc';
 
-function SortableHeader({
-  label,
-  active,
-  dir,
-  onClick,
-  align = 'left',
-}: {
-  label: string;
-  active: boolean;
-  dir: SortDir;
-  onClick: () => void;
-  align?: 'left' | 'center' | 'right';
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={clsx(
-        'inline-flex items-center gap-1.5 text-inherit transition-colors',
-        align === 'center' && 'justify-center',
-        align === 'right' && 'justify-end'
-      )}
-      style={{ color: 'inherit' }}
-      onMouseEnter={e => (e.currentTarget.style.color = 'var(--ink)')}
-      onMouseLeave={e => (e.currentTarget.style.color = 'inherit')}
-      title={`Sort by ${label}`}
-    >
-      <span>{label}</span>
-      {active ? (dir === 'asc' ? <ArrowUp className="w-3.5 h-3.5" /> : <ArrowDown className="w-3.5 h-3.5" />) : (
-        <ArrowUpDown className="w-3.5 h-3.5 opacity-50" />
-      )}
-    </button>
-  );
-}
 
-function GlowDot({ status }: { status: Device['status'] }) {
-  const color = status === 'online' ? 'var(--good)' : status === 'offline' ? 'var(--bad)' : 'var(--ink-4)';
+function GlowDot({ device }: { device: Device }) {
+  const state = displayState(device);
+  const color = STATE_COLOR[state];
+  const title = state === 'degraded'
+    ? `Degraded: ${(device.health_issues?.issues ?? []).map((i) => i.message).join(' ')}`
+    : state === 'expected-offline' ? 'Offline, which is expected for this device' : state;
   return (
     <span
+      title={title}
       style={{
         width: 8, height: 8, borderRadius: 999, display: 'inline-block',
         background: color, flexShrink: 0,
-        boxShadow: status === 'online' ? `0 0 0 2px ${color}33, 0 0 8px ${color}88` : 'none',
+        boxShadow: state === 'online' || state === 'degraded' ? `0 0 0 2px ${color}33, 0 0 8px ${color}88` : 'none',
       }}
     />
   );
 }
 
-function TypePill({ type }: { type: Device['device_type'] }) {
-  const map: Record<string, { label: string; color: string }> = {
-    wireless_ap: { label: 'AP',  color: 'var(--info)' },
-    switch:      { label: 'SW',  color: 'var(--accent)' },
-    router:      { label: 'RTR', color: 'var(--violet)' },
-  };
-  const { label, color } = map[type as string] ?? { label: (type as string)?.slice(0, 3)?.toUpperCase() ?? '?', color: 'var(--ink-3)' };
-  return (
-    <span
-      className="mono text-[10.5px] font-medium px-[6px] py-[2px] rounded-full"
-      style={{ color, border: '1px solid var(--line)' }}
-    >
-      {label}
-    </span>
-  );
-}
 
 function CpuValue({ value }: { value: number | undefined }) {
   if (value == null) return <span className="mono text-[11px]" style={{ color: 'var(--ink-4)' }}>—</span>;
@@ -126,11 +93,50 @@ function LoadSparkline({ data }: { data: number[] }) {
   );
 }
 
+/** How the manager reaches a device (#199). */
+type LoginKind = 'password' | 'key' | 'both';
+// SSH only (#174): added before its API was enabled.
+const apiKind = (d: Device): 'ssl' | 'plain' | 'ssh' => (d.ssh_only ? 'ssh' : usesApiTls(d) ? 'ssl' : 'plain');
+/** Stored password, verified SSH key, or both. */
+const loginKind = (d: Device): LoginKind =>
+  d.has_ssh_key ? (d.has_password === false ? 'key' : 'both') : 'password';
+const LOGIN_LABEL: Record<LoginKind, string> = { password: 'PW', key: 'KEY', both: 'PW+KEY' };
+const LOGIN_TITLE: Record<LoginKind, string> = {
+  password: 'Password only: SSH also uses the password',
+  key: 'SSH key only',
+  both: 'Password for the API, verified SSH key for SSH',
+};
+
 export default function DevicesPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const canWrite = useCanWrite();
+  // Hidden and resized columns, remembered in this browser (#283).
+  const [colPrefs, setColPrefs] = useState<ColumnPrefs>(loadColumnPrefs);
+  useEffect(() => { saveColumnPrefs(colPrefs); }, [colPrefs]);
+  const cols = visibleColumns(colPrefs);
+  const startResize = (e: ReactMouseEvent<HTMLSpanElement>, id: DeviceColumnId) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const th = e.currentTarget.parentElement;
+    if (!th) return;
+    const startX = e.clientX;
+    const startW = th.getBoundingClientRect().width;
+    const move = (ev: MouseEvent) => {
+      const w = clampWidth(startW + ev.clientX - startX);
+      setColPrefs((p) => (p.widths[id] === w ? p : { ...p, widths: { ...p.widths, [id]: w } }));
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  };
+  const resetWidth = (id: DeviceColumnId) =>
+    setColPrefs((p) => { const widths = { ...p.widths }; delete widths[id]; return { ...p, widths }; });
   const [showAddModal, setShowAddModal] = useState(false);
+  const [adoptTarget, setAdoptTarget] = useState<AdoptionCandidate | null>(null);
   const [addPrefill, setAddPrefill] = useState<{ name?: string; ip_address?: string } | undefined>();
   const [editDevice, setEditDevice] = useState<Device | null>(null);
   const [search, setSearch] = useState('');
@@ -138,11 +144,18 @@ export default function DevicesPage() {
   const [searching, setSearching] = useState(false);
   const [hideDuplicates, setHideDuplicates] = useState(true);
   const [showTryAllModal, setShowTryAllModal] = useState(false);
+  const [showCsvImport, setShowCsvImport] = useState(false);
+  // Row selection for bulk tagging (#161).
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkLoginOpen, setBulkLoginOpen] = useState(false);
   const [deviceSort, setDeviceSort] = useState<{ key: DeviceSortKey; dir: SortDir }>({ key: 'name', dir: 'asc' });
   // Physical-placement filters (#107). Both are free-form strings on the device, so
   // the options come from what is actually recorded rather than a fixed list.
   const [rackFilter, setRackFilter] = useState('');
   const [locationFilter, setLocationFilter] = useState('');
+  // How the manager reaches each device (#199).
+  const [apiFilter, setApiFilter] = useState<'' | 'ssl' | 'plain' | 'ssh'>('');
+  const [loginFilter, setLoginFilter] = useState<'' | LoginKind>('');
   const [discoveredSort, setDiscoveredSort] = useState<{ key: DiscoveredSortKey; dir: SortDir }>({
     key: 'discovered_at',
     dir: 'desc',
@@ -174,14 +187,48 @@ export default function DevicesPage() {
     refetchInterval: 60_000,
   });
 
+  // Factory-default devices that discovery can see but "Add to Manager" cannot
+  // reach. Keyed by MAC so the discovered list can offer the right action.
+  const { data: adoptionData } = useQuery({
+    queryKey: ['adoption-candidates'],
+    queryFn: () => adoptionApi.candidates().then((r) => r.data),
+    refetchInterval: 60_000,
+  });
+  // Every unmanaged MikroTik, keyed by MAC. Which action to offer comes from
+  // the server's recommendation rather than from reachability: a configured
+  // switch we have no route to is still a configured switch, and adopting it
+  // would rewrite addressing it is already using.
+  const candidateByMac = useMemo(() => {
+    const m = new Map<string, AdoptionCandidate>();
+    for (const c of adoptionData?.candidates ?? []) m.set(c.mac.toUpperCase(), c);
+    return m;
+  }, [adoptionData]);
+
   const { data: allTags = [] } = useQuery({
     queryKey: ['tags'],
     queryFn: () => tagsApi.list().then((r) => r.data),
   });
 
+  // The 30s refetchInterval above eventually catches a background poll's
+  // effect on a device (e.g. a name that follows the router's identity again
+  // after "Use the router's identity"), but a live event means it shows up
+  // immediately instead of leaving that update to the next tick.
+  useSocket({
+    'device:updated': () => queryClient.invalidateQueries({ queryKey: ['devices'] }),
+  });
+
   const syncMutation = useMutation({
     mutationFn: (id: number) => devicesApi.sync(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['devices'] }),
+    // The list, and anything already loaded for that device's page.
+    onSuccess: (_r, id) => { void queryClient.invalidateQueries({ queryKey: ['devices'] }); void invalidateDevice(queryClient, id); },
+  });
+
+  // Reboot from the row (#292), with a confirmation naming the device.
+  const [rowNote, setRowNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const rebootMutation = useMutation({
+    mutationFn: (d: Device) => devicesApi.reboot(d.id).then((r) => ({ d, msg: r.data.message })),
+    onSuccess: ({ d }) => setRowNote({ ok: true, text: `${d.name}: reboot sent. It will be unreachable for a minute or two while it restarts.` }),
+    onError: (e: unknown, d) => setRowNote({ ok: false, text: `${d.name}: ${(e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'reboot failed'}` }),
   });
 
   const deleteMutation = useMutation({
@@ -199,25 +246,21 @@ export default function DevicesPage() {
     () => [...new Set(devices.map(d => d.rack_name).filter(Boolean) as string[])].sort(),
     [devices]);
   const locationOptions = useMemo(
-    () => [...new Set(devices.map(d => d.location_address).filter(Boolean) as string[])].sort(),
+    // Effective location: a device without its own shows under its site's (#167).
+    () => [...new Set(devices.map(d => d.effective_location?.address).filter(Boolean) as string[])].sort(),
     [devices]);
 
-  const cpuHistoryResults = useQueries({
-    queries: devices.map(d => ({
-      queryKey: ['device-resources-history', d.id],
-      queryFn: () => metricsApi.deviceResources(d.id, '1h').then(r => r.data),
-      staleTime: 60_000,
-      enabled: d.status === 'online',
-    })),
+  // One request for every device's sparkline (#302), not one per device.
+  const { data: cpuHistoryAll } = useQuery({
+    queryKey: ['device-cpu-history', '1h'],
+    queryFn: () => metricsApi.cpuHistory('1h').then(r => r.data.devices),
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+    enabled: devices.length > 0,
   });
   const cpuHistories = useMemo(
-    () => Object.fromEntries(
-      devices.map((d, i) => {
-        const pts = cpuHistoryResults[i]?.data ?? [];
-        return [d.id, pts.filter((p: { cpu_load?: number }) => p.cpu_load != null).map((p: { cpu_load?: number }) => p.cpu_load as number)];
-      })
-    ) as Record<number, number[]>,
-    [devices, cpuHistoryResults],
+    () => Object.fromEntries(devices.map(d => [d.id, d.status === 'online' ? (cpuHistoryAll?.[String(d.id)] ?? []) : []])) as Record<number, number[]>,
+    [devices, cpuHistoryAll],
   );
 
   const filtered = useMemo(() => {
@@ -226,12 +269,12 @@ export default function DevicesPage() {
         const q = search.toLowerCase();
         const haystack = [
           d.name, d.ip_address, d.model, d.serial_number,
-          d.location_address, d.rack_name, d.rack_slot,
+          d.effective_location?.address, d.rack_name, d.rack_slot,
         ];
         if (!haystack.some(v => v && String(v).toLowerCase().includes(q))) return false;
       }
       if (rackFilter && d.rack_name !== rackFilter) return false;
-      if (locationFilter && d.location_address !== locationFilter) return false;
+      if (locationFilter && d.effective_location?.address !== locationFilter) return false;
       if (statusFilter === 'online' && d.status !== 'online') return false;
       if (statusFilter === 'offline' && d.status !== 'offline') return false;
       if (statusFilter === 'updates' && !d.firmware_update_available && !d.routerboard_upgrade_available) return false;
@@ -239,6 +282,8 @@ export default function DevicesPage() {
       if (typeFilter === 'SW' && d.device_type !== 'switch') return false;
       if (typeFilter === 'RTR' && d.device_type !== 'router') return false;
       if (tagFilter != null && !d.tags?.some(t => t.id === tagFilter)) return false;
+      if (apiFilter && apiKind(d) !== apiFilter) return false;
+      if (loginFilter && loginKind(d) !== loginFilter) return false;
       return true;
     });
     const sorted = [...base].sort((a, b) => {
@@ -249,10 +294,14 @@ export default function DevicesPage() {
           case 'model': return x.model || '';
           case 'serial_number': return x.serial_number || '';
           case 'rack_name': return x.rack_name || '';
-          case 'location_address': return x.location_address || '';
+          case 'location_address': return x.effective_location?.address || '';
           case 'ros_version': return x.ros_version || '';
           case 'status': return x.status || '';
           case 'last_seen': return x.last_seen ? new Date(x.last_seen).getTime() : 0;
+          // Sortable too (#85): by what the column shows.
+          case 'device_type': return x.device_type || '';
+          case 'api': return apiKind(x);
+          case 'login': return LOGIN_LABEL[loginKind(x)];
           default: return '';
         }
       };
@@ -264,7 +313,16 @@ export default function DevicesPage() {
       return deviceSort.dir === 'asc' ? cmp : -cmp;
     });
     return sorted;
-  }, [devices, search, statusFilter, typeFilter, tagFilter, rackFilter, locationFilter, deviceSort]);
+  }, [devices, search, statusFilter, typeFilter, tagFilter, rackFilter, locationFilter, apiFilter, loginFilter, deviceSort]);
+
+  // Bulk actions only ever apply to devices the operator can see. A selection
+  // made before narrowing the filters must not quietly include hidden rows.
+  const selectedVisible = filtered.filter((d) => selected.has(d.id));
+  const allVisibleSelected = filtered.length > 0 && selectedVisible.length === filtered.length;
+  const toggleSelected = (id: number) =>
+    setSelected((cur) => { const n = new Set(cur); if (n.has(id)) n.delete(id); else n.add(id); return n; });
+  const toggleAllVisible = () =>
+    setSelected(allVisibleSelected ? new Set() : new Set(filtered.map((d) => d.id)));
 
   const discoveredList = discovered as DiscoveredDevice[];
   const duplicateCount = useMemo(
@@ -341,6 +399,14 @@ export default function DevicesPage() {
               {searching ? 'Searching…' : 'Discover'}
             </button>
             <button
+              onClick={() => setShowCsvImport(true)}
+              className="btn-secondary flex items-center gap-2 text-[12px] py-[6px]"
+              title="Add many devices from a CSV file"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              Import CSV
+            </button>
+            <button
               onClick={() => { setAddPrefill(undefined); setShowAddModal(true); }}
               className="btn-primary flex items-center gap-2 text-[12px] py-[6px]"
             >
@@ -351,56 +417,61 @@ export default function DevicesPage() {
         )}
       </div>
 
-      {/* Filter bar */}
-      <div className="card-subtle flex flex-wrap items-center gap-[6px] p-[6px]">
-        <div className="flex items-center gap-2 flex-1 min-w-[160px] px-[10px] py-[6px]" style={{ color: 'var(--ink-3)' }}>
-          <Search className="w-3.5 h-3.5 flex-shrink-0" />
-          <input
-            type="text"
-            className="bg-transparent text-[13px] outline-none w-full"
-            style={{ color: 'var(--ink)' }}
-            placeholder="Filter devices…"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-          />
+      {rowNote && (
+        <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]"
+          style={{ background: rowNote.ok ? 'var(--good-bg)' : 'var(--bad-bg, #fee2e2)', color: rowNote.ok ? 'var(--good)' : 'var(--bad)' }}>
+          <Power className="w-3.5 h-3.5" /><span className="flex-1">{rowNote.text}</span>
+          <button type="button" onClick={() => setRowNote(null)} className="text-[11px]" style={{ opacity: 0.7 }}>Dismiss</button>
         </div>
+      )}
+
+      {/* Filter bar */}
+      <FilterBar>
+        <FilterSearch value={search} onChange={setSearch} placeholder="Filter devices…" />
         {/* Placement filters — only offered when placement is actually recorded (#107) */}
         {rackOptions.length > 0 && (
-          <select
-            value={rackFilter}
-            onChange={e => setRackFilter(e.target.value)}
-            className="mono text-[11.5px] px-[8px] py-[4px] rounded-[5px] bg-transparent outline-none"
-            style={{ color: rackFilter ? 'var(--ink)' : 'var(--ink-3)', border: '1px solid var(--line)' }}
-          >
+          <FilterSelect value={rackFilter} onChange={setRackFilter} title="Rack">
             <option value="">All racks</option>
             {rackOptions.map(r => <option key={r} value={r}>{r}</option>)}
-          </select>
+          </FilterSelect>
         )}
         {locationOptions.length > 0 && (
-          <select
-            value={locationFilter}
-            onChange={e => setLocationFilter(e.target.value)}
-            className="text-[11.5px] px-[8px] py-[4px] rounded-[5px] bg-transparent outline-none max-w-[180px]"
-            style={{ color: locationFilter ? 'var(--ink)' : 'var(--ink-3)', border: '1px solid var(--line)' }}
-          >
+          <FilterSelect value={locationFilter} onChange={setLocationFilter} title="Location" className="max-w-[180px]">
             <option value="">All locations</option>
             {locationOptions.map(l => <option key={l} value={l}>{l}</option>)}
-          </select>
+          </FilterSelect>
         )}
-        {(['all', 'online', 'offline', 'updates'] as const).map(f => (
+        <FilterSelect value={apiFilter} onChange={v => setApiFilter(v as '' | 'ssl' | 'plain' | 'ssh')} title="How the manager connects to the device">
+          <option value="">Any API</option>
+          <option value="ssl">API-SSL</option>
+          <option value="plain">Plain API</option>
+          <option value="ssh">SSH only (API off)</option>
+        </FilterSelect>
+        <FilterSelect value={loginFilter} onChange={v => setLoginFilter(v as '' | LoginKind)} title="Which credentials the manager has for the device">
+          <option value="">Any login</option>
+          <option value="password">Password only</option>
+          <option value="key">SSH key only</option>
+          <option value="both">Password + SSH key</option>
+        </FilterSelect>
+        {(['all', 'online', 'offline', 'updates'] as const).map(f => {
+          // "All" clears the AP/SW/RTR filter too, and only reads as selected
+          // when nothing is filtered by status or type (#85).
+          const active = f === 'all' ? statusFilter === 'all' && !typeFilter : statusFilter === f;
+          return (
           <button
             key={f}
-            onClick={() => setStatusFilter(f)}
+            onClick={() => { setStatusFilter(f); if (f === 'all') setTypeFilter(null); }}
             className="mono text-[11.5px] px-[10px] py-[4px] rounded-[5px] transition-colors capitalize"
             style={{
-              background: statusFilter === f ? 'var(--surface-3)' : 'transparent',
-              color: statusFilter === f ? 'var(--ink)' : 'var(--ink-3)',
+              background: active ? 'var(--surface-3)' : 'transparent',
+              color: active ? 'var(--ink)' : 'var(--ink-3)',
               border: 'none',
             }}
           >
             {f}
           </button>
-        ))}
+          );
+        })}
         <div className="w-px h-[18px] mx-1" style={{ background: 'var(--line)' }} />
         {(['AP', 'SW', 'RTR'] as const).map(t => {
           const colors: Record<string, string> = { AP: 'var(--info)', SW: 'var(--accent)', RTR: 'var(--violet)' };
@@ -408,6 +479,8 @@ export default function DevicesPage() {
             <button
               key={t}
               onClick={() => setTypeFilter(typeFilter === t ? null : t)}
+              title={typeFilter === t ? 'Show every type' : `Show only ${t === 'AP' ? 'access points' : t === 'SW' ? 'switches' : 'routers'}`}
+              aria-pressed={typeFilter === t}
               className="mono text-[11px] px-[8px] py-[4px] rounded-[5px] transition-colors"
               style={{
                 background: typeFilter === t ? 'var(--surface-3)' : 'transparent',
@@ -422,20 +495,18 @@ export default function DevicesPage() {
         {allTags.length > 0 && (
           <>
             <div className="w-px h-[18px] mx-1" style={{ background: 'var(--line)' }} />
-            <select
-              value={tagFilter ?? ''}
-              onChange={e => setTagFilter(e.target.value ? parseInt(e.target.value, 10) : null)}
-              className="mono text-[11px] px-[8px] py-[4px] rounded-[5px] transition-colors"
-              style={{ background: 'var(--surface-2)', color: 'var(--ink-3)', border: '1px solid var(--line)' }}
-            >
+            <FilterSelect value={tagFilter != null ? String(tagFilter) : ''} onChange={v => setTagFilter(v ? parseInt(v, 10) : null)} title="Tag">
               <option value="">All tags</option>
               {allTags.map(t => (
                 <option key={t.id} value={t.id}>{t.name}</option>
               ))}
-            </select>
+            </FilterSelect>
           </>
         )}
-      </div>
+        <div className="ml-auto">
+          <ColumnPicker prefs={colPrefs} onChange={setColPrefs} />
+        </div>
+      </FilterBar>
 
       {/* Device table */}
       {isLoading ? (
@@ -456,39 +527,63 @@ export default function DevicesPage() {
         </div>
       ) : (
         <div className="card overflow-hidden">
+          {canWrite && selectedVisible.length > 0 && (
+            <BulkTagBar
+              devices={selectedVisible}
+              tags={allTags}
+              onClear={() => setSelected(new Set())}
+              onChangeLogin={() => setBulkLoginOpen(true)}
+            />
+          )}
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--line)' }}>
-                  {[
-                    { key: null,         label: '',           w: 22  },
-                    { key: 'name',       label: 'DEVICE',     w: null },
-                    { key: null,         label: 'TYPE',       w: 72  },
-                    { key: 'model',      label: 'MODEL',      w: null },
-                    { key: 'serial_number', label: 'SERIAL',  w: 130  },
-                    { key: 'rack_name',  label: 'RACK',       w: 100  },
-                    { key: 'ip_address', label: 'IP ADDRESS', w: null },
-                    { key: 'ros_version',label: 'ROS',        w: 110 },
-                    { key: null,         label: 'CPU',        w: 110 },
-                    { key: null,         label: 'LOAD',       w: 100 },
-                    { key: 'last_seen',  label: 'SEEN',       w: 90  },
-                    { key: null,         label: '',           w: 56  },
-                  ].map(({ key, label, w }, i) => (
-                    <th
-                      key={i}
-                      className="table-header px-4 py-[10px] text-left"
-                      style={w ? { width: w } : undefined}
-                    >
-                      {key ? (
-                        <SortableHeader
-                          label={label}
-                          active={deviceSort.key === key as DeviceSortKey}
-                          dir={deviceSort.dir}
-                          onClick={() => flipSort(deviceSort, key as DeviceSortKey, setDeviceSort)}
-                        />
-                      ) : label}
+                  {canWrite && (
+                    <th className="pl-4 pr-0 py-[10px]" style={{ width: 28 }}>
+                      <input
+                        type="checkbox"
+                        aria-label="Select all shown devices"
+                        checked={allVisibleSelected}
+                        ref={(el) => { if (el) el.indeterminate = selectedVisible.length > 0 && !allVisibleSelected; }}
+                        onChange={toggleAllVisible}
+                      />
                     </th>
-                  ))}
+                  )}
+                  {cols.map((c) => {
+                    const w = colPrefs.widths[c.id] ?? c.width;
+                    const resizable = c.id !== 'status' && c.id !== 'actions';
+                    return (
+                      <th
+                        key={c.id}
+                        className="table-header px-4 py-[10px] text-left relative"
+                        style={w ? { width: w } : undefined}
+                      >
+                        {c.sortKey ? (
+                          <SortableHeader
+                            label={c.label}
+                            active={deviceSort.key === c.sortKey as DeviceSortKey}
+                            dir={deviceSort.dir}
+                            onClick={() => flipSort(deviceSort, c.sortKey as DeviceSortKey, setDeviceSort)}
+                          />
+                        ) : c.label}
+                        {/* Drag to resize, double-click to reset this column (#283). */}
+                        {resizable && (
+                          <span
+                            role="separator"
+                            aria-orientation="vertical"
+                            aria-label={`Resize ${c.label || c.id} column`}
+                            title="Drag to resize; double-click to reset"
+                            onMouseDown={(e) => startResize(e, c.id)}
+                            onDoubleClick={() => resetWidth(c.id)}
+                            onClick={(e) => e.stopPropagation()}
+                            className="absolute top-0 right-0 h-full w-[6px] cursor-col-resize select-none"
+                            style={{ borderRight: colPrefs.widths[c.id] ? '2px solid var(--line)' : undefined }}
+                          />
+                        )}
+                      </th>
+                    );
+                  })}
                 </tr>
               </thead>
               <tbody>
@@ -505,56 +600,103 @@ export default function DevicesPage() {
                       onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
                       onClick={() => navigate(`/devices/${device.id}`)}
                     >
-                      <td className="px-4 py-[12px]">
-                        <GlowDot status={device.status} />
-                      </td>
-                      <td className="px-4 py-[12px]">
-                        <div className="text-[13px] font-medium" style={{ color: 'var(--ink)' }}>{device.name}</div>
-                        {device.tags && device.tags.length > 0 && (
-                          <div className="flex flex-wrap gap-1 mt-1">
-                            {device.tags.map(tag => (
-                              <span
-                                key={tag.id}
-                                className="text-[10px] px-[5px] py-[1px] rounded-full font-medium"
-                                style={{ background: tag.color + '33', color: tag.color, border: `1px solid ${tag.color}55` }}
-                              >
-                                {tag.name}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </td>
-                      <td className="px-4 py-[12px]">
-                        <TypePill type={device.device_type} />
-                      </td>
-                      <td className="px-4 py-[12px]">
+                      {canWrite && (
+                        <td className="pl-4 pr-0 py-[12px]" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${device.name}`}
+                            checked={selected.has(device.id)}
+                            onChange={() => toggleSelected(device.id)}
+                          />
+                        </td>
+                      )}
+                      {(() => {
+                        const cell: Record<DeviceColumnId, ReactNode> = {
+                        status: (
+                          <>
+                        <GlowDot device={device} />
+                          </>
+                        ),
+                        device: (
+                          <>
+                        {/* Beside the name rather than beneath it: a second line per
+                            row doubles the table's height for the few rows that
+                            carry tags, and misaligns them with the rest (#149).
+                            flex-wrap keeps a long tag list from pushing the name
+                            off the row on narrow screens. */}
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="cell-primary">{device.name}</span>
+                          {device.tags?.map(tag => (
+                            <span
+                              key={tag.id}
+                              className="text-[10px] px-[5px] py-[1px] rounded-full font-medium"
+                              style={{ background: tag.color + '33', color: tag.color, border: `1px solid ${tag.color}55` }}
+                            >
+                              {tag.name}
+                            </span>
+                          ))}
+                        </div>
+                          </>
+                        ),
+                        type: (
+                          <>
+                        <DeviceTypePill type={device.device_type} />
+                          </>
+                        ),
+                        model: (
+                          <>
                         <span className="mono text-[11.5px]" style={{ color: 'var(--ink-2)' }}>{device.model || '—'}</span>
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        serial: (
+                          <>
                         <span
                           className="mono text-[11.5px] block truncate"
-                          style={{ color: 'var(--ink-3)', maxWidth: 130 }}
+                          style={{ color: 'var(--ink-3)', maxWidth: colPrefs.widths.serial ?? 130 }}
                           title={device.serial_number || undefined}
                         >
                           {device.serial_number || '—'}
                         </span>
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        rack: (
+                          <>
                         <span
                           className="text-[11.5px] block truncate"
-                          style={{ color: 'var(--ink-3)', maxWidth: 100 }}
-                          title={[device.rack_name, device.rack_slot && `slot ${device.rack_slot}`, device.location_address]
+                          style={{ color: 'var(--ink-3)', maxWidth: colPrefs.widths.rack ?? 100 }}
+                          title={[device.rack_name, device.rack_slot && `slot ${device.rack_slot}`, device.effective_location?.address]
                             .filter(Boolean).join(' · ') || undefined}
                         >
                           {device.rack_name
                             ? `${device.rack_name}${device.rack_slot ? `/${device.rack_slot}` : ''}`
                             : '—'}
                         </span>
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        ip: (
+                          <>
                         <span className="mono num-tab text-[12px]" style={{ color: 'var(--ink-2)' }}>{device.ip_address}</span>
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        api: (
+                          <>
+                        {device.ssh_only
+                          ? <span className="mono text-[11px]" style={{ color: 'var(--warn)' }}
+                              title={`Added over SSH only: the API isn't enabled yet.${device.api_check_error ? ` ${device.api_check_error}` : ''}`}>SSH ONLY</span>
+                          : apiKind(device) === 'ssl'
+                          ? <span className="mono text-[11px]" style={{ color: 'var(--ok, #16a34a)' }} title={`Managed over API-SSL (port ${device.api_port})`}>SSL</span>
+                          : <span className="mono text-[11px]" style={{ color: 'var(--warn)' }} title="Managed over the plain, unencrypted API">PLAIN</span>}
+                          </>
+                        ),
+                        login: (
+                          <>
+                        <span className="mono text-[11px]" style={{ color: 'var(--ink-2)' }} title={LOGIN_TITLE[loginKind(device)]}>
+                          {LOGIN_LABEL[loginKind(device)]}
+                        </span>
+                          </>
+                        ),
+                        ros: (
+                          <>
                         <span
                           className="mono text-[11.5px] flex items-center gap-[4px]"
                           style={{ color: device.firmware_update_available || device.routerboard_upgrade_available ? 'var(--warn)' : 'var(--ink-3)' }}
@@ -567,21 +709,29 @@ export default function DevicesPage() {
                           )}
                           {device.ros_version || '—'}
                         </span>
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        cpu: (
+                          <>
                         <CpuValue value={(() => { const arr = cpuHistories[device.id]; return arr && arr.length > 0 ? arr[arr.length - 1] : undefined; })()} />
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        load: (
+                          <>
                         <LoadSparkline data={cpuSpark} />
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        seen: (
+                          <>
                         <span className="mono text-[11px]" style={{ color: 'var(--ink-3)' }}>
                           {device.last_seen
                             ? new Date(device.last_seen).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
                             : '—'}
                         </span>
-                      </td>
-                      <td className="px-4 py-[12px]">
+                          </>
+                        ),
+                        actions: (
+                          <>
                         <div
                           className="flex items-center justify-end gap-1"
                           onClick={e => e.stopPropagation()}
@@ -599,6 +749,24 @@ export default function DevicesPage() {
                               >
                                 <RefreshCw className={clsx('w-3.5 h-3.5', syncMutation.isPending && 'animate-spin')} />
                               </button>
+                              {!device.ssh_only && (
+                                <button
+                                  onClick={() => {
+                                    if (confirm(`Reboot ${device.name}? It will be unreachable for a minute or two while it restarts.`)) {
+                                      setRowNote(null);
+                                      rebootMutation.mutate(device);
+                                    }
+                                  }}
+                                  disabled={rebootMutation.isPending && rebootMutation.variables?.id === device.id}
+                                  className="p-1.5 rounded transition-colors disabled:opacity-40"
+                                  style={{ color: 'var(--ink-4)' }}
+                                  title="Reboot"
+                                  onMouseEnter={e => (e.currentTarget.style.color = 'var(--warn)')}
+                                  onMouseLeave={e => (e.currentTarget.style.color = 'var(--ink-4)')}
+                                >
+                                  <Power className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                               <button
                                 onClick={() => setEditDevice(device)}
                                 className="p-1.5 rounded transition-colors"
@@ -638,7 +806,19 @@ export default function DevicesPage() {
                           )}
                           <ChevronRight className="w-4 h-4" style={{ color: 'var(--ink-4)' }} />
                         </div>
-                      </td>
+                          </>
+                        ),
+                        };
+                        return cols.map((c) => {
+                          const w = colPrefs.widths[c.id];
+                          return (
+                            <td key={c.id} className="px-4 py-[12px]">
+                              {/* A dragged width also caps the content, so a column can shrink below it. */}
+                              {w ? <div style={{ maxWidth: w, overflow: 'hidden' }}>{cell[c.id]}</div> : cell[c.id]}
+                            </td>
+                          );
+                        });
+                      })()}
                     </tr>
                   );
                 })}
@@ -766,18 +946,40 @@ export default function DevicesPage() {
                       </span>
                     </td>
                     <td className="px-4 py-[11px]">
-                      {canWrite && d.duplicate_of_device_id == null && (
-                        <button
-                          onClick={() => {
-                            setAddPrefill({ name: d.identity || '', ip_address: d.address });
-                            setShowAddModal(true);
-                          }}
-                          className="btn-primary text-[12px] py-[5px] px-3 flex items-center gap-1"
-                        >
-                          <Plus className="w-3 h-3" />
-                          Add to Manager
-                        </button>
-                      )}
+                      {canWrite && d.duplicate_of_device_id == null && (() => {
+                        // One action. The system has already seen the address
+                        // and identity, so deciding new-versus-established is
+                        // its job, not something to make the operator diagnose
+                        // before they can click anything. The dialog says what
+                        // it found and lets them overrule it.
+                        const cand = candidateByMac.get((d.mac_address || '').toUpperCase());
+                        return (
+                          <button
+                            onClick={() => setAdoptTarget(
+                              cand ?? {
+                                // Not a MikroTik neighbour we can profile, so
+                                // fall through to registering it as-is.
+                                mac: d.mac_address || '',
+                                address: d.address || '',
+                                identity: d.identity || null,
+                                seenBy: [],
+                                factoryDefault: false,
+                                reachableDirectly: true,
+                                recommendation: {
+                                  mode: 'add',
+                                  confidence: 'high',
+                                  reasons: ['not a MikroTik neighbour we can inspect before connecting'],
+                                },
+                              }
+                            )}
+                            className="btn-primary text-[12px] py-[5px] px-3 flex items-center gap-1"
+                            title={cand?.recommendation.reasons.join(' · ')}
+                          >
+                            <ShieldQuestion className="w-3 h-3" />
+                            Adopt Device
+                          </button>
+                        );
+                      })()}
                     </td>
                   </tr>
                 ))}
@@ -787,6 +989,22 @@ export default function DevicesPage() {
           </div>
           )}
         </div>
+      )}
+
+      {adoptTarget && (
+        <AdoptDeviceModal
+          candidate={adoptTarget}
+          discovered={discovered?.find(
+            (x) => (x.mac_address || '').toUpperCase() === adoptTarget.mac.toUpperCase()
+          )}
+          onClose={() => setAdoptTarget(null)}
+          onSuccess={() => {
+            setAdoptTarget(null);
+            queryClient.invalidateQueries({ queryKey: ['devices'] });
+            queryClient.invalidateQueries({ queryKey: ['devices-discovered'] });
+            queryClient.invalidateQueries({ queryKey: ['adoption-candidates'] });
+          }}
+        />
       )}
 
       {showAddModal && (
@@ -801,6 +1019,10 @@ export default function DevicesPage() {
         />
       )}
 
+      {bulkLoginOpen && (
+        <BulkCredentialsModal devices={selectedVisible} onClose={() => setBulkLoginOpen(false)} />
+      )}
+
       {editDevice && (
         <EditDeviceModal
           device={editDevice}
@@ -810,6 +1032,14 @@ export default function DevicesPage() {
             queryClient.invalidateQueries({ queryKey: ['devices'] });
             queryClient.invalidateQueries({ queryKey: ['devices-discovered'] });
           }}
+        />
+      )}
+
+      {showCsvImport && (
+        <CsvImportModal
+          existingAddresses={(devices as Device[]).map((d) => d.ip_address)}
+          onClose={() => setShowCsvImport(false)}
+          onSuccess={() => queryClient.invalidateQueries({ queryKey: ['devices'] })}
         />
       )}
 

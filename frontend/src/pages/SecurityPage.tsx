@@ -1,14 +1,21 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import LoadError from '../components/common/LoadError';
 import { useNavigate } from 'react-router-dom';
 import {
   Shield, ShieldCheck, ShieldAlert, RefreshCw, ChevronDown, ChevronRight,
-  Gauge, Server, AlertTriangle, ListChecks,
+  Gauge, Server, AlertTriangle, ListChecks, KeyRound,
 } from 'lucide-react';
-import { devicesApi } from '../services/api';
+import { devicesApi, certificatesApi, operationsApi } from '../services/api';
+import { activeChecks, countFindings, mutedCount } from '../utils/securityFindings';
 import type { SecurityCheck } from '../services/api';
 import type { Device } from '../types';
 import clsx from 'clsx';
+import CertificateList from '../components/CertificateList';
+import RouterOsCveCard from '../components/security/RouterOsCveCard';
+import ApiSslCard from '../components/security/ApiSslCard';
+import { useCanWrite } from '../hooks/useCanWrite';
+import { PendingIdentityCard } from '../components/security/IdentityChange';
 
 interface DevicePosture {
   id: number; name: string; ip_address: string; device_type?: string;
@@ -49,6 +56,17 @@ function Kpi({ icon: Icon, label, value, accent, valueClass }: {
 export default function SecurityPage() {
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState<number | null>(null);
+  const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
+
+  const { data: certData, isLoading: certLoading, isError: certError, error: certErr } = useQuery({
+    queryKey: ['fleet-certificates'],
+    queryFn: () => certificatesApi.list().then((r) => r.data),
+    staleTime: 60_000,
+  });
+  // From the server, which decides it with the same function that decides
+  // whether an alert is sent. Recomputing the list of "bad" states here meant
+  // adding a state elsewhere silently changed this number's meaning.
+  const badCount = certData?.attentionCount ?? 0;
 
   const { data: devices = [] } = useQuery({
     queryKey: ['devices'],
@@ -58,39 +76,118 @@ export default function SecurityPage() {
   const online = (devices as Device[]).filter(d => d.status === 'online');
   const onlineKey = online.map(d => d.id).join(',');
 
-  const { data: fleet = [], isLoading, refetch, isFetching } = useQuery({
-    queryKey: ['security-fleet', onlineKey],
-    queryFn: async (): Promise<DevicePosture[]> => {
-      const results = await Promise.allSettled(
-        online.map(async (d) => {
-          const r = await devicesApi.getSecurityPosture(d.id);
-          return { id: d.id, name: d.name, ip_address: d.ip_address, device_type: d.device_type, score: r.data.score, checks: r.data.checks };
-        })
-      );
-      return results.map((r, i) =>
-        r.status === 'fulfilled' ? r.value
-          : { id: online[i].id, name: online[i].name, ip_address: online[i].ip_address, device_type: online[i].device_type, score: null, checks: [], error: (r.reason as Error)?.message });
-    },
+  // From the server's cache of each device's checks, refreshed a few devices
+  // at a time, rather than asking every online device on every load: on a
+  // large fleet that was hundreds of connections per page view (#302).
+  // "Re-scan fleet" reads every device again, still a few at a time.
+  const [rescan, setRescan] = useState(0);
+  const { data: postureData, isLoading, isFetching, isError: fleetError, error: fleetErr } = useQuery({
+    queryKey: ['security-fleet', onlineKey, rescan],
+    queryFn: () => operationsApi.securityPosture(rescan > 0).then((r) => r.data),
     enabled: online.length > 0,
-    refetchInterval: 120_000,
+    refetchInterval: (q) => ((q.state.data?.refreshing ?? 0) > 0 ? 5_000 : 120_000),
   });
+  const fleet: DevicePosture[] = (postureData?.devices ?? []).map((d) => ({
+    id: d.id, name: d.name, ip_address: d.ip_address ?? '', device_type: d.device_type ?? 'router',
+    score: d.score, checks: d.checks, ...(d.error ? { error: d.error } : {}),
+  }));
 
   const scored = fleet.filter(f => f.score !== null);
   const avgScore = scored.length ? Math.round(scored.reduce((s, f) => s + (f.score ?? 0), 0) / scored.length) : null;
-  const totalFindings = fleet.reduce((s, f) => s + f.checks.length, 0);
-  const highCount = fleet.reduce((s, f) => s + f.checks.filter(c => c.severity === 'high').length, 0);
+  // Muted findings are excluded from every count here. They are still rendered,
+  // greyed and labelled "not counted" — which is precisely what the numbers used
+  // to contradict (#157).
+  const totalFindings = fleet.reduce((s, f) => s + countFindings(f.checks).total, 0);
+  const highCount = fleet.reduce((s, f) => s + countFindings(f.checks).high, 0);
+  const totalMuted = fleet.reduce((s, f) => s + mutedCount(f.checks), 0);
 
   // Aggregate identical findings across the fleet ("telnet enabled — 3 devices").
   const commonFindings = (() => {
-    const m = new Map<string, { title: string; severity: string; count: number }>();
-    for (const f of fleet) for (const c of f.checks) {
-      const e = m.get(c.title) ?? { title: c.title, severity: c.severity, count: 0 };
-      e.count++; m.set(c.title, e);
+    // Device names, not just a tally. A count with no way to find out *which*
+    // devices is a dead end — the card told you six devices needed an update and
+    // then left you to work out which six (#158).
+    const m = new Map<string, { title: string; severity: string; devices: string[]; deviceIds: number[]; fix?: SecurityCheck['fix'] }>();
+    for (const f of fleet) for (const c of activeChecks(f.checks)) {
+      const e = m.get(c.title) ?? { title: c.title, severity: c.severity, devices: [], deviceIds: [], fix: c.fix };
+      e.devices.push(f.name);
+      e.deviceIds.push(f.id);
+      m.set(c.title, e);
     }
-    return [...m.values()].sort((a, b) => (SEV_ORDER[a.severity] - SEV_ORDER[b.severity]) || (b.count - a.count));
+    return [...m.values()].sort(
+      (a, b) => (SEV_ORDER[a.severity] - SEV_ORDER[b.severity]) || (b.devices.length - a.devices.length)
+    );
   })();
 
   const goManage = (id: number) => navigate(`/devices/${id}?tab=security`);
+
+  // WebFig to HTTPS for every device a finding names (#234), one at a time:
+  // each may create and sign a certificate on its device.
+  const canWrite = useCanWrite();
+  const qc = useQueryClient();
+  const [httpsRun, setHttpsRun] = useState<{ running: boolean; results: { name: string; ok: boolean; message: string }[] } | null>(null);
+  const switchAllToHttps = async (ids: number[]) => {
+    const names = new Map(fleet.map((f) => [f.id, f.name.trim()]));
+    setHttpsRun({ running: true, results: [] });
+    for (const id of ids) {
+      let r: { name: string; ok: boolean; message: string };
+      try {
+        const res = await devicesApi.enableWwwSsl(id);
+        r = { name: names.get(id) ?? `#${id}`, ok: res.data.switched, message: res.data.message };
+      } catch (err) {
+        r = { name: names.get(id) ?? `#${id}`, ok: false,
+          message: (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Could not switch WebFig to HTTPS' };
+      }
+      setHttpsRun((cur) => ({ running: true, results: [...(cur?.results ?? []), r] }));
+    }
+    setHttpsRun((cur) => ({ running: false, results: cur?.results ?? [] }));
+    void qc.invalidateQueries({ queryKey: ['security-fleet'] });
+  };
+
+  // RoMON to each device's site setting (#311), one device at a time.
+  const [romonRun, setRomonRun] = useState<{ running: boolean; results: { name: string; ok: boolean; message: string }[] } | null>(null);
+  const applyRomonAll = async (ids: number[]) => {
+    if (!window.confirm(`Apply the RoMON setting on ${ids.length} device${ids.length === 1 ? '' : 's'}? Each gets its site's setting (on, with its secret if one is set).`)) return;
+    const names = new Map(fleet.map((f) => [f.id, f.name.trim()]));
+    setRomonRun({ running: true, results: [] });
+    for (const id of ids) {
+      let r: { name: string; ok: boolean; message: string };
+      try {
+        const res = await devicesApi.applyRomon(id);
+        r = { name: names.get(id) ?? `#${id}`, ok: true, message: res.data.message };
+      } catch (err) {
+        r = { name: names.get(id) ?? `#${id}`, ok: false,
+          message: (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Could not apply the RoMON setting' };
+      }
+      setRomonRun((cur) => ({ running: true, results: [...(cur?.results ?? []), r] }));
+    }
+    setRomonRun((cur) => ({ running: false, results: cur?.results ?? [] }));
+    void qc.invalidateQueries({ queryKey: ['security-fleet'] });
+  };
+
+  // Turn plain API off across the fleet (#201), one device at a time. Each is
+  // checked first (API-SSL login works, nothing else on plain API); a device
+  // where Change Guard predicts trouble is skipped for doing by hand.
+  const [apiOffRun, setApiOffRun] = useState<{ running: boolean; results: { name: string; ok: boolean; message: string }[] } | null>(null);
+  const turnOffPlainApi = async (ids: number[]) => {
+    const names = new Map(fleet.map((f) => [f.id, f.name.trim()]));
+    setApiOffRun({ running: true, results: [] });
+    for (const id of ids) {
+      const name = names.get(id) ?? `#${id}`;
+      let r: { name: string; ok: boolean; message: string };
+      try {
+        const res = await devicesApi.disablePlainApi(id);
+        r = { name, ok: true, message: res.data.message };
+      } catch (err) {
+        const data = (err as { response?: { data?: { error?: string; reason?: string; verdict?: unknown } } })?.response?.data;
+        r = { name, ok: false, message: data?.verdict
+          ? 'Skipped: Change Guard predicts a problem with this one; turn it off from the device\u2019s Security tab to see why.'
+          : data?.error || data?.reason || 'Could not turn plain API off' };
+      }
+      setApiOffRun((cur) => ({ running: true, results: [...(cur?.results ?? []), r] }));
+    }
+    setApiOffRun((cur) => ({ running: false, results: cur?.results ?? [] }));
+    void qc.invalidateQueries({ queryKey: ['security-fleet'] });
+  };
 
   return (
     <div className="space-y-6">
@@ -100,7 +197,7 @@ export default function SecurityPage() {
           <h1 className="text-xl font-bold text-gray-900 dark:text-white flex items-center gap-2"><Shield className="w-5 h-5 text-blue-500" /> Security</h1>
           <p className="text-sm text-gray-500 dark:text-slate-400">Fleet-wide firewall posture and access control</p>
         </div>
-        <button onClick={() => refetch()} disabled={isFetching} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-300 dark:border-slate-600 text-sm text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors">
+        <button onClick={() => setRescan((n) => n + 1)} disabled={isFetching} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-300 dark:border-slate-600 text-sm text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors">
           <RefreshCw className={clsx('w-3.5 h-3.5', isFetching && 'animate-spin')} /> Re-scan fleet
         </button>
       </div>
@@ -111,17 +208,26 @@ export default function SecurityPage() {
           value={avgScore ?? '—'} valueClass={scoreColor(avgScore)} />
         <Kpi icon={Server} label="Devices scanned" accent="bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400"
           value={<>{scored.length}<span className="text-sm font-normal text-gray-400">/{online.length}</span></>} />
+        {/* Muted findings are excluded and reported separately rather than
+            folded in silently — this card used to include them (#157). */}
         <Kpi icon={ShieldAlert} label="Total findings" accent="bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400"
-          value={totalFindings} />
+          value={<>{totalFindings}{totalMuted > 0 && <span className="text-sm font-normal text-gray-400"> +{totalMuted} muted</span>}</>} />
         <Kpi icon={AlertTriangle} label="High severity" accent={highCount > 0 ? 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400' : 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'}
           value={highCount} valueClass={highCount > 0 ? 'text-red-600 dark:text-red-400' : 'text-green-600 dark:text-green-400'} />
       </div>
 
-      {/* Main: posture list (wide) + common findings (narrow) */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
+      <PendingIdentityCard />
+
+      <ApiSslCard />
+
+      <RouterOsCveCard />
+
+      {/* Every card the full width, one per row. Long lists are capped and scroll
+          inside their card, so a fleet of hundreds doesn't stretch the page. */}
+      <div className="space-y-6">
         {/* Fleet posture */}
-        <div className="card overflow-hidden xl:col-span-2">
-          <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2">
+        <div className="card overflow-hidden flex flex-col max-h-[560px]">
+          <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2 shrink-0">
             <ShieldCheck className="w-4 h-4 text-green-500" />
             <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Fleet Security Posture</h2>
           </div>
@@ -130,12 +236,11 @@ export default function SecurityPage() {
           ) : online.length === 0 ? (
             <div className="p-8 text-center text-sm text-gray-400">No online devices to scan.</div>
           ) : (
-            <div className="divide-y divide-gray-100 dark:divide-slate-700">
+            <div className="divide-y divide-gray-100 dark:divide-slate-700 flex-1 min-h-0 overflow-y-auto">
               {fleet.map(f => {
                 const open = expanded === f.id;
-                const highs = f.checks.filter(c => c.severity === 'high').length;
-                const meds = f.checks.filter(c => c.severity === 'medium').length;
-                const lows = f.checks.filter(c => c.severity === 'low').length;
+                const { high: highs, medium: meds, low: lows } = countFindings(f.checks);
+                const muted = mutedCount(f.checks);
                 return (
                   <div key={f.id}>
                     <div className="flex items-center gap-3 px-5 py-3 hover:bg-gray-50 dark:hover:bg-slate-700/30">
@@ -146,13 +251,19 @@ export default function SecurityPage() {
                           <div className="text-sm font-medium text-gray-900 dark:text-white truncate">{f.name}</div>
                           <div className="text-xs text-gray-400 font-mono">{f.ip_address}</div>
                         </div>
-                        {f.error ? <span className="text-xs text-red-500">{f.error}</span> : f.checks.length === 0 ? (
-                          <span className="inline-flex items-center gap-1 text-xs text-green-600 dark:text-green-400"><ShieldCheck className="w-3.5 h-3.5" /> Clean</span>
+                        {f.error ? <span className="text-xs text-red-500">{f.error}</span> : highs + meds + lows === 0 ? (
+                          // Clean means nothing *counts*, not nothing exists. A
+                          // device whose only findings are muted used to show
+                          // badges for them (#157).
+                          <span className="inline-flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                            <ShieldCheck className="w-3.5 h-3.5" /> Clean{muted > 0 ? ` · ${muted} muted` : ''}
+                          </span>
                         ) : (
                           <div className="flex items-center gap-1.5 flex-shrink-0">
                             {highs > 0 && <span className={clsx('text-xs px-1.5 py-0.5 rounded font-medium', SEV_BADGE.high)}>{highs} high</span>}
                             {meds > 0 && <span className={clsx('text-xs px-1.5 py-0.5 rounded font-medium', SEV_BADGE.medium)}>{meds} med</span>}
                             {lows > 0 && <span className={clsx('text-xs px-1.5 py-0.5 rounded font-medium', SEV_BADGE.low)}>{lows} low</span>}
+                            {muted > 0 && <span className="text-xs px-1.5 py-0.5 rounded font-medium" style={{ background: 'var(--surface-2)', color: 'var(--ink-4)' }}>{muted} muted</span>}
                           </div>
                         )}
                       </button>
@@ -176,28 +287,136 @@ export default function SecurityPage() {
         </div>
 
         {/* Common findings across the fleet */}
-        <div className="card overflow-hidden">
-          <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2">
+        <div className="card overflow-hidden flex flex-col max-h-[560px]">
+          <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2 shrink-0">
             <ListChecks className="w-4 h-4 text-indigo-500" />
             <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Common Findings</h2>
           </div>
-          {commonFindings.length === 0 ? (
+          {fleetError ? (
+            <LoadError what="the fleet's security checks" error={fleetErr} />
+          ) : commonFindings.length === 0 ? (
             <div className="p-8 text-center text-sm text-gray-400">
-              {isLoading ? 'Scanning…' : <span className="inline-flex items-center gap-1.5 text-green-600 dark:text-green-400"><ShieldCheck className="w-4 h-4" /> No issues across the fleet</span>}
+              {/* "No issues" only when every online device was actually checked (U5). */}
+              {isLoading ? 'Scanning…'
+                : scored.length < online.length
+                  ? <span className="inline-flex items-center gap-1.5 text-amber-600 dark:text-amber-400"><ShieldCheck className="w-4 h-4" /> No common issues among the {scored.length} device{scored.length === 1 ? '' : 's'} checked; {online.length - scored.length} could not be checked</span>
+                  : <span className="inline-flex items-center gap-1.5 text-green-600 dark:text-green-400"><ShieldCheck className="w-4 h-4" /> No issues across the fleet</span>}
             </div>
           ) : (
-            <div className="divide-y divide-gray-100 dark:divide-slate-700">
-              {commonFindings.map(c => (
-                <div key={c.title} className="flex items-center gap-3 px-5 py-2.5">
-                  <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0', SEV_DOT[c.severity])} />
-                  <span className="text-sm text-gray-700 dark:text-slate-300 flex-1 min-w-0 truncate" title={c.title}>{c.title}</span>
-                  <span className="text-xs text-gray-400 dark:text-slate-500 flex-shrink-0">{c.count} {c.count === 1 ? 'device' : 'devices'}</span>
-                </div>
-              ))}
+            <div className="divide-y divide-gray-100 dark:divide-slate-700 flex-1 min-h-0 overflow-y-auto">
+              {commonFindings.map(c => {
+                const open = expandedFinding === c.title;
+                return (
+                  <div key={c.title}>
+                    <button
+                      onClick={() => setExpandedFinding(open ? null : c.title)}
+                      className="w-full flex items-center gap-3 px-5 py-2.5 hover:bg-gray-50 dark:hover:bg-slate-700/30 text-left"
+                    >
+                      {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />
+                            : <ChevronRight className="w-3.5 h-3.5 text-gray-400 flex-shrink-0" />}
+                      <span className={clsx('w-1.5 h-1.5 rounded-full flex-shrink-0', SEV_DOT[c.severity])} />
+                      <span className="text-sm text-gray-700 dark:text-slate-300 flex-1 min-w-0">{c.title}</span>
+                      <span className="text-xs text-gray-400 dark:text-slate-500 flex-shrink-0">
+                        {c.devices.length} {c.devices.length === 1 ? 'device' : 'devices'}
+                      </span>
+                    </button>
+                    {open && c.fix === 'api-off' && canWrite && (
+                      <div className="px-5 pb-2 pl-12 space-y-1.5">
+                        <button className="btn-primary text-xs py-1" disabled={apiOffRun?.running}
+                          title="On each: check the manager can log in over API-SSL and nothing else uses plain API, then turn it off under Change Guard"
+                          onClick={() => { void turnOffPlainApi(c.deviceIds); }}>
+                          {apiOffRun?.running ? 'Turning off…' : `Turn off plain API on ${c.deviceIds.length === 1 ? 'it' : `all ${c.deviceIds.length}`}`}
+                        </button>
+                        {apiOffRun && apiOffRun.results.map((r, i) => (
+                          <p key={i} className={clsx('text-xs', r.ok ? 'text-green-700 dark:text-green-400' : 'text-amber-700 dark:text-amber-400')}>
+                            {r.name}: {r.message}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                    {open && c.fix === 'romon' && canWrite && (
+                      <div className="px-5 pb-2 pl-12 space-y-1.5">
+                        <button className="btn-primary text-xs py-1" disabled={romonRun?.running}
+                          title="Apply each device's site RoMON setting, one device at a time"
+                          onClick={() => { void applyRomonAll(c.deviceIds); }}>
+                          {romonRun?.running ? 'Applying…' : `Apply the RoMON setting on ${c.deviceIds.length === 1 ? 'it' : `all ${c.deviceIds.length}`}`}
+                        </button>
+                        {romonRun && romonRun.results.map((r, i) => (
+                          <p key={i} className={clsx('text-xs', r.ok ? 'text-green-700 dark:text-green-400' : 'text-amber-700 dark:text-amber-400')}>
+                            {r.name}: {r.message}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                    {/* Answers "which ones?", which the tally alone never did (#158). */}
+                    {open && c.fix === 'www-ssl' && canWrite && (
+                      <div className="px-5 pb-2 pl-12 space-y-1.5">
+                        <button className="btn-primary text-xs py-1" disabled={httpsRun?.running}
+                          title="Enable www-ssl with a certificate on each, then turn plain www off once HTTPS answers"
+                          onClick={() => { void switchAllToHttps(c.deviceIds); }}>
+                          {httpsRun?.running ? 'Switching…' : `Switch ${c.deviceIds.length === 1 ? 'it' : `all ${c.deviceIds.length}`} to HTTPS`}
+                        </button>
+                        {httpsRun && httpsRun.results.map((r, i) => (
+                          <p key={i} className={clsx('text-xs', r.ok ? 'text-green-700 dark:text-green-400' : 'text-amber-700 dark:text-amber-400')}>
+                            {r.name}: {r.message}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                    {open && (
+                      <div className="px-5 pb-2.5 pl-12 flex flex-wrap gap-1.5 max-h-[120px] overflow-y-auto">
+                        {c.devices.map(n => (
+                          <span key={n} className="mono text-[11px] px-1.5 py-0.5 rounded"
+                                style={{ background: 'var(--surface-2)', color: 'var(--ink-2)' }}>
+                            {n.trim()}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
       </div>
+
+      {/* Certificates across the fleet (#143): the full width, because it's a
+          table; in a third of the page its columns were crushed. */}
+      <div className="card overflow-hidden">
+          <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2 flex-wrap">
+            <KeyRound className="w-4 h-4 text-indigo-500" />
+            <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Certificates</h2>
+            {certData && (
+              <span className="text-xs text-gray-400 dark:text-slate-500">
+                {certData.certificates.length} across the fleet
+                {certData.alertingEnabled
+                  ? ` · alerting ${certData.warnDays} days ahead`
+                  : ' · expiry alerting is off'}
+              </span>
+            )}
+            {/* Counted, not just listed: "two expiring" is the number worth seeing
+                without reading every row. */}
+            {certData && (badCount > 0) && (
+              <span className="ml-auto text-xs font-medium text-amber-600 dark:text-amber-400">
+                {badCount} need attention
+              </span>
+            )}
+          </div>
+          <div className="p-2">
+            {certLoading
+              ? <p className="p-6 text-center text-sm text-gray-400">Loading…</p>
+              : certError ? <LoadError what="certificates" error={certErr} />
+              : <CertificateList
+                  certificates={certData?.certificates ?? []}
+                  showDevice
+                  storageKey="fleet"
+                  emptyText="No certificates collected yet — they are read on each slow poll."
+                  maxHeight={480}
+                />}
+          </div>
+        </div>
+
     </div>
   );
 }

@@ -1,7 +1,13 @@
+import { escapeHtml } from '../utils/html';
 import nodemailer from 'nodemailer';
+import { smtpTransportOptions, describeSmtpError } from '../utils/smtpTransport';
 import * as https from 'https';
 import * as http from 'http';
 import { query } from '../config/database';
+import { buildGotifyRequest } from '../utils/gotify';
+import { openConfig } from '../utils/alertChannelSecrets';
+import { resolveAlertTarget } from '../utils/alertTarget';
+import { isDeviceInMaintenance } from '../routes/maintenanceWindows';
 
 export type AlertEventType =
   | 'device_offline'
@@ -13,7 +19,18 @@ export type AlertEventType =
   | 'cert_expiry'
   | 'device_discovered'
   | 'firmware_update_available'
-  | 'config_drift';
+  | 'config_drift'
+  | 'device_degraded'
+  | 'device_health_restored'
+  | 'device_identity_changed'
+  | 'cve_active'
+  | 'wireguard_stale'
+  | 'interface_errors'
+  | 'interface_flapping'
+  | 'optic_degraded'
+  | 'routing_peer_down'
+  | 'platform_backup_failed'
+  | 'device_cert_renewal_failed';
 
 export interface AlertContext {
   deviceId?: number;
@@ -33,7 +50,7 @@ interface AlertRule {
 interface AlertChannel {
   id: number;
   name: string;
-  type: 'email' | 'slack' | 'discord' | 'telegram' | 'ntfy';
+  type: 'email' | 'slack' | 'discord' | 'telegram' | 'ntfy' | 'gotify';
   enabled: boolean;
   config: Record<string, unknown>;
 }
@@ -53,6 +70,16 @@ const EVENT_LABELS: Record<string, string> = {
   device_discovered:        'New Device Discovered',
   firmware_update_available: 'Firmware Update Available',
   config_drift:             'Configuration Changed',
+  device_degraded:          'Device Degraded (Hardware)',
+  device_health_restored:   'Device Hardware Healthy Again',
+  device_identity_changed:  'Device Identity Changed (certificate, host key or serial)',
+  wireguard_stale:          'WireGuard Peer Stale',
+  interface_errors:         'Interface Errors',
+  interface_flapping:       'Interface Flapping',
+  optic_degraded:           'Optic Light Level',
+  routing_peer_down:        'Routing Peer Down (BGP/OSPF)',
+  platform_backup_failed:   'Platform Backup Failed',
+  device_cert_renewal_failed: 'Device Certificate Renewal Failed',
 };
 
 const EVENT_EMOJI: Record<string, string> = {
@@ -66,6 +93,16 @@ const EVENT_EMOJI: Record<string, string> = {
   device_discovered:        '🔍',
   firmware_update_available: '🔄',
   config_drift:             '📝',
+  device_degraded:          '🟠',
+  device_health_restored:   '🟢',
+  device_identity_changed:  '🛑',
+  wireguard_stale:          '🔌',
+  interface_errors:         '📉',
+  interface_flapping:       '🔁',
+  optic_degraded:           '🔦',
+  routing_peer_down:        '🛣️',
+  platform_backup_failed:   '💾',
+  device_cert_renewal_failed: '🔐',
 };
 
 export class AlertService {
@@ -78,12 +115,8 @@ export class AlertService {
 
       // Maintenance window suppression — skip if device is in a currently active window
       if (ctx.deviceId != null) {
-        const inMaintenance = await query<{ count: string }>(
-          `SELECT COUNT(*)::text AS count FROM maintenance_windows
-           WHERE active = true AND $1 = ANY(device_ids) AND NOW() BETWEEN start_at AND end_at`,
-          [ctx.deviceId]
-        ).catch(() => [{ count: '0' }]);
-        if (parseInt(inMaintenance[0]?.count || '0', 10) > 0) {
+        const inMaintenance = await isDeviceInMaintenance(ctx.deviceId).catch(() => false);
+        if (inMaintenance) {
           console.log(`[AlertService] Suppressed ${eventType} for device ${ctx.deviceId} (maintenance window)`);
           return;
         }
@@ -198,12 +231,15 @@ export class AlertService {
     message: string,
     ctx: AlertContext
   ): Promise<void> {
+    // Secrets are stored encrypted and opened only here, to send (S7).
+    const config = openConfig(ch.type, ch.config as Record<string, unknown>) as typeof ch.config;
     switch (ch.type) {
-      case 'email':    await this.sendEmail(ch.config, eventType, message, ctx); break;
-      case 'slack':    await this.sendSlack(ch.config, eventType, message, ctx); break;
-      case 'discord':  await this.sendDiscord(ch.config, eventType, message, ctx); break;
-      case 'telegram': await this.sendTelegram(ch.config, eventType, message, ctx); break;
-      case 'ntfy':     await this.sendNtfy(ch.config, eventType, message, ctx); break;
+      case 'email':    await this.sendEmail(config, eventType, message, ctx); break;
+      case 'slack':    await this.sendSlack(config, eventType, message, ctx); break;
+      case 'discord':  await this.sendDiscord(config, eventType, message, ctx); break;
+      case 'telegram': await this.sendTelegram(config, eventType, message, ctx); break;
+      case 'ntfy':     await this.sendNtfy(config, eventType, message, ctx); break;
+      case 'gotify':   await this.sendGotify(config, eventType, message, ctx); break;
     }
   }
 
@@ -214,10 +250,7 @@ export class AlertService {
     ctx: AlertContext
   ): Promise<void> {
     const host      = cfg.smtp_host as string;
-    const port      = (cfg.smtp_port as number) || 587;
-    const secure    = !!(cfg.smtp_secure);
     const user      = cfg.smtp_user as string | undefined;
-    const pass      = cfg.smtp_pass as string | undefined;
     const from      = (cfg.from_address as string) || user || 'alerts@mikrotik-manager';
     const recipients = (cfg.recipients as string[]) || [];
 
@@ -225,18 +258,13 @@ export class AlertService {
       throw new Error('Email channel missing smtp_host or recipients');
     }
 
-    const transport = nodemailer.createTransport({
-      host,
-      port,
-      secure,
-      auth: user && pass ? { user, pass } : undefined,
-      tls: { rejectUnauthorized: false },
-    } as nodemailer.TransportOptions);
+    const transport = nodemailer.createTransport(smtpTransportOptions(cfg));
 
     const label   = EVENT_LABELS[eventType] ?? eventType;
     const subject = `[Mikrotik Manager] ${label}`;
-    const device  = ctx.deviceName ? `<b>Device:</b> ${ctx.deviceName}<br>` : '';
-    const details = ctx.details    ? `<br><pre>${ctx.details}</pre>` : '';
+    // Device names, messages and log details are untrusted text (GHSA-28hr-v457-cc6g).
+    const device  = ctx.deviceName ? `<b>Device:</b> ${escapeHtml(ctx.deviceName)}<br>` : '';
+    const details = ctx.details    ? `<br><pre>${escapeHtml(ctx.details)}</pre>` : '';
 
     const html = `
 <div style="font-family:sans-serif;max-width:600px">
@@ -244,15 +272,15 @@ export class AlertService {
     <strong>Mikrotik Manager Alert</strong>
   </div>
   <div style="border:1px solid #e5e7eb;border-top:none;padding:20px;border-radius:0 0 8px 8px">
-    <h2 style="margin:0 0 12px;color:#1f2937">${EVENT_EMOJI[eventType] ?? '🔔'} ${label}</h2>
-    <p style="color:#374151">${message}</p>
+    <h2 style="margin:0 0 12px;color:#1f2937">${EVENT_EMOJI[eventType] ?? '🔔'} ${escapeHtml(label)}</h2>
+    <p style="color:#374151">${escapeHtml(message)}</p>
     <div style="color:#6b7280;font-size:13px">${device}${details}</div>
     <hr style="margin:16px 0;border:none;border-top:1px solid #e5e7eb">
     <p style="font-size:12px;color:#9ca3af">Sent by Mikrotik Manager · ${new Date().toUTCString()}</p>
   </div>
 </div>`;
 
-    await transport.sendMail({ from, to: recipients.join(', '), subject, html });
+    await transport.sendMail({ from, to: recipients.join(', '), subject, html }).catch((e) => { throw describeSmtpError(e); });
   }
 
   private async sendSlack(
@@ -318,11 +346,14 @@ export class AlertService {
     const chatId   = cfg.chat_id   as string;
     if (!botToken || !chatId) throw new Error('Telegram channel missing bot_token or chat_id');
 
+    // Telegram's HTML mode rejects the whole message on a stray < or &, and
+    // device names, log lines and details come from devices (J5).
+    const esc = (v: string) => v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const label  = EVENT_LABELS[eventType] ?? eventType;
-    const device = ctx.deviceName ? `\n📡 <b>Device:</b> ${ctx.deviceName}` : '';
-    const detail = ctx.details    ? `\n<pre>${ctx.details}</pre>` : '';
+    const device = ctx.deviceName ? `\n📡 <b>Device:</b> ${esc(ctx.deviceName)}` : '';
+    const detail = ctx.details    ? `\n<pre>${esc(String(ctx.details))}</pre>` : '';
 
-    const text = `${EVENT_EMOJI[eventType] ?? '🔔'} <b>${label}</b>\n${message}${device}${detail}`;
+    const text = `${EVENT_EMOJI[eventType] ?? '🔔'} <b>${esc(label)}</b>\n${esc(message)}${device}${detail}`;
 
     const url  = `https://api.telegram.org/bot${botToken}/sendMessage`;
     const body = JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' });
@@ -388,6 +419,22 @@ export class AlertService {
     await this.postJson(serverUrl, JSON.stringify(body), this.ntfyAuthHeaders(cfg));
   }
 
+  /** Gotify (#169). Request shape and priorities live in utils/gotify.ts. */
+  private async sendGotify(
+    cfg: Record<string, unknown>,
+    eventType: string,
+    message: string,
+    ctx: AlertContext
+  ): Promise<void> {
+    const label = EVENT_LABELS[eventType] ?? eventType;
+    const emoji = EVENT_EMOJI[eventType] ?? '\u{1F514}';
+    const lines = [message];
+    if (ctx.deviceName) lines.push(`Device: ${ctx.deviceName}`);
+    if (ctx.details)    lines.push(ctx.details);
+    const req = buildGotifyRequest(cfg, eventType, `${emoji} ${label}`, lines.join('\n'), ctx.deviceId);
+    await this.postJson(req.url, req.body, req.headers);
+  }
+
   /**
    * Access token if present, otherwise basic auth. Infrastructure alerts should not
    * require a world-writable topic, so both of ntfy's schemes are supported and the
@@ -412,42 +459,51 @@ export class AlertService {
    * channel stays worth being woken by.
    */
   private ntfyPriority(eventType: string): number {
-    if (['device_offline', 'log_error', 'high_cpu', 'high_memory'].includes(eventType)) return 4;
-    if (['device_online', 'device_discovered'].includes(eventType)) return 2;
+    if (['device_offline', 'device_degraded', 'device_identity_changed', 'log_error', 'high_cpu', 'high_memory'].includes(eventType)) return 4;
+    if (['device_online', 'device_health_restored', 'device_discovered'].includes(eventType)) return 2;
     return 3;
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
-  private postJson(url: string, body: string, extraHeaders: Record<string, string> = {}): Promise<void> {
+  private async postJson(url: string, body: string, extraHeaders: Record<string, string> = {}): Promise<void> {
+    const parsed  = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('URL must be http(s)');
+    const isHttps = parsed.protocol === 'https:';
+    const lib     = isHttps ? https : http;
+    // Checked and pinned before connecting: see utils/alertTarget.ts.
+    const address = await resolveAlertTarget(parsed.hostname);
+
     return new Promise((resolve, reject) => {
-      const parsed   = new URL(url);
-      const isHttps  = parsed.protocol === 'https:';
-      const lib      = isHttps ? https : http;
-      const options  = {
-        hostname: parsed.hostname,
-        port:     parsed.port || (isHttps ? 443 : 80),
-        path:     parsed.pathname + parsed.search,
-        method:   'POST',
+      const options = {
+        host:       address,
+        port:       parsed.port || (isHttps ? 443 : 80),
+        path:       parsed.pathname + parsed.search,
+        method:     'POST',
+        // Certificate check and virtual hosting use the real name.
+        servername: isHttps ? parsed.hostname.replace(/^\[|\]$/g, '') : undefined,
+        timeout:    10_000,
         headers:  {
           'Content-Type':   'application/json',
           'Content-Length': Buffer.byteLength(body),
+          Host:             parsed.host,
           ...extraHeaders,
         },
       };
 
       const req = lib.request(options, (res) => {
-        let data = '';
-        res.on('data', (chunk) => { data += chunk; });
+        // The body is deliberately not read into the error. It used to be
+        // returned (200 characters of it) to whoever pressed Test, which
+        // turned a channel pointed at an internal service into a way to read
+        // that service's replies.
+        res.resume();
         res.on('end', () => {
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve();
-          } else {
-            reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
-          }
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve();
+          else reject(new Error(`The server answered HTTP ${res.statusCode}`));
         });
       });
 
+      req.on('timeout', () => req.destroy(new Error('No answer within 10 seconds')));
       req.on('error', reject);
       req.write(body);
       req.end();

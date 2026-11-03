@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
+import { useFleetRefresh } from '../hooks/useFleetRefresh';
 import {
   Wifi, CheckCircle, XCircle, HelpCircle, Users, RefreshCw, ExternalLink,
 } from 'lucide-react';
@@ -36,11 +37,16 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 export default function WirelessPage() {
-  const { data: aps = [], isLoading, refetch, isFetching } = useQuery({
+  const { data: devices = [], isLoading, refetch, isFetching } = useQuery({
     queryKey: ['wireless-aps'],
     queryFn: () => wirelessApi.list().then(r => r.data as WirelessAP[]),
     refetchInterval: 30_000,
   });
+  // A CAPsMAN controller with no radios of its own has its own section below,
+  // and isn't an access point (#365).
+  const aps = devices.filter(a => a.has_radios !== false);
+  // Refresh asks the devices in view for a fresh poll, then reads again as it lands.
+  const { refresh, refreshing } = useFleetRefresh(['fast', 'slow'], refetch);
 
   const online  = aps.filter(a => a.status === 'online').length;
   const offline = aps.filter(a => a.status === 'offline').length;
@@ -74,11 +80,11 @@ export default function WirelessPage() {
           </p>
         </div>
         <button
-          onClick={() => refetch()}
-          disabled={isFetching}
+          onClick={() => void refresh()}
+          disabled={isFetching || refreshing}
           className="btn-secondary flex items-center gap-2 text-sm"
         >
-          <RefreshCw className={clsx('w-4 h-4', isFetching && 'animate-spin')} />
+          <RefreshCw className={clsx('w-4 h-4', (isFetching || refreshing) && 'animate-spin')} />
           Refresh
         </button>
       </div>
@@ -101,10 +107,10 @@ export default function WirelessPage() {
       </div>
 
       {/* RF Health — channel map, density, TX retries, connectivity */}
-      {aps.length > 0 && <RfHealth />}
+      {devices.length > 0 && <RfHealth />}
 
       {/* Rogue & neighbor AP detection (from stored AP scans) */}
-      {aps.length > 0 && <RogueApsCard />}
+      {devices.length > 0 && <RogueApsCard />}
 
       <CapsmanPanel />
 

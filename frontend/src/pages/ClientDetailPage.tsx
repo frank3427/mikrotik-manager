@@ -1,9 +1,10 @@
 import { useState } from 'react';
+import { useRememberedRange } from '../hooks/useRememberedRange';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   ArrowLeft, Wifi, Network, Router, Layers, Activity,
-  Power, Save, Clock, ChevronRight, AlertCircle, Pencil, X, Gauge, Check,
+  Power, Save, Clock, ChevronRight, AlertCircle, Pencil, X, Gauge, Check, WifiOff, Box,
 } from 'lucide-react';
 import { useCanWrite } from '../hooks/useCanWrite';
 import {
@@ -13,10 +14,14 @@ import {
 import { format, formatDistanceToNow, parseISO } from 'date-fns';
 import RoamingTimeline from '../components/clients/RoamingTimeline';
 import { clientsApi, trafficApi, devicesApi } from '../services/api';
+import FastTrackNote from '../components/common/FastTrackNote';
 import { CATEGORY_META, SELECTABLE_CATEGORIES } from '../utils/clientCategories';
 import type { ClientDetail } from '../services/api';
 import type { SignalPoint } from '../services/api';
 import clsx from 'clsx';
+import { formatRatePair } from '../utils/wifiRate';
+import ClientAddressLists from '../components/clients/ClientAddressLists';
+import { disconnectClient } from '../utils/disconnectClient';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -52,7 +57,7 @@ function deviceIcon(type?: string) {
 // ─── Connectivity Timeline ────────────────────────────────────────────────────
 
 function ConnectivityTimeline({ mac }: { mac: string }) {
-  const [range, setRange] = useState<'2h' | '24h' | '7d'>('24h');
+  const [range, setRange] = useRememberedRange<'2h' | '24h' | '7d'>('client-connectivity', '24h', ['2h', '24h', '7d']);
 
   const { data: points = [], isLoading } = useQuery({
     queryKey: ['client-presence', mac, range],
@@ -148,10 +153,26 @@ function ConnectivityTimeline({ mac }: { mac: string }) {
 
 // ─── Connection Diagram ───────────────────────────────────────────────────────
 
+/**
+ * A node's name, wrapped rather than cut off (#363: "01-NIKITINA-ASW01-2F"
+ * showed as "01-NIKITINA-A…" with no way to read the rest), with the full
+ * name on hover and a link to the device where there is one.
+ */
+function NodeLabel({ text, to }: { text: string; to?: string }) {
+  const cls = 'text-[11px] text-center font-medium max-w-[160px] break-words';
+  return to ? (
+    <Link to={to} title={text} className={clsx(cls, 'text-blue-600 dark:text-blue-400 hover:underline')}>{text}</Link>
+  ) : (
+    <span title={text} className={clsx(cls, 'text-gray-700 dark:text-slate-300')}>{text}</span>
+  );
+}
+
 function ConnectionDiagram({ client }: { client: ClientDetail }) {
   const ClientIcon = client.client_type === 'wireless' ? Wifi : Network;
   const DeviceIcon = deviceIcon(client.device_type);
-  const UpstreamIcon = client.upstream_device_type ? deviceIcon(client.upstream_device_type) : Router;
+  // A neighbour the manager doesn't manage could be anything (#365).
+  const UpstreamIcon = client.upstream_managed === false ? Box
+    : client.upstream_device_type ? deviceIcon(client.upstream_device_type) : Router;
 
   const clientName = client.custom_name || client.hostname || client.mac_address;
 
@@ -176,9 +197,7 @@ function ConnectionDiagram({ client }: { client: ClientDetail }) {
               client.active ? 'text-green-600 dark:text-green-400' : 'text-gray-400'
             )} />
           </div>
-          <span className="text-[11px] text-center text-gray-700 dark:text-slate-300 font-medium max-w-[90px] truncate">
-            {clientName}
-          </span>
+          <NodeLabel text={clientName} />
           {client.ip_address && (
             <span className="text-[10px] font-mono text-gray-400 dark:text-slate-500">
               {client.ip_address}
@@ -195,9 +214,7 @@ function ConnectionDiagram({ client }: { client: ClientDetail }) {
             {/* eslint-disable-next-line react-hooks/static-components */}
             <DeviceIcon className="w-5 h-5 text-blue-600 dark:text-blue-400" />
           </div>
-          <span className="text-[11px] text-center text-gray-700 dark:text-slate-300 font-medium max-w-[90px] truncate">
-            {client.device_name || 'Unknown'}
-          </span>
+          <NodeLabel text={client.device_name || 'Unknown'} to={client.device_id ? `/devices/${client.device_id}` : undefined} />
           {client.ssid && (
             <span className="text-[10px] text-blue-500 dark:text-blue-400 font-medium">
               {client.ssid}
@@ -219,9 +236,10 @@ function ConnectionDiagram({ client }: { client: ClientDetail }) {
                 {/* eslint-disable-next-line react-hooks/static-components */}
                 <UpstreamIcon className="w-5 h-5 text-purple-600 dark:text-purple-400" />
               </div>
-              <span className="text-[11px] text-center text-gray-700 dark:text-slate-300 font-medium max-w-[90px] truncate">
-                {client.upstream_device_name}
-              </span>
+              <NodeLabel text={client.upstream_device_name} to={client.upstream_device_id ? `/devices/${client.upstream_device_id}` : undefined} />
+              {client.upstream_managed === false && (
+                <span className="text-[10px] text-gray-400 dark:text-slate-500">not managed</span>
+              )}
               {client.upstream_device_ip && (
                 <span className="text-[10px] font-mono text-gray-400 dark:text-slate-500">
                   {client.upstream_device_ip}
@@ -289,6 +307,7 @@ function LimitBandwidth({ deviceId, ip, name }: { deviceId: number; ip: string; 
             <label className="text-[10px] text-gray-500 dark:text-slate-400">Download
               <input className="input font-mono mt-0.5 py-1 text-xs" value={down} onChange={e => setDown(e.target.value)} placeholder="50M" /></label>
           </div>
+          <FastTrackNote deviceId={deviceId} compact />
           {error && <p className="text-[10px] text-red-500">{error}</p>}
           <div className="flex items-center gap-2">
             <button onClick={apply} disabled={status === 'saving'}
@@ -305,14 +324,17 @@ function LimitBandwidth({ deviceId, ip, name }: { deviceId: number; ip: string; 
 }
 
 function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrite: boolean }) {
+  const [listsOpen, setListsOpen] = useState(false);
   const qc = useQueryClient();
   const [notes, setNotes] = useState(client.comment || '');
   const [notesChanged, setNotesChanged] = useState(false);
   const [wolStatus, setWolStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const [kick, setKick] = useState<{ busy: boolean; ok?: boolean; message?: string }>({ busy: false });
   const [editingName, setEditingName] = useState(false);
   const [nameValue, setNameValue] = useState(client.custom_name || '');
 
   const nameMutation = useMutation({
+    meta: { inlineError: true },
     mutationFn: () => clientsApi.updateHostname(client.mac_address, nameValue),
     onSuccess: () => {
       // Invalidate everywhere names are shown
@@ -324,6 +346,7 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
   });
 
   const notesMutation = useMutation({
+    meta: { inlineError: true },
     mutationFn: () => clientsApi.updateNotes(client.mac_address, notes),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['client-detail', client.mac_address] });
@@ -339,6 +362,17 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
       qc.invalidateQueries({ queryKey: ['wireless-clients-page'] });
     },
   });
+
+  // Disconnect from the access point (#338).
+  const handleDisconnect = async () => {
+    setKick({ busy: true });
+    const r = await disconnectClient(client.mac_address, client.custom_name || client.hostname || client.mac_address, client.device_name);
+    setKick(r ? { busy: false, ok: r.ok, message: r.message } : { busy: false });
+    if (r?.ok) {
+      qc.invalidateQueries({ queryKey: ['client-detail', client.mac_address] });
+      qc.invalidateQueries({ queryKey: ['clients'] });
+    }
+  };
 
   const handleWol = async () => {
     setWolStatus('sending');
@@ -432,6 +466,15 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
 
         <DetailRow label="IP Address">
           <span className="font-mono">{client.ip_address || '—'}</span>
+          {/* Firewall address lists for this address (#145). */}
+          {canWrite && client.ip_address && (
+            <button type="button" onClick={() => setListsOpen(true)}
+              className="ml-2 text-xs text-blue-600 dark:text-blue-400 hover:underline">Address lists</button>
+          )}
+          {listsOpen && client.ip_address && (
+            <ClientAddressLists address={client.ip_address} defaultDeviceId={client.device_id}
+              clientName={client.custom_name || client.hostname || client.mac_address} onClose={() => setListsOpen(false)} />
+          )}
         </DetailRow>
 
         <DetailRow label="MAC Address">
@@ -490,6 +533,14 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
           </DetailRow>
         )}
 
+        {formatRatePair(client.tx_rate_bps, client.rx_rate_bps) && (
+          <DetailRow label="Link rate">
+            <span title="From the access point's side: TX is towards the client, RX from it">
+              {formatRatePair(client.tx_rate_bps, client.rx_rate_bps)}
+            </span>
+          </DetailRow>
+        )}
+
         {client.vlan_id != null && (
           <DetailRow label="VLAN">
             <span className="font-mono">
@@ -543,6 +594,26 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
         </div>
       )}
 
+      {/* Disconnect a wireless client from its access point (#338) */}
+      {canWrite && client.client_type === 'wireless' && client.active && (
+        <div className="pt-1">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-medium text-gray-700 dark:text-slate-300">Disconnect</span>
+          </div>
+          <button
+            onClick={() => void handleDisconnect()}
+            disabled={kick.busy}
+            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 hover:bg-amber-200 dark:hover:bg-amber-900/50"
+          >
+            <WifiOff className="w-3.5 h-3.5" />
+            {kick.busy ? 'Disconnecting…' : 'Disconnect from access point'}
+          </button>
+          <p className={clsx('text-[10px] mt-1', kick.message ? (kick.ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400') : 'text-gray-400 dark:text-slate-500')} role="status">
+            {kick.message ?? 'Removes it from the access point’s registration table, as WinBox does; it normally reconnects within seconds.'}
+          </p>
+        </div>
+      )}
+
       {/* Limit bandwidth — creates a simple queue on the client's device targeting its IP */}
       {canWrite && client.ip_address && client.device_id && (
         <LimitBandwidth deviceId={client.device_id} ip={client.ip_address} name={client.custom_name || client.hostname || client.mac_address} />
@@ -583,7 +654,7 @@ function ClientDetailsCard({ client, canWrite }: { client: ClientDetail; canWrit
 // ─── Traffic Graph ────────────────────────────────────────────────────────────
 
 function TrafficCard({ mac }: { mac: string }) {
-  const [range, setRange] = useState<'2h' | '24h' | '7d'>('24h');
+  const [range, setRange] = useRememberedRange<'2h' | '24h' | '7d'>('client-traffic', '24h', ['2h', '24h', '7d']);
 
   const { data: points = [], isLoading } = useQuery({
     queryKey: ['client-traffic', mac, range],
@@ -693,7 +764,7 @@ const APP_COLORS = [
 ];
 
 function AppTrafficCard({ mac }: { mac: string }) {
-  const [range, setRange] = useState<'2h' | '24h' | '7d'>('24h');
+  const [range, setRange] = useRememberedRange<'2h' | '24h' | '7d'>('client-apps', '24h', ['2h', '24h', '7d']);
 
   const { data, isLoading } = useQuery({
     queryKey: ['client-app-traffic', mac, range],
@@ -826,7 +897,7 @@ function qualityColor(dbm: number): string {
 }
 
 function SignalCard({ mac }: { mac: string }) {
-  const [range, setRange] = useState<'2h' | '24h' | '7d'>('24h');
+  const [range, setRange] = useRememberedRange<'2h' | '24h' | '7d'>('client-signal', '24h', ['2h', '24h', '7d']);
 
   const { data: raw = [], isLoading } = useQuery({
     queryKey: ['client-signal', mac, range],
@@ -950,7 +1021,11 @@ function SignalCard({ mac }: { mac: string }) {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function ClientDetailPage() {
-  const { mac } = useParams<{ mac: string }>();
+  const { mac: rawMac } = useParams<{ mac: string }>();
+  // Only a MAC address is used from the URL (outside review U13): anything
+  // else, such as an encoded path, never reaches an API call.
+  const macParts = (rawMac ?? '').split(/[:-]/);
+  const mac = macParts.length === 6 && macParts.every((p) => /^[0-9A-Fa-f]{2}$/.test(p)) ? rawMac : undefined;
   const navigate = useNavigate();
   const canWrite = useCanWrite();
 

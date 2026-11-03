@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the same gates GitHub Actions runs, locally, before pushing.
 #
-# Mirrors .github/workflows/ci.yml exactly (frontend lint/type-check/build,
+# Mirrors .github/workflows/ci.yml exactly (frontend lint/type-check/test/build,
 # backend lint/type-check/build, prod-dependency audits) and additionally runs
 # the backend Jest suite, which CI does not currently cover.
 #
@@ -38,12 +38,39 @@ run() {
 : >/tmp/ci-preflight-failures
 echo "Running CI gates locally (mirrors .github/workflows/ci.yml)"
 
+# The published deployment file is generated. Checking it first because it costs
+# nothing and because drift here is invisible to every maintainer — it only ever
+# breaks the Quick Deploy path that no one on the team runs (#121).
+run "compose: ghcr in sync"  .  node scripts/generate-ghcr-compose.mjs --check
+
 run "backend: lint"        backend  npm run lint
 run "backend: type-check"  backend  npx tsc --noEmit
 run "backend: build"       backend  npm run build
 run "backend: tests"       backend  npx jest --silent
+
+# The platform-backup round trip against a real Postgres, as CI runs it with its
+# service database. A throwaway container on a spare port; skipped without Docker.
+e2e_pg() {
+  local name=mtm-preflight-pg port=55433
+  docker rm -f "$name" >/dev/null 2>&1
+  docker run -d --name "$name" -e POSTGRES_PASSWORD=e2e -e POSTGRES_DB=mtm_e2e \
+    -p "127.0.0.1:$port:5432" postgres:15-alpine >/dev/null || return 1
+  local ok=1
+  for _ in $(seq 1 30); do docker exec "$name" pg_isready -U postgres >/dev/null 2>&1 && { ok=0; break; }; sleep 1; done
+  [[ $ok -eq 0 ]] && PG_E2E_URL="postgres://postgres:e2e@127.0.0.1:$port/mtm_e2e" \
+    npx jest --silent "\.pg\.test\.ts$"
+  local rc=$?
+  docker rm -f "$name" >/dev/null 2>&1
+  return $rc
+}
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  run "backend: Postgres tests"     backend  e2e_pg
+else
+  printf '  %-34s%s\n' "backend: Postgres tests" "skipped (no Docker)"
+fi
 run "frontend: lint"       frontend npm run lint
 run "frontend: type-check" frontend npx tsc --noEmit
+run "frontend: tests"      frontend npm test
 run "frontend: build"      frontend npm run build
 
 if [[ $SKIP_AUDIT -eq 0 ]]; then

@@ -1,0 +1,166 @@
+/**
+ * Deciding which RouterOS log lines are actually new (issue #137).
+ *
+ * `/log/print` returns the device's whole ring buffer every time — commonly a
+ * thousand lines — so almost all of it is already stored. Getting this decision
+ * right is the difference between inserting a handful of rows and re-offering
+ * the entire buffer once a minute.
+ */
+
+import { createHash } from 'crypto';
+
+export interface RawLogLine {
+  '.id'?: string;
+  time?: string;
+  topics?: string;
+  message?: string;
+  [k: string]: unknown;
+}
+
+/** RouterOS log ids are hex strings like "*1A2F"; 0 means "no usable id". */
+export function parseRosId(id: string | undefined): number {
+  // Stored ids carry a content suffix ("*5~1a2b3c4d", see storedLogId).
+  const hex = (id || '').replace(/^\*/, '').split('~')[0];
+  if (!hex || !/^[0-9a-fA-F]+$/.test(hex)) return 0;
+  const n = parseInt(hex, 16);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
+/**
+ * The highest log id we have already stored.
+ *
+ * Taken as the maximum over recent rows rather than "the last row inserted".
+ * Those are usually the same, but not always — and when they differ the
+ * watermark goes backwards, every later line looks new, and the whole buffer is
+ * reprocessed on every poll.
+ */
+export function highestStoredId(storedIds: (string | null | undefined)[]): number {
+  let max = 0;
+  for (const id of storedIds) {
+    const n = parseRosId(id ?? undefined);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
+/**
+ * Has the device's log buffer been cleared or the device rebooted?
+ *
+ * Detected by ids going backwards. When it happens the id watermark is
+ * meaningless and timestamps are the only thing left to compare.
+ */
+export function isLogReset(currentMaxId: number, lastStoredId: number): boolean {
+  return lastStoredId > 0 && currentMaxId > 0 && currentMaxId < lastStoredId;
+}
+
+/**
+ * Which lines should be inserted.
+ *
+ * `parseTime` is injected so the caller's RouterOS timestamp handling is used
+ * without this module needing to know about it.
+ */
+export function selectNewLogLines(
+  logs: RawLogLine[],
+  opts: {
+    lastStoredId: number;
+    latestStoredTime: Date;
+    parseTime: (raw: string) => Date;
+  }
+): RawLogLine[] {
+  const ids = logs.map((l) => parseRosId(l['.id'])).filter((n) => n > 0);
+  const currentMax = ids.length ? Math.max(...ids) : 0;
+  const reset = isLogReset(currentMax, opts.lastStoredId);
+
+  const out: RawLogLine[] = [];
+  for (const log of logs) {
+    const id = parseRosId(log['.id']);
+    if (id > 0 && !reset) {
+      if (id <= opts.lastStoredId) continue;
+    } else {
+      // No usable id, or the buffer reset: fall back to timestamps.
+      if (opts.parseTime(log.time || '') <= opts.latestStoredTime) continue;
+    }
+    out.push(log);
+  }
+  return out;
+}
+
+/**
+ * A stable identifier for a log line that RouterOS gave no `.id`.
+ *
+ * The events table has a unique index on (device_id, log_id) and relies on it
+ * to reject lines already stored. PostgreSQL treats NULLs as *distinct* in a
+ * unique index, so a NULL log_id conflicts with nothing: a device whose log
+ * entries carry no `.id` had no protection at all and re-inserted the same
+ * lines on every poll, without bound.
+ *
+ * Deriving the key from the line's own content restores that protection. The
+ * `#` prefix keeps it out of the space of real RouterOS ids, which are `*`
+ * followed by hex, so the two can never collide or be mistaken for each other.
+ *
+ * The trade, stated plainly: two genuinely separate lines with the same
+ * timestamp, topic and text collapse into one. RouterOS timestamps are
+ * second-resolution, so that is possible. Losing a repeat of an identical
+ * message is a far smaller loss than growing the table by the whole buffer
+ * every minute for ever.
+ */
+export function surrogateLogId(time: string, topics: string, message: string): string {
+  const hash = createHash('sha256')
+    .update(`${time}\u0000${topics}\u0000${message}`)
+    .digest('hex')
+    .slice(0, 16);
+  return `#${hash}`;           // 17 chars, inside the column's VARCHAR(20)
+}
+
+/**
+ * The id a log line is stored under: RouterOS's own id plus a short hash of
+ * the line (outside review J9). RouterOS numbers log lines from *1 again
+ * after a reboot, so after a second reboot new lines reused the ids of lines
+ * already stored, and the unique index silently dropped them, losing exactly
+ * the post-crash lines someone would want. The same line polled twice still
+ * gets the same id, so de-duplication holds. At most 18 characters, inside
+ * the column's VARCHAR(20).
+ */
+export function storedLogId(rosId: string, time: string, topics: string, message: string): string {
+  const hash = createHash('sha256').update(`${time}\u0000${topics}\u0000${message}`).digest('hex').slice(0, 8);
+  return `${rosId.slice(0, 9)}~${hash}`;
+}
+
+/** True for the ids this module synthesised, as opposed to RouterOS's own. */
+export function isSurrogateLogId(id: string | null | undefined): boolean {
+  return typeof id === 'string' && id.startsWith('#');
+}
+
+/**
+ * Where to resume reading a device's log (#361): the later of what is still
+ * stored in events and what was last seen on the device. Read from events
+ * alone, clearing them (or the firewall logs) reset the mark and the next
+ * poll re-imported the whole log buffer.
+ */
+export function resumePoint(
+  stored: { lastId: number; latestTime: Date },
+  seen: { lastId: number | null; latestTime: Date | null },
+): { lastId: number; latestTime: Date } {
+  const seenTime = seen.latestTime ? seen.latestTime.getTime() : 0;
+  return {
+    lastId: Math.max(stored.lastId, seen.lastId ?? 0),
+    latestTime: new Date(Math.max(stored.latestTime.getTime(), seenTime)),
+  };
+}
+
+/**
+ * What this read of the buffer has now seen: its highest id and newest line
+ * time. Stored on the device as the next poll's resume point. After a reboot
+ * the ids start again, so the highest id can be lower than before; that is
+ * the new mark.
+ */
+export function bufferMark(logs: RawLogLine[], parseTime: (raw: string) => Date): { lastId: number; latestTime: Date | null } {
+  let lastId = 0;
+  let latest = 0;
+  for (const l of logs) {
+    lastId = Math.max(lastId, parseRosId(l['.id']));
+    const t = parseTime(l.time || '').getTime();
+    if (Number.isFinite(t) && t > latest) latest = t;
+  }
+  return { lastId, latestTime: latest > 0 ? new Date(latest) : null };
+}

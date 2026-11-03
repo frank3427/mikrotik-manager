@@ -1,12 +1,13 @@
-import { useState, useRef } from 'react';
+import NumberSetting from '../components/settings/NumberSetting';
+import { useState, useRef, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Settings, Users, Key, Plus, Trash2, CheckCircle, AlertCircle, Pencil, X,
-  ShieldCheck, ShieldAlert, RefreshCw, Upload, Lock, Bell, Send, KeyRound, ClipboardList, FileText, Zap, LogIn,
-  Activity,
-} from 'lucide-react';
-import { settingsApi, authApi, certApi, alertsApi, auditLogApi, tagsApi, maintenanceApi, configTemplatesApi } from '../services/api';
-import type { MaintenanceWindow, ConfigTemplate } from '../services/api';
+  ShieldCheck, ShieldAlert, RefreshCw, Upload, Lock, Bell, Send, ClipboardList, Zap, LogIn,
+  Activity, Moon, Globe, HardDrive } from 'lucide-react';
+import { settingsApi, authApi, certApi, alertsApi, auditLogApi, tagsApi } from '../services/api';
+import { docsUrl } from '../version';
+import MaintenanceWindowsCard from '../components/settings/MaintenanceWindowsCard';
 import type { CertInfo, AlertRule, AlertChannel } from '../services/api';
 import PollerHealthCard from '../components/system/PollerHealthCard';
 import { useAuthStore } from '../store/authStore';
@@ -17,9 +18,17 @@ import {
   type BackupFrequency,
 } from '../utils/backupSchedule';
 import clsx from 'clsx';
-import CredentialPresetsSettings from '../components/settings/CredentialPresetsSettings';
+import FirmwareTimeoutCard from '../components/settings/FirmwareTimeoutCard';
+import PollModulesCard from '../components/settings/PollModulesCard';
+import TagRow from '../components/settings/TagRow';
+import DarkSiteCard from '../components/settings/DarkSiteCard';
+import FleetSshKeysCard from '../components/settings/FleetSshKeysCard';
 import AutomationSettings from '../components/settings/AutomationSettings';
+import EncryptionKeyCard from '../components/settings/EncryptionKeyCard';
 import OidcSettings from '../components/settings/OidcSettings';
+import PlatformBackupSettings from '../components/settings/PlatformBackupSettings';
+import { useIsSiteScoped } from '../hooks/useCanWrite';
+import SiteAccessDialog, { type UserSiteRole, type UserGroupRole } from '../components/settings/SiteAccessDialog';
 
 const ROLE_META: Record<UserRole, { label: string; color: string; desc: string }> = {
   admin:    { label: 'Admin',    color: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400',    desc: 'Full access including user management' },
@@ -51,12 +60,33 @@ export default function SettingsPage() {
   const { theme, setTheme } = useThemeStore();
   const isAdmin = user?.role === 'admin';
   const canWrite = user?.role !== 'viewer';
-  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sso' | 'credentials' | 'security' | 'certificate' | 'alerting' | 'audit' | 'tags' | 'maintenance' | 'templates' | 'automation' | 'poller'>('general');
+  // Timezone for scheduled work. The browser's zone is offered as a shortcut
+  // because it is almost always what the operator means.
+  // UTC is put first explicitly. Intl.supportedValuesOf('timeZone') lists 418
+  // canonical zones and UTC is not among them, so the default value matched no
+  // <option> and the browser displayed the first entry instead: every install
+  // on the default showed its backups scheduled in "Africa/Abidjan". Right only
+  // because Abidjan also sits at UTC+0.
+  const timezoneOptions = useMemo<string[]>(() => {
+    const supported = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] }).supportedValuesOf;
+    let zones: string[] = [];
+    try {
+      zones = supported ? supported('timeZone') : [];
+    } catch {
+      zones = [];
+    }
+    return ['UTC', ...zones.filter((z) => z !== 'UTC')];
+  }, []);
+  const browserTimezone = useMemo(() => {
+    try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return ''; }
+  }, []);
+
+  const siteScoped = useIsSiteScoped();
+  const [activeTab, setActiveTab] = useState<'general' | 'users' | 'sso' | 'security' | 'certificate' | 'alerting' | 'audit' | 'tags' | 'maintenance' | 'automation' | 'poller' | 'darksite' | 'sshkeys' | 'platformbackup'>(siteScoped ? 'security' : 'general');
   const [auditSearch, setAuditSearch] = useState('');
   const [auditPage, setAuditPage] = useState(1);
   const [newTagName, setNewTagName] = useState('');
   const [newTagColor, setNewTagColor] = useState('#6366f1');
-  const [mwForm, setMwForm] = useState({ name: '', start_at: '', end_at: '' });
 
   // ─── App settings ─────────────────────────────────────────────────────────
   const { data: settings = {} } = useQuery({
@@ -73,12 +103,19 @@ export default function SettingsPage() {
   const { data: users = [] } = useQuery({
     queryKey: ['settings-users'],
     queryFn: () => settingsApi.getUsers().then((r) => r.data as User[]),
+    // Fleet admins only; the server refuses everyone else.
+    enabled: isAdmin && !siteScoped,
   });
 
   const [newUser, setNewUser] = useState({ username: '', password: '', role: 'viewer' as UserRole });
   const [userError, setUserError] = useState('');
   const [userSuccess, setUserSuccess] = useState('');
   const [editUser, setEditUser] = useState<EditUserState | null>(null);
+  // Per-site access (P1-7): the users list returns each account's site roles.
+  const [accessUser, setAccessUser] = useState<User | null>(null);
+  const siteRolesOf = (u: User): UserSiteRole[] => (u as User & { site_roles?: UserSiteRole[] }).site_roles ?? [];
+  const groupRolesOf = (u: User): UserGroupRole[] => (u as User & { group_roles?: UserGroupRole[] }).group_roles ?? [];
+  const isLimited = (u: User) => siteRolesOf(u).length > 0 || groupRolesOf(u).length > 0;
   const [editError, setEditError] = useState('');
 
   const createUserMutation = useMutation({
@@ -254,69 +291,6 @@ export default function SettingsPage() {
       reader.readAsText(file);
     });
 
-  // ─── Config Templates ──────────────────────────────────────────────────────
-  const [tplFormOpen, setTplFormOpen] = useState(false);
-  const [tplForm, setTplForm] = useState<{
-    name: string; description: string; applies_to_type: string;
-    dns_servers: string; ntp_servers: string; syslog_host: string;
-  }>({ name: '', description: '', applies_to_type: '', dns_servers: '', ntp_servers: '', syslog_host: '' });
-  const [tplApplyId, setTplApplyId] = useState<number | null>(null);
-  const [tplApplyDeviceIds, setTplApplyDeviceIds] = useState<number[]>([]);
-  const [tplApplyResults, setTplApplyResults] = useState<{ device_id: number; device_name: string; ok: boolean; error?: string }[] | null>(null);
-  const [tplError, setTplError] = useState('');
-
-  const { data: templates = [] } = useQuery({
-    queryKey: ['config-templates'],
-    queryFn: () => configTemplatesApi.list().then((r) => r.data),
-    enabled: activeTab === 'templates',
-  });
-
-  const { data: allDevicesList = [] } = useQuery({
-    queryKey: ['devices-list-for-templates'],
-    queryFn: () => import('../services/api').then(m => m.default.get<{ id: number; name: string }[]>('/devices').then(r => r.data)),
-    enabled: tplApplyId != null,
-  });
-
-  const createTemplateMutation = useMutation({
-    mutationFn: () => {
-      const tj: ConfigTemplate['template_json'] = {};
-      if (tplForm.dns_servers.trim()) tj.dns_servers = tplForm.dns_servers.split(',').map((s) => s.trim()).filter(Boolean);
-      if (tplForm.ntp_servers.trim()) tj.ntp_servers = tplForm.ntp_servers.split(',').map((s) => s.trim()).filter(Boolean);
-      if (tplForm.syslog_host.trim()) tj.syslog_host = tplForm.syslog_host.trim();
-      return configTemplatesApi.create({
-        name: tplForm.name.trim(),
-        description: tplForm.description.trim() || null,
-        applies_to_type: tplForm.applies_to_type || null,
-        template_json: tj,
-      });
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['config-templates'] });
-      setTplFormOpen(false);
-      setTplForm({ name: '', description: '', applies_to_type: '', dns_servers: '', ntp_servers: '', syslog_host: '' });
-      setTplError('');
-    },
-    onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setTplError(msg || 'Failed to create template');
-    },
-  });
-
-  const deleteTemplateMutation = useMutation({
-    mutationFn: (id: number) => configTemplatesApi.delete(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['config-templates'] }),
-  });
-
-  const applyTemplateMutation = useMutation({
-    mutationFn: () => configTemplatesApi.apply(tplApplyId!, tplApplyDeviceIds),
-    onSuccess: (res) => {
-      setTplApplyResults(res.data.results);
-    },
-    onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setTplError(msg || 'Failed to apply template');
-    },
-  });
 
   // ─── Tags ─────────────────────────────────────────────────────────────────
   const { data: tags = [] } = useQuery({
@@ -339,43 +313,14 @@ export default function SettingsPage() {
   });
 
   // ─── Maintenance Windows ───────────────────────────────────────────────────
-  const { data: maintenanceWindows = [] } = useQuery({
-    queryKey: ['maintenance-windows'],
-    queryFn: () => maintenanceApi.list().then((r) => r.data),
-    enabled: activeTab === 'maintenance',
-  });
-
-  const createMwMutation = useMutation({
-    mutationFn: () => maintenanceApi.create({
-      name: mwForm.name.trim(),
-      device_ids: [],
-      start_at: mwForm.start_at,
-      end_at: mwForm.end_at,
-      recurring_cron: null,
-      active: true,
-    }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['maintenance-windows'] });
-      setMwForm({ name: '', start_at: '', end_at: '' });
-    },
-  });
-
-  const deleteMwMutation = useMutation({
-    mutationFn: (id: number) => maintenanceApi.delete(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['maintenance-windows'] }),
-  });
-
-  const toggleMwMutation = useMutation({
-    mutationFn: ({ id, active }: { id: number; active: boolean }) => maintenanceApi.update(id, { active }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['maintenance-windows'] }),
-  });
-
   // ─── Audit Log ────────────────────────────────────────────────────────────
+
   const { data: auditData } = useQuery({
     queryKey: ['audit-log', auditPage, auditSearch],
     queryFn: () => auditLogApi.list({ page: auditPage, limit: 50, search: auditSearch || undefined }).then((r) => r.data),
     enabled: activeTab === 'audit',
   });
+  const auditPages = Math.max(1, Math.ceil((auditData?.total ?? 0) / 50));
 
   // ─── Alerting ──────────────────────────────────────────────────────────────
   const { data: alertRules = [] } = useQuery({
@@ -462,6 +407,20 @@ export default function SettingsPage() {
     high_memory: 'High memory usage',
     cert_expiry: 'Certificate expiring soon',
     device_discovered: 'New device discovered',
+    device_degraded: 'Device degraded (power supply, fan or temperature)',
+    device_identity_changed: 'Device certificate or SSH host key changed',
+    device_health_restored: 'Device hardware healthy again',
+    // The two rules that showed without a caption (#223).
+    config_drift: 'Configuration changed on a device',
+    firmware_update_available: 'RouterOS update available',
+    cve_active: 'Serious RouterOS CVE affects the fleet (exploited, critical or high)',
+    wireguard_stale: 'WireGuard peer stale: no handshake for longer than the threshold (minutes)',
+    interface_errors: 'Interface errors: bad frames on a port, per minute averaged over 5 minutes (threshold)',
+    interface_flapping: 'Interface flapping: a port went down this many times in an hour (threshold)',
+    optic_degraded: "Optic light level: this many dB away from the port's usual level either way, past a receive limit below, or the module at 70 °C (threshold, dB)",
+    routing_peer_down: 'Routing peer down: a BGP session or OSPF neighbour that was up has been down this long (threshold, minutes)',
+    platform_backup_failed: 'Platform backup failed: a backup of MikroTik Manager itself failed or didn’t reach a destination',
+    device_cert_renewal_failed: 'Device certificate renewal failed: the manager couldn’t renew a certificate its CA issued to a device',
   };
 
   const cfgStr = (key: string) => (chForm.config[key] as string) ?? '';
@@ -470,7 +429,9 @@ export default function SettingsPage() {
 
   // Tabs are grouped by audience: platform administration, the signed-in
   // user's own account, and fleet-facing operational configuration.
-  const tabGroups = [
+  // An account limited to particular sites only manages its own password here:
+  // everything else on this page is fleet-wide (P1-7).
+  const allTabGroups = [
     {
       label: 'Platform',
       tabs: [
@@ -480,6 +441,10 @@ export default function SettingsPage() {
         { key: 'certificate' as const, label: 'Certificate', icon: Lock },
         ...(isAdmin ? [{ key: 'audit' as const, label: 'Audit Log', icon: ClipboardList }] : []),
         ...(isAdmin ? [{ key: 'poller' as const, label: 'Polling', icon: Activity }] : []),
+        ...(isAdmin ? [{ key: 'platformbackup' as const, label: 'Backup & Restore', icon: HardDrive }] : []),
+        // Its own entry rather than a card inside General, where it sat six
+        // cards down and was not found (#159).
+        { key: 'darksite' as const, label: 'Dark Site Mode', icon: Moon },
       ],
     },
     {
@@ -491,52 +456,91 @@ export default function SettingsPage() {
     {
       label: 'Fleet',
       tabs: [
-        { key: 'credentials' as const, label: 'Device Credentials', icon: KeyRound },
+        ...(isAdmin ? [{ key: 'sshkeys' as const, label: 'SSH Keys', icon: Key }] : []),
         { key: 'alerting' as const, label: 'Alerting', icon: Bell },
         { key: 'automation' as const, label: 'Automation', icon: Zap },
         ...(isAdmin ? [
-          { key: 'templates' as const, label: 'Config Templates', icon: FileText },
           { key: 'tags' as const, label: 'Tags', icon: ShieldCheck },
           { key: 'maintenance' as const, label: 'Maintenance', icon: ShieldAlert },
         ] : []),
       ],
     },
   ];
+  // With password sign-in off (PASSWORD_LOGIN=false, #226) there is no
+  // password or 2FA to manage, so My Account goes.
+  const { data: loginHints } = useQuery({
+    queryKey: ['login-hints'],
+    queryFn: () => authApi.loginHints().then((r) => r.data),
+    staleTime: 300_000,
+  });
+  const passwordLogin = loginHints?.password_login !== false;
+  const visibleGroups = passwordLogin ? allTabGroups : allTabGroups.filter((g) => g.label !== 'My Account');
+  const tabGroups = siteScoped
+    ? visibleGroups.filter((g) => g.label === 'My Account')
+    : visibleGroups;
 
   return (
     <div className="space-y-4">
       <h1 className="text-xl font-bold text-gray-900 dark:text-white">Settings</h1>
 
-      <div className="flex flex-wrap gap-x-6 gap-y-2 border-b border-gray-200 dark:border-slate-700">
-        {tabGroups.map((group, gi) => (
-          <div key={group.label} className={clsx(gi > 0 && 'sm:border-l sm:border-gray-200 sm:dark:border-slate-700 sm:pl-6')}>
-            <div className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-slate-500 select-none pt-1">
-              {group.label}
-            </div>
-            <div className="flex gap-1">
+      {/* Side navigation rather than a tab strip. Fourteen tabs across three
+          groups wrapped onto several lines above the content and scrolled out
+          of reach; down the side they stay put while a long tab scrolls. */}
+      <div className="flex flex-col md:flex-row gap-6 items-start">
+        {/* Phones get a dropdown. A sideways-scrolling strip showed two and a
+            half of fourteen tabs with nothing to say the rest existed. */}
+        <select
+          value={activeTab}
+          onChange={(e) => setActiveTab(e.target.value as typeof activeTab)}
+          className="input md:hidden w-full"
+          aria-label="Settings section"
+        >
+          {tabGroups.map((group) => (
+            <optgroup key={group.label} label={group.label}>
               {group.tabs.map((tab) => (
-                <button
-                  key={tab.key}
-                  onClick={() => setActiveTab(tab.key)}
-                  className={clsx(
-                    'px-3 py-2 text-sm font-medium border-b-2 transition-colors -mb-px flex items-center gap-2 whitespace-nowrap',
-                    activeTab === tab.key
-                      ? 'border-blue-600 text-blue-600 dark:text-blue-400'
-                      : 'border-transparent text-gray-500 dark:text-slate-400 hover:text-gray-700 dark:hover:text-slate-300'
-                  )}
-                >
-                  <tab.icon className="w-4 h-4" />
-                  {tab.label}
-                </button>
+                <option key={tab.key} value={tab.key}>{tab.label}</option>
               ))}
+            </optgroup>
+          ))}
+        </select>
+
+        <nav className="hidden md:flex md:w-52 flex-shrink-0 md:sticky md:top-2 flex-col gap-5">
+          {tabGroups.map((group) => (
+            <div key={group.label}>
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-slate-500 select-none px-3 mb-1">
+                {group.label}
+              </div>
+              <div className="flex flex-col gap-0.5">
+                {group.tabs.map((tab) => (
+                  <button
+                    key={tab.key}
+                    onClick={() => setActiveTab(tab.key)}
+                    className={clsx(
+                      'px-3 py-1.5 text-sm font-medium rounded-md transition-colors flex items-center gap-2 whitespace-nowrap text-left',
+                      activeTab === tab.key
+                        ? 'bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
+                        : 'text-gray-600 dark:text-slate-400 hover:bg-gray-100 dark:hover:bg-slate-800 hover:text-gray-900 dark:hover:text-slate-200'
+                    )}
+                  >
+                    <tab.icon className="w-4 h-4 flex-shrink-0" />
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
-        ))}
-      </div>
+          ))}
+        </nav>
+
+        <div className="flex-1 min-w-0 w-full space-y-4">
 
       {/* ── General ── */}
       {activeTab === 'general' && (
-        <div className="space-y-4 max-w-lg">
+        // Two flowing columns on wide screens. A single 512px column of eight
+        // cards left most of a monitor empty and made this the longest scroll in
+        // the app. Columns rather than a grid, so a short card such as
+        // Appearance does not leave a hole the height of its taller neighbour.
+        <div className="max-w-6xl xl:columns-2 xl:gap-4 [&>*]:mb-4 [&>*]:break-inside-avoid">
+          {isAdmin && <EncryptionKeyCard />}
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-4">Appearance</h3>
             <div className="flex items-center justify-between">
@@ -564,7 +568,10 @@ export default function SettingsPage() {
           </div>
 
           <div className="card p-5">
-            <h3 className="font-semibold text-gray-900 dark:text-white mb-4">Polling Intervals</h3>
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Polling Intervals</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
+              The defaults. A site (Sites → edit) or a device (its Overview tab) can override them.
+            </p>
             <div className="space-y-3">
               {[
                 { key: 'polling_fast_interval', label: 'Fast poll (interface stats, clients)', unit: 'sec' },
@@ -576,13 +583,10 @@ export default function SettingsPage() {
                     <div className="text-sm font-medium text-gray-700 dark:text-slate-300">{label}</div>
                     <div className="text-xs text-gray-400">{unit}</div>
                   </div>
-                  <input
-                    type="number"
+                  <NumberSetting
                     className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
                     value={settings[key] as number ?? ''}
-                    onChange={(e) =>
-                      updateSettingsMutation.mutate({ [key]: parseInt(e.target.value) })
-                    }
+                    onCommit={(v) => updateSettingsMutation.mutate({ [key]: v })}
                     min="10"
                     step="10"
                     disabled={!isAdmin}
@@ -608,13 +612,10 @@ export default function SettingsPage() {
                     <div className="text-sm font-medium text-gray-700 dark:text-slate-300">{label}</div>
                     <div className="text-xs text-gray-400">{unit}</div>
                   </div>
-                  <input
-                    type="number"
+                  <NumberSetting
                     className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
                     value={settings[key] as number ?? ''}
-                    onChange={(e) =>
-                      updateSettingsMutation.mutate({ [key]: parseInt(e.target.value) })
-                    }
+                    onCommit={(v) => updateSettingsMutation.mutate({ [key]: v })}
                     min="1"
                     step="1"
                     disabled={!isAdmin}
@@ -655,13 +656,10 @@ export default function SettingsPage() {
                   <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Scan interval</div>
                   <div className="text-xs text-gray-400">seconds</div>
                 </div>
-                <input
-                  type="number"
+                <NumberSetting
                   className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
                   value={settings['mac_scan_interval'] as number ?? 300}
-                  onChange={(e) =>
-                    updateSettingsMutation.mutate({ mac_scan_interval: parseInt(e.target.value) })
-                  }
+                  onCommit={(v) => updateSettingsMutation.mutate({ mac_scan_interval: v })}
                   min="60"
                   step="30"
                   disabled={!isAdmin || !settings['mac_scan_enabled']}
@@ -700,11 +698,10 @@ export default function SettingsPage() {
                   <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Snapshot interval</div>
                   <div className="text-xs text-gray-400">minutes</div>
                 </div>
-                <input
-                  type="number"
+                <NumberSetting
                   className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
                   value={settings['config_snapshot_interval_min'] as number ?? 60}
-                  onChange={(e) => updateSettingsMutation.mutate({ config_snapshot_interval_min: parseInt(e.target.value) })}
+                  onCommit={(v) => updateSettingsMutation.mutate({ config_snapshot_interval_min: v })}
                   min="15"
                   step="15"
                   disabled={!isAdmin || settings['config_snapshot_enabled'] === false}
@@ -715,15 +712,120 @@ export default function SettingsPage() {
                   <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Retention</div>
                   <div className="text-xs text-gray-400">snapshots kept per device</div>
                 </div>
-                <input
-                  type="number"
+                <NumberSetting
                   className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
                   value={settings['config_snapshot_retention'] as number ?? 30}
-                  onChange={(e) => updateSettingsMutation.mutate({ config_snapshot_retention: parseInt(e.target.value) })}
+                  onCommit={(v) => updateSettingsMutation.mutate({ config_snapshot_retention: v })}
                   min="1"
                   step="1"
                   disabled={!isAdmin || settings['config_snapshot_enabled'] === false}
                 />
+              </div>
+            </div>
+          </div>
+
+          {/* Change Guard */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Change Guard</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
+              Before a change that could cut the manager off, the device arms its own revert. If the manager
+              can&apos;t reach it afterwards, the device puts the change back by itself.
+            </p>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Protect risky changes</div>
+                <button
+                  onClick={() => isAdmin && updateSettingsMutation.mutate({ change_guard_enabled: settings['change_guard_enabled'] === false })}
+                  disabled={!isAdmin}
+                  className={clsx(
+                    'relative inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200',
+                    isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
+                    settings['change_guard_enabled'] !== false ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
+                  )}
+                >
+                  <span className={clsx(
+                    'inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200',
+                    settings['change_guard_enabled'] !== false ? 'translate-x-5' : 'translate-x-0'
+                  )} />
+                </button>
+              </div>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-gray-700 dark:text-slate-300">How it reverts</div>
+                  <div className="text-xs text-gray-400 dark:text-slate-500 mt-0.5 max-w-md">
+                    {settings['change_guard_mode'] === 'script'
+                      ? 'Puts back only what the change touched, with no reboot. Works with a RouterOS login in the write group. Changes it can\u2019t cover (bulk commands, firmware, routing, WireGuard, wireless) use a full restore instead.'
+                      : 'Restores the whole configuration from a backup taken just before the change, and reboots. Needs the policy permission on the RouterOS login (the full group has it).'}
+                    {' '}<a className="underline" href={docsUrl('change-guard/#settings')} target="_blank" rel="noreferrer">More</a>
+                  </div>
+                </div>
+                <select
+                  className="input w-44 disabled:opacity-50 disabled:cursor-not-allowed"
+                  value={settings['change_guard_mode'] === 'script' ? 'script' : 'binary'}
+                  onChange={(e) => updateSettingsMutation.mutate({ change_guard_mode: e.target.value })}
+                  disabled={!isAdmin || settings['change_guard_enabled'] === false}
+                >
+                  <option value="binary">Full restore (reboots)</option>
+                  <option value="script">Targeted, no reboot</option>
+                </select>
+              </div>
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Revert after</div>
+                  <div className="text-xs text-gray-400">seconds without contact (60 to 900)</div>
+                </div>
+                <NumberSetting
+                  className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
+                  value={settings['change_guard_timeout_sec'] as number ?? 120}
+                  onCommit={(v) => updateSettingsMutation.mutate({ change_guard_timeout_sec: Math.min(900, Math.max(60, v)) })}
+                  min="60"
+                  max="900"
+                  step="10"
+                  disabled={!isAdmin || settings['change_guard_enabled'] === false}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Config Health */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Config Health</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
+              A standing audit of each device&apos;s live configuration for things RouterOS accepts but
+              that don&apos;t work, shown on the Operations dashboard and each device&apos;s Config Health
+              card. Read-only on the device.
+            </p>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Run the audit automatically</div>
+                <button
+                  onClick={() => isAdmin && updateSettingsMutation.mutate({ config_health_enabled: settings['config_health_enabled'] === false })}
+                  disabled={!isAdmin}
+                  className={clsx(
+                    'relative inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200',
+                    isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
+                    settings['config_health_enabled'] !== false ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
+                  )}
+                >
+                  <span className={clsx(
+                    'inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200',
+                    settings['config_health_enabled'] !== false ? 'translate-x-5' : 'translate-x-0'
+                  )} />
+                </button>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <div className="text-sm font-medium text-gray-700 dark:text-slate-300">How often</div>
+                <select
+                  className="input w-36 disabled:opacity-50 disabled:cursor-not-allowed"
+                  value={String(settings['config_health_interval_min'] ?? 60)}
+                  onChange={(e) => updateSettingsMutation.mutate({ config_health_interval_min: Number(e.target.value) })}
+                  disabled={!isAdmin || settings['config_health_enabled'] === false}
+                >
+                  {[[15, 'Every 15 minutes'], [30, 'Every 30 minutes'], [60, 'Hourly'], [240, 'Every 4 hours'],
+                    [720, 'Every 12 hours'], [1440, 'Daily']].map(([v, label]) => (
+                    <option key={v} value={String(v)}>{label}</option>
+                  ))}
+                </select>
               </div>
             </div>
           </div>
@@ -753,41 +855,19 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          {/* Maps & geocoding (issue #106) */}
-          <div className="card p-5">
-            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Maps &amp; Geocoding</h3>
-            <p className="text-xs text-gray-400 dark:text-slate-500 mb-4">
-              Device location maps use OpenStreetMap for tiles and Nominatim to turn an address
-              into coordinates. Both are outbound requests to a third party, and the address you
-              enter is sent to them. Turn this off on isolated networks, or wherever device
-              locations should not leave your infrastructure — everything else keeps working, and
-              addresses are still recorded as text.
-            </p>
-            <div className="flex items-center justify-between">
-              <div className="text-sm font-medium text-gray-700 dark:text-slate-300">Enable maps and address lookup</div>
-              <button
-                onClick={() => isAdmin && updateSettingsMutation.mutate({ maps_enabled: settings['maps_enabled'] === false })}
-                disabled={!isAdmin}
-                className={clsx(
-                  'relative inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200',
-                  isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
-                  settings['maps_enabled'] !== false ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
-                )}
-              >
-                <span className={clsx(
-                  'inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200',
-                  settings['maps_enabled'] !== false ? 'translate-x-5' : 'translate-x-0'
-                )} />
-              </button>
-            </div>
-          </div>
-
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-4">Data Retention</h3>
             <div className="space-y-3">
               {[
-                { key: 'retention_events_days', label: 'Events retention', desc: 'Auto-delete event log entries older than this many days' },
+                { key: 'retention_events_days', label: 'Events retention', desc: 'Auto-delete non-firewall event log entries older than this many days' },
+                { key: 'retention_firewall_events_days', label: 'Firewall logs retention', desc: 'Auto-delete firewall packet logs older than this many days' },
+                { key: 'retention_proxy_days', label: 'Proxy log retention', desc: 'Auto-delete parsed proxy connection records older than this many days' },
                 { key: 'retention_clients_days', label: 'Client retention', desc: 'Auto-delete inactive client records not seen within this many days' },
+                { key: 'retention_scan_days', label: 'Scan retention', desc: 'Auto-delete spectral and nearby-AP scan results older than this many days' },
+                { key: 'retention_lte_history_days', label: 'LTE history retention', desc: 'Auto-delete LTE cell and band change history older than this many days' },
+                { key: 'retention_alert_history_days', label: 'Alert history retention', desc: 'Auto-delete the record of sent alerts older than this many days' },
+                { key: 'retention_audit_days', label: 'Audit log retention', desc: 'Auto-delete audit log entries older than this many days' },
+                { key: 'retention_availability_days', label: 'Outage history retention', desc: 'Auto-delete ended outages older than this many days (uptime reports look back up to 90)' },
                 { key: 'netflow_retention_days', label: 'Traffic detail retention', desc: 'Auto-delete per-client NetFlow time-series data older than this many days' },
                 { key: 'netflow_daily_retention_days', label: 'Traffic daily rollup retention', desc: 'Auto-delete per-client daily traffic totals older than this many days' },
               ].map(({ key, label, desc }) => (
@@ -796,21 +876,54 @@ export default function SettingsPage() {
                     <div className="text-sm font-medium text-gray-700 dark:text-slate-300">{label}</div>
                     <div className="text-xs text-gray-400">{desc}</div>
                   </div>
-                  <input
-                    type="number"
+                  <NumberSetting
                     className="input w-24 text-center disabled:opacity-50 disabled:cursor-not-allowed"
                     value={settings[key] as number ?? ''}
-                    onChange={(e) =>
-                      updateSettingsMutation.mutate({ [key]: parseInt(e.target.value) })
-                    }
+                    onCommit={(v) => updateSettingsMutation.mutate({ [key]: v })}
                     min="1"
-                    max="365"
+                    max="3650"
                     disabled={!isAdmin}
                   />
                 </div>
               ))}
             </div>
           </div>
+
+          {/* Passwords and keys in backups (#172) */}
+          {(() => {
+            const on = settings['backup_include_secrets'] === true;
+            return (
+              <div className="card p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Include passwords and keys in backups</h3>
+                    <p className="text-xs text-gray-500 dark:text-slate-400">
+                      Without them, RouterOS v7 leaves Wi-Fi keys, VPN and PPP secrets, WireGuard private keys
+                      and SNMP communities out of a backup, so a restore can&apos;t bring a device back exactly.
+                      With them, those backups are encrypted on disk, marked in the Backups list, and only admins
+                      can view or download them. Config History never includes them. RouterOS v6 exports always
+                      include them, so v6 backups are handled the same way either way.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => isAdmin && updateSettingsMutation.mutate({ backup_include_secrets: !on })}
+                    disabled={!isAdmin}
+                    aria-label="Include passwords and keys in backups"
+                    className={clsx(
+                      'relative inline-flex h-6 w-11 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200',
+                      isAdmin ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
+                      on ? 'bg-blue-600' : 'bg-gray-300 dark:bg-slate-600'
+                    )}
+                  >
+                    <span className={clsx(
+                      'inline-block h-5 w-5 transform rounded-full bg-white shadow transition duration-200',
+                      on ? 'translate-x-5' : 'translate-x-0'
+                    )} />
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Scheduled Backups */}
           <div className="card p-5">
@@ -823,6 +936,15 @@ export default function SettingsPage() {
               const enabled = !!settings['backup_schedule_enabled'];
               const sched = parseBackupCron(settings['backup_schedule_cron'] as string);
               const controlsDisabled = !isAdmin || !enabled;
+              const appTimezone = (settings['app_timezone'] as string) || 'UTC';
+              // Showing the clock in the chosen zone makes a wrong setting
+              // obvious immediately, rather than at 2am three days later.
+              let currentTimeInAppTz = '';
+              try {
+                currentTimeInAppTz = new Intl.DateTimeFormat(undefined, {
+                  timeZone: appTimezone, hour: '2-digit', minute: '2-digit', hour12: false,
+                }).format(new Date());
+              } catch { currentTimeInAppTz = 'unknown zone'; }
               const apply = (next: typeof sched) =>
                 updateSettingsMutation.mutate({ backup_schedule_cron: scheduleToCron(next) });
               return (
@@ -910,9 +1032,40 @@ export default function SettingsPage() {
                     </div>
                   </div>
 
+                  {/* Timezone belongs beside the schedule, because it is the
+                      schedule's unit. Scheduled work used to be evaluated against
+                      the container clock — UTC in the shipped image — so "02:00"
+                      meant 02:00 UTC wherever you were (#117). */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="text-xs text-gray-500 dark:text-slate-400">Timezone</label>
+                    <select
+                      value={appTimezone}
+                      disabled={!isAdmin}
+                      onChange={(e) => updateSettingsMutation.mutate({ app_timezone: e.target.value })}
+                      className="input text-xs py-1 max-w-[260px]"
+                    >
+                      {!timezoneOptions.includes(appTimezone) && (
+                        <option value={appTimezone}>{appTimezone}</option>
+                      )}
+                      {timezoneOptions.map((tz) => <option key={tz} value={tz}>{tz}</option>)}
+                    </select>
+                    {browserTimezone && browserTimezone !== appTimezone && (
+                      <button
+                        type="button"
+                        disabled={!isAdmin}
+                        onClick={() => updateSettingsMutation.mutate({ app_timezone: browserTimezone })}
+                        className="text-xs underline text-blue-600 dark:text-blue-400 disabled:opacity-50"
+                      >
+                        Use {browserTimezone}
+                      </button>
+                    )}
+                  </div>
+
                   <p className={clsx('text-xs', enabled ? 'text-gray-500 dark:text-slate-400' : 'text-gray-400 dark:text-slate-600')}>
                     {enabled
-                      ? <>Runs <span className="font-medium text-gray-700 dark:text-slate-300">{describeBackupSchedule(sched).toLowerCase()}</span>, server time.</>
+                      ? <>Runs <span className="font-medium text-gray-700 dark:text-slate-300">{describeBackupSchedule(sched).toLowerCase()}</span>{' '}
+                          in <span className="font-medium text-gray-700 dark:text-slate-300">{appTimezone}</span>
+                          {' '}(currently {currentTimeInAppTz}).</>
                       : 'Enable to choose a backup schedule.'}
                   </p>
                   {sched.frequency === 'monthly' && (
@@ -928,14 +1081,39 @@ export default function SettingsPage() {
       )}
 
       {/* ── Users ── */}
+      {activeTab === 'darksite' && (
+        <div className="max-w-2xl">
+          <DarkSiteCard isAdmin={isAdmin} />
+        </div>
+      )}
+
       {activeTab === 'poller' && (
-        <div className="card p-5">
-          <PollerHealthCard />
+        <div className="space-y-4">
+          <div className="card p-5">
+            <PollerHealthCard />
+          </div>
+          <PollModulesCard
+            settings={settings}
+            onChange={(data) => updateSettingsMutation.mutate(data)}
+            saving={updateSettingsMutation.isPending}
+          />
+          <FirmwareTimeoutCard
+            settings={settings}
+            onSave={(data) => updateSettingsMutation.mutate(data)}
+            saving={updateSettingsMutation.isPending}
+          />
         </div>
       )}
 
       {activeTab === 'users' && (
         <div className="space-y-4">
+          {accessUser && (
+            <SiteAccessDialog
+              user={{ ...accessUser, site_roles: siteRolesOf(accessUser), group_roles: groupRolesOf(accessUser) }}
+              isSelf={accessUser.id === user?.id}
+              onClose={() => setAccessUser(null)}
+            />
+          )}
           {/* Role legend */}
           <div className="card p-4">
             <h3 className="text-xs font-semibold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-3">
@@ -963,6 +1141,7 @@ export default function SettingsPage() {
                 <tr className="border-b border-gray-100 dark:border-slate-700">
                   <th className="table-header px-4 py-2.5 text-left">Username</th>
                   <th className="table-header px-4 py-2.5 text-left">Role</th>
+                  <th className="table-header px-4 py-2.5 text-left">Access</th>
                   <th className="table-header px-4 py-2.5 text-left">Created</th>
                   <th className="table-header px-4 py-2.5 w-20" />
                 </tr>
@@ -985,7 +1164,13 @@ export default function SettingsPage() {
                       )}
                     </td>
                     <td className="px-4 py-2.5">
-                      <RoleBadge role={u.role} />
+                      {/* A site-limited account's roles are per site; its own role column doesn't apply (P1-7). */}
+                      {isLimited(u) ? <span className="text-xs text-gray-500 dark:text-slate-400">per site</span> : <RoleBadge role={u.role} />}
+                    </td>
+                    <td className="px-4 py-2.5 text-xs text-gray-600 dark:text-slate-300">
+                      {isLimited(u)
+                        ? [...groupRolesOf(u).map((r) => `${r.group_name} (group): ${r.role}`), ...siteRolesOf(u).map((r) => `${r.site_name}: ${r.role}`)].join(', ')
+                        : 'Whole fleet'}
                     </td>
                     <td className="px-4 py-2.5 text-xs text-gray-400 dark:text-slate-500">
                       {u.created_at ? new Date(u.created_at).toLocaleDateString() : '—'}
@@ -1009,6 +1194,13 @@ export default function SettingsPage() {
                             title="Edit user"
                           >
                             <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => setAccessUser(u)}
+                            className="p-1 rounded text-gray-400 hover:text-blue-500 transition-colors"
+                            title="Site access"
+                          >
+                            <Globe className="w-3.5 h-3.5" />
                           </button>
                           {u.id !== user?.id && (
                             <button
@@ -1095,12 +1287,17 @@ export default function SettingsPage() {
       )}
 
       {/* ── Device Credential Presets ── */}
-      {activeTab === 'credentials' && (
-        <CredentialPresetsSettings isAdmin={isAdmin} />
-      )}
+
+      {activeTab === 'sshkeys' && isAdmin && <FleetSshKeysCard />}
+      {activeTab === 'platformbackup' && isAdmin && <PlatformBackupSettings />}
 
       {/* ── My Password ── */}
-      {activeTab === 'security' && (
+      {activeTab === 'security' && !passwordLogin && (
+        <div className="card p-5 max-w-2xl text-sm text-gray-600 dark:text-slate-300">
+          Password sign-in is turned off on this server, so accounts are managed through SSO.
+        </div>
+      )}
+      {activeTab === 'security' && passwordLogin && (
         <div className="max-w-md space-y-4">
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-4">Change My Password</h3>
@@ -1568,7 +1765,36 @@ export default function SettingsPage() {
 
       {/* ── Alerting ── */}
       {activeTab === 'alerting' && (
-        <div className="space-y-4">
+        // Read-only for viewers: every change here needs write access (U10).
+        <fieldset disabled={!canWrite} className="space-y-4 min-w-0">
+
+          {/* Hardware health limit (#168) */}
+          <div className="card p-5">
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Hardware health</h3>
+            <p className="text-xs text-gray-400 dark:text-slate-500 mb-3">
+              A device shows as degraded when a power supply or fan reports a failure, or a temperature
+              reaches this limit. Readings can be ignored per device on its Overview tab.
+            </p>
+            <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-slate-300">
+              Temperature limit
+              <input
+                key={String(settings['health_temp_limit_c'] ?? 85)}
+                type="number"
+                min={40}
+                max={150}
+                className="input w-20 py-1"
+                defaultValue={Number(settings['health_temp_limit_c'] ?? 85)}
+                disabled={!isAdmin}
+                onBlur={(e) => {
+                  const v = Number(e.target.value);
+                  if (Number.isInteger(v) && v >= 40 && v <= 150 && v !== Number(settings['health_temp_limit_c'] ?? 85)) {
+                    updateSettingsMutation.mutate({ health_temp_limit_c: v });
+                  }
+                }}
+              />
+              °C
+            </label>
+          </div>
 
           {/* Alert Rules */}
           <div className="card p-5">
@@ -1606,12 +1832,11 @@ export default function SettingsPage() {
                         </button>
                       </td>
                       <td className="py-2.5 pr-4 text-center">
-                        {['high_cpu', 'high_memory', 'cert_expiry'].includes(rule.event_type) ? (
-                          <input
-                            type="number"
+                        {['high_cpu', 'high_memory', 'cert_expiry', 'wireguard_stale', 'interface_errors', 'interface_flapping', 'optic_degraded', 'routing_peer_down'].includes(rule.event_type) ? (
+                          <NumberSetting
                             className="input w-20 text-center py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
                             value={rule.threshold ?? ''}
-                            onChange={(e) => updateRuleMutation.mutate({ type: rule.event_type, data: { enabled: rule.enabled, threshold: parseInt(e.target.value) || null, cooldown_min: rule.cooldown_min } })}
+                            onCommit={(v) => updateRuleMutation.mutate({ type: rule.event_type, data: { enabled: rule.enabled, threshold: v, cooldown_min: rule.cooldown_min } })}
                             min="1"
                             disabled={!canWrite}
                           />
@@ -1620,11 +1845,10 @@ export default function SettingsPage() {
                         )}
                       </td>
                       <td className="py-2.5 text-center">
-                        <input
-                          type="number"
+                        <NumberSetting
                           className="input w-20 text-center py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
                           value={rule.cooldown_min}
-                          onChange={(e) => updateRuleMutation.mutate({ type: rule.event_type, data: { enabled: rule.enabled, threshold: rule.threshold, cooldown_min: parseInt(e.target.value) || 15 } })}
+                          onCommit={(v) => updateRuleMutation.mutate({ type: rule.event_type, data: { enabled: rule.enabled, threshold: rule.threshold, cooldown_min: v } })}
                           min="1"
                           disabled={!canWrite}
                         />
@@ -1633,6 +1857,23 @@ export default function SettingsPage() {
                   ))}
                 </tbody>
               </table>
+            </div>
+
+            {/* Optional fixed receive limits for optics (#249). */}
+            <div className="mt-4 pt-4 border-t border-gray-100 dark:border-slate-700 text-sm">
+              <p className="font-medium text-gray-900 dark:text-white">Optic receive limits</p>
+              <p className="text-xs text-gray-500 dark:text-slate-400 mt-0.5 mb-2">
+                Optional. A port turns red, and alerts under &quot;Optic light level&quot;, when its receive light goes under
+                the low limit or over the high one. Leave empty for off. Each port is always also judged against its own usual
+                level. The right limits depend on the optics: for 100G optics around -8 and +2 dBm, but a 10G LR link runs fine
+                near -12 dBm, so set them for the optics you run.
+              </p>
+              <div className="flex flex-wrap items-center gap-4">
+                <DbmLimit label="Low limit" placeholder="-8" value={settings['optic_rx_low_dbm']} disabled={!isAdmin}
+                  onCommit={(v) => updateSettingsMutation.mutate({ optic_rx_low_dbm: v })} />
+                <DbmLimit label="High limit" placeholder="2" value={settings['optic_rx_high_dbm']} disabled={!isAdmin}
+                  onCommit={(v) => updateSettingsMutation.mutate({ optic_rx_high_dbm: v })} />
+              </div>
             </div>
           </div>
 
@@ -1764,7 +2005,7 @@ export default function SettingsPage() {
               </div>
             )}
           </div>
-        </div>
+        </fieldset>
       )}
 
       {/* ── Channel Modal ── */}
@@ -1788,7 +2029,7 @@ export default function SettingsPage() {
                 <div className="flex-1">
                   <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Type</label>
                   <select className="input w-full" value={chForm.type} onChange={(e) => setChForm((f) => ({ ...f, type: e.target.value as AlertChannel['type'], config: {} }))} disabled={chModal.mode === 'edit'}>
-                    {(['slack', 'discord', 'telegram', 'ntfy', 'email'] as const).map((t) => (
+                    {(['slack', 'discord', 'telegram', 'ntfy', 'gotify', 'email'] as const).map((t) => (
                       <option key={t} value={t}>{t === 'ntfy' ? 'ntfy' : t.charAt(0).toUpperCase() + t.slice(1)}</option>
                     ))}
                   </select>
@@ -1820,6 +2061,25 @@ export default function SettingsPage() {
                   <div>
                     <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Chat ID</label>
                     <input className="input w-full" value={cfgStr('chat_id')} onChange={(e) => setCfg('chat_id', e.target.value)} placeholder="-100123456789" />
+                  </div>
+                </>
+              ) : chForm.type === 'gotify' ? (
+                <>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Server URL</label>
+                    <input className="input w-full font-mono text-xs" value={cfgStr('server_url')} onChange={(e) => setCfg('server_url', e.target.value)} placeholder="https://gotify.example.com" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">App Token</label>
+                    <input type="password" className="input w-full font-mono text-xs" value={cfgStr('app_token')} onChange={(e) => setCfg('app_token', e.target.value)} placeholder="A1b2C3..." />
+                    <p className="mt-1 text-[11px] text-gray-500 dark:text-slate-400">
+                      In Gotify, create an application under Apps and copy its token. Outages are sent at priority 8, recoveries at 2.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 dark:text-slate-400 mb-1">Manager URL (optional)</label>
+                    <input className="input w-full font-mono text-xs" value={cfgStr('click_url')} onChange={(e) => setCfg('click_url', e.target.value)} placeholder="https://mikrotik.example.com" />
+                    <p className="mt-1 text-[11px] text-gray-500 dark:text-slate-400">Makes each notification open the device it refers to.</p>
                   </div>
                 </>
               ) : chForm.type === 'ntfy' ? (
@@ -1895,6 +2155,17 @@ export default function SettingsPage() {
                     <input type="checkbox" id="smtp_secure" checked={!!(chForm.config['smtp_secure'])} onChange={(e) => setCfg('smtp_secure', e.target.checked)} className="rounded" />
                     <label htmlFor="smtp_secure" className="text-xs text-gray-600 dark:text-slate-400">Use TLS/SSL (port 465)</label>
                   </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <input type="checkbox" id="smtp_tls_verify" checked={chForm.config['smtp_tls_verify'] !== false} onChange={(e) => setCfg('smtp_tls_verify', e.target.checked)} className="rounded" />
+                      <label htmlFor="smtp_tls_verify" className="text-xs text-gray-600 dark:text-slate-400">Check the server&apos;s certificate</label>
+                    </div>
+                    {chForm.config['smtp_tls_verify'] === false && (
+                      <p className="text-xs text-amber-600 dark:text-amber-400 mt-1 ml-6">
+                        Anyone between the manager and the mail server could read the SMTP login. Only turn this off for a server you run with a self-signed certificate.
+                      </p>
+                    )}
+                  </div>
                 </>
               )}
 
@@ -1962,159 +2233,6 @@ export default function SettingsPage() {
       {activeTab === 'sso' && (
         <OidcSettings isAdmin={isAdmin} />
       )}
-      {/* ── Config Templates ── */}
-      {activeTab === 'templates' && (
-        <div className="space-y-4">
-          <div className="card p-5">
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="font-semibold text-gray-900 dark:text-white">Configuration Templates</h3>
-                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                  Define reusable config sets (DNS, NTP, Syslog) and push them to multiple devices at once.
-                </p>
-              </div>
-              <button onClick={() => { setTplFormOpen(true); setTplError(''); }} className="btn-primary text-sm">
-                <Plus className="w-4 h-4" /> New Template
-              </button>
-            </div>
-
-            {tplError && (
-              <div className="flex items-center gap-2 text-sm text-red-500 mb-3">
-                <AlertCircle className="w-4 h-4" /> {tplError}
-              </div>
-            )}
-
-            {/* Create form */}
-            {tplFormOpen && (
-              <div className="border border-blue-200 dark:border-blue-800 rounded-lg p-4 mb-4 space-y-3 bg-blue-50/30 dark:bg-blue-900/10">
-                <h4 className="text-sm font-semibold text-gray-800 dark:text-white">New Template</h4>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="label">Name</label>
-                    <input className="input" value={tplForm.name} onChange={(e) => setTplForm((f) => ({ ...f, name: e.target.value }))} placeholder="Standard Office Config" />
-                  </div>
-                  <div>
-                    <label className="label">Device Type (optional)</label>
-                    <select className="input" value={tplForm.applies_to_type} onChange={(e) => setTplForm((f) => ({ ...f, applies_to_type: e.target.value }))}>
-                      <option value="">All devices</option>
-                      <option value="router">Router</option>
-                      <option value="switch">Switch</option>
-                      <option value="wireless">Wireless AP</option>
-                    </select>
-                  </div>
-                </div>
-                <div>
-                  <label className="label">Description (optional)</label>
-                  <input className="input" value={tplForm.description} onChange={(e) => setTplForm((f) => ({ ...f, description: e.target.value }))} placeholder="Standard DNS and NTP for main office" />
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="label">DNS Servers (comma-separated)</label>
-                    <input className="input" value={tplForm.dns_servers} onChange={(e) => setTplForm((f) => ({ ...f, dns_servers: e.target.value }))} placeholder="8.8.8.8, 1.1.1.1" />
-                  </div>
-                  <div>
-                    <label className="label">NTP Servers (comma-separated)</label>
-                    <input className="input" value={tplForm.ntp_servers} onChange={(e) => setTplForm((f) => ({ ...f, ntp_servers: e.target.value }))} placeholder="pool.ntp.org" />
-                  </div>
-                </div>
-                <div>
-                  <label className="label">Syslog Host (optional)</label>
-                  <input className="input" value={tplForm.syslog_host} onChange={(e) => setTplForm((f) => ({ ...f, syslog_host: e.target.value }))} placeholder="192.168.1.100" />
-                </div>
-                <div className="flex gap-2">
-                  <button onClick={() => createTemplateMutation.mutate()} disabled={!tplForm.name.trim() || createTemplateMutation.isPending} className="btn-primary text-sm">
-                    Create Template
-                  </button>
-                  <button onClick={() => { setTplFormOpen(false); setTplError(''); }} className="btn-secondary text-sm">Cancel</button>
-                </div>
-              </div>
-            )}
-
-            {/* Template list */}
-            {templates.length === 0 ? (
-              <p className="text-sm text-gray-500 dark:text-slate-400">No templates yet. Create one to get started.</p>
-            ) : (
-              <div className="space-y-2">
-                {templates.map((tpl) => (
-                  <div key={tpl.id} className="border border-gray-200 dark:border-slate-700 rounded-lg p-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-medium text-sm text-gray-900 dark:text-white">{tpl.name}</span>
-                          {tpl.applies_to_type && (
-                            <span className="text-xs px-1.5 py-0.5 rounded bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">
-                              {tpl.applies_to_type}
-                            </span>
-                          )}
-                        </div>
-                        {tpl.description && <p className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">{tpl.description}</p>}
-                        <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-gray-500 dark:text-slate-400">
-                          {tpl.template_json.dns_servers?.length ? <span>DNS: {tpl.template_json.dns_servers.join(', ')}</span> : null}
-                          {tpl.template_json.ntp_servers?.length ? <span>NTP: {tpl.template_json.ntp_servers.join(', ')}</span> : null}
-                          {tpl.template_json.syslog_host ? <span>Syslog: {tpl.template_json.syslog_host}</span> : null}
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2 flex-shrink-0">
-                        <button
-                          onClick={() => { setTplApplyId(tpl.id); setTplApplyDeviceIds([]); setTplApplyResults(null); setTplError(''); }}
-                          className="text-xs px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors flex items-center gap-1"
-                        >
-                          <Send className="w-3 h-3" /> Apply
-                        </button>
-                        <button onClick={() => deleteTemplateMutation.mutate(tpl.id)} className="text-gray-400 hover:text-red-500 transition-colors">
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Apply panel */}
-                    {tplApplyId === tpl.id && (
-                      <div className="mt-3 pt-3 border-t border-gray-200 dark:border-slate-700 space-y-2">
-                        <p className="text-xs font-medium text-gray-700 dark:text-slate-300">Select devices to apply this template to:</p>
-                        <div className="max-h-40 overflow-y-auto space-y-1">
-                          {allDevicesList.map((d) => (
-                            <label key={d.id} className="flex items-center gap-2 text-sm cursor-pointer">
-                              <input
-                                type="checkbox"
-                                checked={tplApplyDeviceIds.includes(d.id)}
-                                onChange={(e) => setTplApplyDeviceIds((ids) =>
-                                  e.target.checked ? [...ids, d.id] : ids.filter((x) => x !== d.id)
-                                )}
-                              />
-                              <span className="text-gray-800 dark:text-slate-200">{d.name}</span>
-                            </label>
-                          ))}
-                        </div>
-                        {tplApplyResults && (
-                          <div className="space-y-1 mt-2">
-                            {tplApplyResults.map((r) => (
-                              <div key={r.device_id} className={`text-xs flex items-center gap-1.5 ${r.ok ? 'text-green-600 dark:text-green-400' : 'text-red-500'}`}>
-                                {r.ok ? <CheckCircle className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
-                                {r.device_name}: {r.ok ? 'Applied successfully' : r.error}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => applyTemplateMutation.mutate()}
-                            disabled={tplApplyDeviceIds.length === 0 || applyTemplateMutation.isPending}
-                            className="btn-primary text-xs"
-                          >
-                            {applyTemplateMutation.isPending ? 'Applying...' : `Apply to ${tplApplyDeviceIds.length} device${tplApplyDeviceIds.length !== 1 ? 's' : ''}`}
-                          </button>
-                          <button onClick={() => { setTplApplyId(null); setTplApplyResults(null); }} className="btn-secondary text-xs">Cancel</button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* ── Tags ── */}
       {activeTab === 'tags' && (
         <div className="space-y-4">
@@ -2134,7 +2252,7 @@ export default function SettingsPage() {
                   value={newTagName}
                   onChange={(e) => setNewTagName(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && newTagName.trim() && createTagMutation.mutate()}
-                  className="input-field flex-1 text-sm"
+                  className="input flex-1 text-sm"
                 />
                 <button
                   onClick={() => createTagMutation.mutate()}
@@ -2147,21 +2265,12 @@ export default function SettingsPage() {
             )}
             <div className="space-y-2">
               {tags.map((tag) => (
-                <div key={tag.id} className="flex items-center justify-between p-3 rounded-lg" style={{ background: 'var(--surface-2)' }}>
-                  <div className="flex items-center gap-3">
-                    <div className="w-4 h-4 rounded-full" style={{ background: tag.color }} />
-                    <span className="text-sm font-medium text-gray-900 dark:text-white">{tag.name}</span>
-                    <span className="text-xs text-gray-400 dark:text-slate-500">{tag.device_count} device{tag.device_count !== 1 ? 's' : ''}</span>
-                  </div>
-                  {isAdmin && (
-                    <button
-                      onClick={() => deleteTagMutation.mutate(tag.id)}
-                      className="p-1 rounded text-gray-400 hover:text-red-500 transition-colors"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  )}
-                </div>
+                <TagRow
+                  key={tag.id}
+                  tag={tag}
+                  canEdit={isAdmin}
+                  onDelete={(id) => { if (confirm('Delete this tag? It is removed from every device that has it.')) deleteTagMutation.mutate(id); }}
+                />
               ))}
               {tags.length === 0 && (
                 <p className="text-sm text-gray-400 dark:text-slate-500 text-center py-4">No tags created yet</p>
@@ -2174,98 +2283,7 @@ export default function SettingsPage() {
       {/* ── Maintenance Windows ── */}
       {activeTab === 'maintenance' && (
         <div className="space-y-4">
-          <div className="card p-5">
-            <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-1">Maintenance Windows</h3>
-            <p className="text-xs text-gray-500 dark:text-slate-400 mb-4">
-              Alerts are suppressed for devices during active maintenance windows.
-            </p>
-
-            {isAdmin && (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-4">
-                <input
-                  type="text"
-                  placeholder="Window name…"
-                  value={mwForm.name}
-                  onChange={(e) => setMwForm(f => ({ ...f, name: e.target.value }))}
-                  className="input-field text-sm"
-                />
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs text-gray-500 dark:text-slate-400">Start</label>
-                  <input
-                    type="datetime-local"
-                    value={mwForm.start_at}
-                    onChange={(e) => setMwForm(f => ({ ...f, start_at: e.target.value }))}
-                    className="input-field text-sm"
-                  />
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs text-gray-500 dark:text-slate-400">End</label>
-                  <input
-                    type="datetime-local"
-                    value={mwForm.end_at}
-                    onChange={(e) => setMwForm(f => ({ ...f, end_at: e.target.value }))}
-                    className="input-field text-sm"
-                  />
-                </div>
-                <button
-                  onClick={() => createMwMutation.mutate()}
-                  disabled={!mwForm.name.trim() || !mwForm.start_at || !mwForm.end_at || createMwMutation.isPending}
-                  className="btn-primary text-sm sm:col-span-3 justify-center flex items-center gap-2"
-                >
-                  <Plus className="w-4 h-4" />
-                  Create Window
-                </button>
-              </div>
-            )}
-
-            <div className="space-y-2">
-              {(maintenanceWindows as MaintenanceWindow[]).map((mw) => {
-                const now = new Date();
-                const start = new Date(mw.start_at);
-                const end = new Date(mw.end_at);
-                const isActive = mw.active && now >= start && now <= end;
-                const isPast = now > end;
-                return (
-                  <div key={mw.id} className={clsx(
-                    'flex items-center justify-between p-3 rounded-lg',
-                    isActive ? 'border border-yellow-400 dark:border-yellow-600' : ''
-                  )} style={{ background: 'var(--surface-2)' }}>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium text-gray-900 dark:text-white">{mw.name}</span>
-                        {isActive && <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400">Active</span>}
-                        {isPast && <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-slate-700 dark:text-slate-400">Expired</span>}
-                        {!mw.active && <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-400 dark:bg-slate-700 dark:text-slate-500">Disabled</span>}
-                      </div>
-                      <div className="text-xs text-gray-400 dark:text-slate-500 mt-0.5">
-                        {new Date(mw.start_at).toLocaleString()} – {new Date(mw.end_at).toLocaleString()}
-                        {mw.device_ids.length > 0 && ` · ${mw.device_ids.length} device(s)`}
-                      </div>
-                    </div>
-                    {isAdmin && (
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => toggleMwMutation.mutate({ id: mw.id, active: !mw.active })}
-                          className="text-xs px-2 py-1 rounded border border-gray-300 dark:border-slate-600 text-gray-500 dark:text-slate-400 hover:text-gray-700 dark:hover:text-slate-300"
-                        >
-                          {mw.active ? 'Disable' : 'Enable'}
-                        </button>
-                        <button
-                          onClick={() => deleteMwMutation.mutate(mw.id)}
-                          className="p-1 rounded text-gray-400 hover:text-red-500 transition-colors"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              {(maintenanceWindows as MaintenanceWindow[]).length === 0 && (
-                <p className="text-sm text-gray-400 dark:text-slate-500 text-center py-4">No maintenance windows created</p>
-              )}
-            </div>
-          </div>
+          <MaintenanceWindowsCard isAdmin={isAdmin} timeZone={(settings['app_timezone'] as string) || 'UTC'} />
         </div>
       )}
 
@@ -2283,7 +2301,7 @@ export default function SettingsPage() {
                 placeholder="Search user, path, IP…"
                 value={auditSearch}
                 onChange={(e) => { setAuditSearch(e.target.value); setAuditPage(1); }}
-                className="input-field w-64 text-sm"
+                className="input w-64 text-sm"
               />
             </div>
             <div className="overflow-x-auto">
@@ -2344,8 +2362,11 @@ export default function SettingsPage() {
             </div>
             {(auditData?.total ?? 0) > 50 && (
               <div className="flex items-center justify-between mt-4 text-sm text-gray-500 dark:text-slate-400">
-                <span>{auditData?.total} total entries</span>
-                <div className="flex gap-2">
+                <span>{(auditData?.total ?? 0).toLocaleString()} total entries</span>
+                {/* Jump straight to a page (discussion #85), not only one at a time. */}
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setAuditPage(1)} disabled={auditPage <= 1}
+                    className="btn-secondary text-xs px-3 py-1 disabled:opacity-50">First</button>
                   <button
                     onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
                     disabled={auditPage <= 1}
@@ -2353,20 +2374,68 @@ export default function SettingsPage() {
                   >
                     Prev
                   </button>
-                  <span className="px-2 py-1">Page {auditPage}</span>
+                  <label className="flex items-center gap-1.5 px-1">
+                    Page
+                    <input
+                      key={auditPage}
+                      type="number" min={1} max={auditPages} defaultValue={auditPage}
+                      aria-label="Go to page"
+                      className="input py-0.5 px-1.5 text-xs w-16 text-center"
+                      onKeyDown={(e) => {
+                        if (e.key !== 'Enter') return;
+                        const n = Math.round(Number((e.target as HTMLInputElement).value));
+                        if (Number.isFinite(n)) setAuditPage(Math.min(auditPages, Math.max(1, n)));
+                      }}
+                      onBlur={(e) => {
+                        const n = Math.round(Number(e.target.value));
+                        if (Number.isFinite(n) && n !== auditPage) setAuditPage(Math.min(auditPages, Math.max(1, n)));
+                      }}
+                    />
+                    of {auditPages.toLocaleString()}
+                  </label>
                   <button
                     onClick={() => setAuditPage((p) => p + 1)}
-                    disabled={auditPage * 50 >= (auditData?.total ?? 0)}
+                    disabled={auditPage >= auditPages}
                     className="btn-secondary text-xs px-3 py-1 disabled:opacity-50"
                   >
                     Next
                   </button>
+                  <button onClick={() => setAuditPage(auditPages)} disabled={auditPage >= auditPages}
+                    className="btn-secondary text-xs px-3 py-1 disabled:opacity-50">Last</button>
                 </div>
               </div>
             )}
           </div>
         </div>
       )}
+        </div>
+      </div>
     </div>
+  );
+}
+
+/** A dBm limit: decimals allowed, empty means off (#249). Saves on blur or Enter. */
+function DbmLimit({ label, value, placeholder, disabled, onCommit }: {
+  label: string; value: unknown; placeholder: string; disabled?: boolean; onCommit: (v: number | null) => void;
+}) {
+  const saved = value === null || value === undefined || value === '' ? '' : String(value);
+  const [draft, setDraft] = useState<string | null>(null);
+  const commit = () => {
+    if (draft === null) return;
+    const t = draft.trim();
+    setDraft(null);
+    if (t === '') { if (saved !== '') onCommit(null); return; }
+    const n = Number(t);
+    if (!Number.isFinite(n) || n < -40 || n > 10) return;
+    if (String(n) !== saved) onCommit(n);
+  };
+  return (
+    <label className="flex items-center gap-2 text-xs text-gray-600 dark:text-slate-300">
+      {label}
+      <input className="input w-20 text-center py-1 text-xs" inputMode="decimal" placeholder={placeholder} disabled={disabled}
+        value={draft ?? saved} onChange={(e) => setDraft(e.target.value)} onBlur={commit}
+        onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }} />
+      dBm
+    </label>
   );
 }

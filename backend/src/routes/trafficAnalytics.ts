@@ -3,9 +3,39 @@ import { getQueryApi, bucket } from '../config/influxdb';
 import { query } from '../config/database';
 import { requireAuth } from '../middleware/auth';
 import { netflowCollector } from '../services/netflow/NetflowCollector';
+import { fluxString } from '@influxdata/influxdb-client';
+import { activeSite } from '../middleware/site';
+import { siteList } from '../utils/siteScope';
 
 const router = Router();
 router.use(requireAuth);
+
+/**
+ * A Flux filter for the selected site(s), or '' for the whole fleet. Traffic is
+ * stored with the site its exporter belongs to (outside review J4), so a site
+ * view, and a site-scoped account (P1-7), see only that site's traffic.
+ *
+ * A selection that contains every device is the whole fleet, so no filter is
+ * applied. That is always the case on a single-site install, where the one site
+ * is always selected: filtering there hid all traffic recorded before 0.24.47,
+ * which carries no site, and cost a filter on every query for nothing.
+ */
+async function siteFilter(req: Request): Promise<string> {
+  const sites = siteList(activeSite(req));
+  if (!sites) return '';
+  if (sites.length === 0) return '|> filter(fn: (r) => false)';
+  try {
+    const rows = await query<{ outside: number }>(
+      `SELECT COUNT(*)::int AS outside FROM devices WHERE site_id IS NULL OR NOT (site_id = ANY($1::int[]))`,
+      [sites]);
+    if (rows[0]?.outside === 0) return '';
+  } catch { /* can't tell: filter, which is the safe side */ }
+  // Site ids are integers, safe to inline as strings. Written as `==` joined by
+  // `or`, not contains(): InfluxDB pushes the former down to storage, while
+  // contains() is evaluated in Flux after reading every point in the range, and
+  // also stops the filters after it from being pushed down.
+  return `|> filter(fn: (r) => ${sites.map((id) => `r.site_id == "${id}"`).join(' or ')})`;
+}
 
 function rangeToFlux(range: string): string {
   const allowed = ['1h', '2h', '3h', '6h', '12h', '24h', '7d', '30d'];
@@ -31,8 +61,23 @@ function sanitizeMac(raw: string): string | null {
 }
 
 // GET /api/traffic/status — collector state for the config page
-router.get('/status', async (_req: Request, res: Response) => {
-  res.json(netflowCollector.getStats());
+router.get('/status', async (req: Request, res: Response) => {
+  const stats = netflowCollector.getStats();
+  // The exporter list follows the site selector, like the charts (#236). A
+  // site-scoped account's selection is always within its own sites (P1-7).
+  // Collector totals stay collector-wide; the response says so.
+  const sites = siteList(activeSite(req));
+  if (!sites) { res.json({ ...stats, site_filtered: false }); return; }
+  const own = new Set((await query<{ id: number }>(
+    `SELECT id FROM devices WHERE site_id = ANY($1::int[])`, [sites])).map((d) => d.id));
+  res.json({
+    ...stats,
+    // Only this site's devices: unidentified exporters and refused sources
+    // carry no site, so they show in the all-sites view only.
+    exporters: stats.exporters.filter((e) => own.has(e.deviceId)),
+    rejectedSources: [],
+    site_filtered: true,
+  });
 });
 
 // GET /api/traffic/timeseries?range=24h — fleet-wide upload/download over time
@@ -40,11 +85,13 @@ router.get('/timeseries', async (req: Request, res: Response) => {
   const range = rangeToFlux(String(req.query.range || '24h'));
   const every = windowForRange(range);
   const queryApi = getQueryApi();
+  const site = await siteFilter(req);
 
   const fluxQuery = `
     from(bucket: "${bucket}")
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_traffic")
+      ${site}
       |> filter(fn: (r) => r._field == "bytes" or r._field == "packets")
       |> group(columns: ["direction", "_field"])
       |> aggregateWindow(every: ${every}, fn: sum, createEmpty: false)
@@ -68,7 +115,8 @@ router.get('/timeseries', async (req: Request, res: Response) => {
       }
     });
   } catch {
-    // No data yet
+    // An Influx failure is not "no traffic" (outside review J3).
+    return res.status(503).json({ error: 'The metrics database could not be read, so this data is unavailable right now.' });
   }
 
   res.json(Object.values(pivoted).sort((a, b) => a.time.localeCompare(b.time)));
@@ -79,11 +127,13 @@ router.get('/top-clients', async (req: Request, res: Response) => {
   const range = rangeToFlux(String(req.query.range || '24h'));
   const limit = Math.min(parseInt(String(req.query.limit || '10'), 10) || 10, 50);
   const queryApi = getQueryApi();
+  const site = await siteFilter(req);
 
   const fluxQuery = `
     from(bucket: "${bucket}")
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_traffic")
+      ${site}
       |> filter(fn: (r) => r._field == "bytes")
       |> group(columns: ["mac", "direction"])
       |> sum()
@@ -104,7 +154,8 @@ router.get('/top-clients', async (req: Request, res: Response) => {
       else entry.download += value;
     });
   } catch {
-    // No data yet
+    // An Influx failure is not "no traffic" (outside review J3).
+    return res.status(503).json({ error: 'The metrics database could not be read, so this data is unavailable right now.' });
   }
 
   const ranked = Array.from(perMac.entries())
@@ -116,11 +167,15 @@ router.get('/top-clients', async (req: Request, res: Response) => {
   const realMacs = ranked.map((r) => r.mac).filter((m) => m !== 'unknown' && m !== 'other');
   const names = new Map<string, { hostname: string | null; custom_name: string | null; vendor: string | null; ip_address: string | null }>();
   if (realMacs.length > 0) {
+    // Names come from the clients in view, never another site's record of a MAC.
+    const sites = siteList(activeSite(req));
     const rows = await query<{ mac_address: string; hostname: string | null; custom_name: string | null; vendor: string | null; ip_address: string | null }>(
-      `SELECT DISTINCT ON (mac_address) mac_address, hostname, custom_name, vendor, ip_address
-       FROM clients WHERE LOWER(mac_address) = ANY($1)
-       ORDER BY mac_address, last_seen DESC NULLS LAST`,
-      [realMacs]
+      `SELECT DISTINCT ON (LOWER(c.mac_address)) c.mac_address, c.hostname, c.custom_name, c.vendor, c.ip_address
+       FROM clients c
+       ${sites ? 'JOIN devices d ON d.id = c.device_id AND d.site_id = ANY($2::int[])' : ''}
+       WHERE LOWER(c.mac_address) = ANY($1)
+       ORDER BY LOWER(c.mac_address), c.last_seen DESC NULLS LAST`,
+      sites ? [realMacs, sites] : [realMacs]
     );
     for (const row of rows) names.set(row.mac_address.toLowerCase(), row);
   }
@@ -144,18 +199,20 @@ router.get('/top-clients', async (req: Request, res: Response) => {
 router.get('/apps', async (req: Request, res: Response) => {
   const range = rangeToFlux(String(req.query.range || '24h'));
   const queryApi = getQueryApi();
+  const site = await siteFilter(req);
 
   let macFilter = '';
   if (req.query.mac) {
     const mac = sanitizeMac(String(req.query.mac));
     if (!mac) return res.status(400).json({ error: 'Invalid mac' });
-    macFilter = `|> filter(fn: (r) => r.mac == "${mac}")`;
+    macFilter = `|> filter(fn: (r) => r.mac == ${fluxString(String(mac))})`;
   }
 
   const fluxQuery = `
     from(bucket: "${bucket}")
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_traffic")
+      ${site}
       |> filter(fn: (r) => r._field == "bytes" or r._field == "packets")
       ${macFilter}
       |> group(columns: ["app", "_field"])
@@ -177,7 +234,8 @@ router.get('/apps', async (req: Request, res: Response) => {
       else entry.bytes += value;
     });
   } catch {
-    // No data yet
+    // An Influx failure is not "no traffic" (outside review J3).
+    return res.status(503).json({ error: 'The metrics database could not be read, so this data is unavailable right now.' });
   }
 
   const apps = Array.from(byApp.entries()).map(([app, e]) => ({ app, bytes: e.bytes, packets: e.packets }));
@@ -191,13 +249,15 @@ router.get('/client/:mac', async (req: Request, res: Response) => {
   const range = rangeToFlux(String(req.query.range || '24h'));
   const every = windowForRange(range);
   const queryApi = getQueryApi();
+  const site = await siteFilter(req);
 
   const seriesFlux = `
     from(bucket: "${bucket}")
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_traffic")
+      ${site}
       |> filter(fn: (r) => r._field == "bytes")
-      |> filter(fn: (r) => r.mac == "${mac}")
+      |> filter(fn: (r) => r.mac == ${fluxString(String(mac))})
       |> group(columns: ["direction"])
       |> aggregateWindow(every: ${every}, fn: sum, createEmpty: false)
   `;
@@ -213,15 +273,17 @@ router.get('/client/:mac', async (req: Request, res: Response) => {
       else if (direction === 'download') pivoted[time].download += value;
     });
   } catch {
-    // No data yet
+    // An Influx failure is not "no traffic" (outside review J3).
+    return res.status(503).json({ error: 'The metrics database could not be read, so this data is unavailable right now.' });
   }
 
   const appsFlux = `
     from(bucket: "${bucket}")
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_traffic")
+      ${site}
       |> filter(fn: (r) => r._field == "bytes" or r._field == "packets")
-      |> filter(fn: (r) => r.mac == "${mac}")
+      |> filter(fn: (r) => r.mac == ${fluxString(String(mac))})
       |> group(columns: ["app", "_field"])
       |> sum()
   `;
@@ -241,7 +303,8 @@ router.get('/client/:mac', async (req: Request, res: Response) => {
       else entry.bytes += value;
     });
   } catch {
-    // No data yet
+    // An Influx failure is not "no traffic" (outside review J3).
+    return res.status(503).json({ error: 'The metrics database could not be read, so this data is unavailable right now.' });
   }
   const apps = Array.from(byApp.entries()).map(([app, e]) => ({ app, bytes: e.bytes, packets: e.packets }));
 

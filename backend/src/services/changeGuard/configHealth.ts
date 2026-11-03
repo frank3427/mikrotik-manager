@@ -26,6 +26,7 @@ import {
   type RosRow,
 } from './pathModel';
 import type { GuardDevice } from './ChangeGuard';
+import { stpDomains, type StpBridge, type StpLink } from '../../utils/stpUpstream';
 
 export type FindingSeverity = 'critical' | 'warning' | 'info';
 
@@ -513,6 +514,301 @@ function ruleDuplicateAddress(snap: DeviceSnapshot): ConfigFinding[] {
 const SEVERITY_RANK: Record<FindingSeverity, number> = { critical: 0, warning: 1, info: 2 };
 
 /** Run every rule against a snapshot. Pure — no device or database access. */
+
+const STP_DOC = 'https://help.mikrotik.com/docs/spaces/ROS/pages/328068/Bridging+and+Switching#BridgingandSwitching-SpanningTreeProtocol';
+
+/**
+ * Spanning tree turned off on a bridge with more than one active port.
+ *
+ * RouterOS accepts `protocol-mode=none` without comment, and on a correctly
+ * cabled network nothing happens — which is precisely why it is dangerous. STP
+ * is not what makes the network work; it is what stops a second cable between
+ * two switches from becoming a broadcast storm that saturates every link and
+ * takes the segment down. With it off there is nothing to detect that loop and
+ * nothing to break it.
+ *
+ * Single-port bridges are ignored: they cannot loop.
+ */
+function ruleStpDisabled(snap: DeviceSnapshot): ConfigFinding[] {
+  const out: ConfigFinding[] = [];
+  for (const b of snap.bridges) {
+    const name = b['name'];
+    if (!name) continue;
+    const mode = (b['protocol-mode'] || '').toLowerCase();
+    if (mode !== 'none') continue;
+
+    const ports = snap.bridgePorts
+      .filter((p) => p['bridge'] === name && !isTrue(p['disabled']))
+      .map((p) => p['interface'])
+      .filter(Boolean);
+    if (ports.length < 2) continue;
+
+    out.push({
+      rule: 'stp-disabled',
+      fingerprint: `stp-disabled:${name}`,
+      severity: 'warning',
+      title: `Spanning tree is off on bridge ${name} (${ports.length} active ports)`,
+      detail:
+        `protocol-mode is "none", so this bridge runs no spanning tree. Nothing is wrong `
+        + `while the cabling is correct — but a second path between two switches, whether `
+        + `patched deliberately or by accident, becomes a forwarding loop. A loop at layer 2 `
+        + `has no TTL to stop it: broadcasts multiply until the segment is unusable, and it `
+        + `usually takes the management path with it.`,
+      remediation:
+        `Set a spanning tree protocol on the bridge: /interface/bridge set ${name} `
+        + `protocol-mode=rstp. Leave it off only where the bridge physically cannot loop.`,
+      docUrl: STP_DOC,
+      objects: [name, ...ports],
+    });
+  }
+  return out;
+}
+
+/**
+ * Classic STP where RSTP would do.
+ *
+ * Both prevent loops; they differ in how long the network is down while they
+ * work it out. Classic STP walks listening and learning on a timer — 30 to 50
+ * seconds before a port forwards. RSTP negotiates with its neighbour and is
+ * usually sub-second. The difference is only visible when a link fails, which is
+ * exactly when it is least welcome.
+ */
+function ruleStpLegacyMode(snap: DeviceSnapshot): ConfigFinding[] {
+  return snap.bridges
+    .filter((b) => b['name'] && (b['protocol-mode'] || '').toLowerCase() === 'stp')
+    .map((b) => ({
+      rule: 'stp-legacy-mode',
+      fingerprint: `stp-legacy-mode:${b['name']}`,
+      severity: 'info' as FindingSeverity,
+      title: `Bridge ${b['name']} runs classic STP rather than RSTP`,
+      detail:
+        `Recovery from a failed link takes 30-50 seconds under classic STP, against `
+        + `well under a second with RSTP. Everything through this bridge is offline for that `
+        + `whole interval. RSTP falls back to classic automatically when it meets a neighbour `
+        + `that only speaks it, so changing this is safe even in a mixed network.`,
+      remediation: `/interface/bridge set ${b['name']} protocol-mode=rstp`,
+      docUrl: STP_DOC,
+      objects: [b['name']],
+    }));
+}
+
+// ─── Spanning tree across the fleet (#260) ──────────────────────────────────
+
+export interface StpFleetInput {
+  deviceId: number;
+  deviceName: string;
+  /** Every managed bridge, as spanning tree reports it. */
+  fleetBridges: StpBridge[];
+  devices: { id: number; name: string; device_type: string | null }[];
+  /** Discovered neighbours of this device: port, managed far end if resolved, advertised capabilities. */
+  neighbours: { from_interface: string | null; to_device_id: number | null; neighbor_caps: string | null }[];
+  /** Every neighbour sighting, to name a root no managed device owns. */
+  sightings: StpLink[];
+}
+
+/**
+ * Spanning-tree findings that need the rest of the fleet to see (#260).
+ *
+ * - Spanning tree off on a bridge that has switches on two or more ports is a
+ *   loop one cable away: the per-device warning becomes critical.
+ * - A tree whose root kept RouterOS's default priority was settled by lowest
+ *   MAC address, not by anyone; reported on the root (or its members, when the
+ *   root isn't managed).
+ * - An access point as root of a tree of several switches: a reboot or link
+ *   flap there reconverges everything around the weakest box.
+ */
+export function stpFleetRules(snap: DeviceSnapshot, input: StpFleetInput): { findings: ConfigFinding[]; replaces: string[] } {
+  const findings: ConfigFinding[] = [];
+  const replaces: string[] = [];
+  const name = (id: number) => input.devices.find((d) => d.id === id)?.name.trim() ?? `device ${id}`;
+
+  for (const b of snap.bridges) {
+    const bridge = b['name'];
+    if (!bridge || (b['protocol-mode'] || '').toLowerCase() !== 'none') continue;
+    const members = new Set(snap.bridgePorts.filter((p) => p['bridge'] === bridge && !isTrue(p['disabled'])).map((p) => p['interface']));
+    const switchPorts = [...new Set(input.neighbours
+      .filter((n) => n.from_interface && members.has(n.from_interface)
+        && (n.to_device_id != null || /bridge/i.test(n.neighbor_caps ?? '')))
+      .map((n) => n.from_interface!))];
+    if (switchPorts.length < 2) continue;
+    replaces.push(`stp-disabled:${bridge}`);
+    findings.push({
+      rule: 'stp-disabled-redundant',
+      fingerprint: `stp-disabled-redundant:${bridge}`,
+      severity: 'critical',
+      title: `Spanning tree is off on bridge ${bridge}, which has switches on ${switchPorts.length} ports`,
+      detail:
+        `protocol-mode is "none" and discovery sees switches on ${switchPorts.join(', ')}. If any two of them are `
+        + `also connected to each other, by design or by a stray patch cable, this bridge forwards in a loop: `
+        + `broadcasts multiply until the network is unusable, and nothing here will stop it.`,
+      remediation: `/interface/bridge set ${bridge} protocol-mode=rstp`,
+      docUrl: STP_DOC,
+      objects: [bridge, ...switchPorts],
+    });
+  }
+
+  const domains = stpDomains(input.fleetBridges, input.sightings).filter((d) => d.memberDeviceIds.length >= 2);
+  for (const d of domains) {
+    if (!d.memberDeviceIds.includes(input.deviceId)) continue;
+    const isOwner = d.ownerDeviceId === input.deviceId;
+    if (d.defaultPriority && (isOwner || d.ownerDeviceId === null)) {
+      const others = d.memberDeviceIds.filter((id) => id !== input.deviceId).map(name);
+      findings.push({
+        rule: 'stp-root-by-mac',
+        fingerprint: `stp-root-by-mac:${d.rootBridgeId.toLowerCase()}`,
+        severity: 'info',
+        title: isOwner
+          ? `${input.deviceName.trim()} is the spanning-tree root only because it has the lowest MAC address`
+          : `This tree's root (${d.guessedName ?? d.rootBridgeId}) won on lowest MAC address, not by choice`,
+        detail:
+          `Every bridge in this tree (with ${others.join(', ')}) has RouterOS's default priority, 0x8000, so the `
+          + `root was decided by which has the lowest MAC. Replace or add a switch and the root can move to it, `
+          + `and the whole tree reconverges around a box nobody chose.`,
+        remediation: isOwner
+          ? `If this should be the root, make it so on purpose: /interface/bridge set [find] priority=0x4000`
+          : 'Give the switch that should be root a lower priority, e.g. /interface/bridge set [find] priority=0x4000 on it.',
+        docUrl: STP_DOC,
+        objects: [d.rootBridgeId],
+      });
+    }
+    const owner = input.devices.find((x) => x.id === d.ownerDeviceId);
+    if (isOwner && owner && /wireless|ap/i.test(owner.device_type ?? '')) {
+      findings.push({
+        rule: 'stp-root-is-ap',
+        fingerprint: `stp-root-is-ap:${d.rootBridgeId.toLowerCase()}`,
+        severity: 'warning',
+        title: `An access point, ${input.deviceName.trim()}, is the spanning-tree root for ${d.memberDeviceIds.length - 1} other device(s)`,
+        detail:
+          `Every switch in this tree routes its idea of the network through this AP. When it reboots or its link `
+          + `flaps, the tree reconverges around whichever switch has the next-best priority, and traffic stops while it does.`,
+        remediation:
+          `Give the core switch a lower priority than the AP (e.g. priority=0x4000 on the switch), or raise the AP's: `
+          + `/interface/bridge set [find] priority=0xF000`,
+        docUrl: STP_DOC,
+        objects: [d.rootBridgeId],
+      });
+    }
+  }
+  return { findings, replaces };
+}
+
+const DEVICE_MODE_DOC = 'https://help.mikrotik.com/docs/spaces/ROS/pages/93749258/Device-mode';
+
+/** Device-mode features the manager relies on, and what each one powers here. */
+const MANAGER_FEATURES: { key: string; what: string }[] = [
+  { key: 'bandwidth-test', what: 'the bandwidth test tool' },
+  { key: 'sniffer', what: 'packet capture' },
+  { key: 'hotspot', what: 'the Guest WiFi wizard (hotspot)' },
+  { key: 'fetch', what: 'adopting new devices through this one' },
+];
+
+/**
+ * RouterOS device-mode blocking what the manager uses (#230).
+ *
+ * Device-mode switches RouterOS features off below the configuration: a
+ * command for a blocked feature fails with "not allowed by device-mode", and
+ * changing it needs someone at the device to press its button or power-cycle
+ * it. Found out at the worst moment, as the reason a protected change couldn't
+ * run, so it's raised ahead of time.
+ */
+function ruleDeviceMode(snap: DeviceSnapshot): ConfigFinding[] {
+  const dm = snap.deviceMode;
+  if (!dm) return [];
+  const fields = new Map(Object.entries(dm));
+  const blocked = (key: string) => ['false', 'no'].includes(fields.get(key) ?? '');
+  const mode = dm['mode'] || 'unknown';
+  const out: ConfigFinding[] = [];
+  const how = `Changing device-mode needs physical access: run /system/device-mode/update with the `
+    + `feature set to yes, then press the device's reset or mode button (or power-cycle it) within `
+    + `the confirmation window.`;
+
+  if (isTrue(dm['flagged'])) {
+    out.push({
+      rule: 'device-mode-flagged',
+      fingerprint: 'device-mode-flagged',
+      severity: 'warning',
+      title: 'RouterOS has flagged this device',
+      detail: `RouterOS flags a device when it finds configuration it considers suspicious, and `
+        + `then refuses to change device-mode until the flag is cleared. Something on this device `
+        + `triggered it, which is worth checking for compromise.`,
+      remediation: `Review the configuration for anything you didn't add, then clear the flag `
+        + `with /system/device-mode/update flagged=no and confirm at the device. ${how}`,
+      docUrl: DEVICE_MODE_DOC,
+      objects: [],
+    });
+  }
+
+  if (blocked('scheduler')) {
+    out.push({
+      rule: 'device-mode-no-scheduler',
+      fingerprint: 'device-mode-no-scheduler',
+      severity: 'warning',
+      title: `Device-mode (${mode}) blocks the scheduler, so Change Guard can't protect changes`,
+      detail: `Change Guard arms its automatic undo as a scheduler entry on the device. With the `
+        + `scheduler blocked it can't, and a change that could cut off management is refused rather `
+        + `than made unprotected.`,
+      remediation: `Allow the scheduler: /system/device-mode/update scheduler=yes. ${how}`,
+      docUrl: DEVICE_MODE_DOC,
+      objects: ['scheduler'],
+    });
+  }
+
+  const off = MANAGER_FEATURES.filter((f) => blocked(f.key));
+  if (off.length > 0) {
+    out.push({
+      rule: 'device-mode-blocks-features',
+      fingerprint: `device-mode-blocks-features:${off.map((f) => f.key).join(',')}`,
+      severity: 'info',
+      title: `Device-mode (${mode}) blocks ${off.map((f) => f.key).join(', ')}`,
+      detail: `These are switched off on the device, so ${off.map((f) => f.what).join(', ')} won't `
+        + `work here; RouterOS answers "not allowed by device-mode". That's fine if it's deliberate.`,
+      remediation: `Allow what you need, for example /system/device-mode/update `
+        + `${off.map((f) => `${f.key}=yes`).join(' ')}. ${how}`,
+      docUrl: DEVICE_MODE_DOC,
+      objects: off.map((f) => f.key),
+    });
+  }
+  return out;
+}
+
+/**
+ * Routing between VLANs on the CPU of a switch that could do it in hardware
+ * (#254). A Marvell 98DX switch chip (CRS3xx, CRS5xx, CCR2116, CCR2216) can
+ * route between VLAN interfaces at wire speed with L3 hardware offloading;
+ * with it off, every routed packet goes through the CPU, a fraction of the
+ * ports' speed. Info rather than a warning: it isn't broken, and turning
+ * offloading on means routed traffic no longer passes the firewall.
+ */
+export function ruleL3HwOffloadOff(snap: DeviceSnapshot): ConfigFinding[] {
+  const chip = (snap.switches ?? []).find((s) => isL3HwChip(s['type']));
+  if (!chip || isTrue(chip['l3-hw-offloading'])) return [];
+  const vlanNames = new Set(snap.vlanInterfaces.filter((v) => !isTrue(v['disabled'])).map((v) => v['name']));
+  const routed = [...new Set(snap.addresses
+    .filter((a) => !isTrue(a['disabled']) && vlanNames.has(a['interface']))
+    .map((a) => a['interface']))].sort();
+  if (routed.length < 2) return [];
+  return [{
+    rule: 'l3-hw-offload-off',
+    // Per chip, not per VLAN set: adding a VLAN shouldn't make it a new finding.
+    fingerprint: `l3-hw-offload-off:${chip['name'] || 'switch1'}`,
+    severity: 'info',
+    title: `Routing between ${routed.length} VLANs runs on the CPU`,
+    detail: `${routed.join(', ')} have addresses, so this device routes between them, and its switch chip ` +
+      `(${chip['type']}) can do that in hardware, but L3 hardware offloading is off. Every routed packet ` +
+      `goes through the CPU, at a fraction of the ports' speed.`,
+    remediation: 'Turn on L3 hardware offloading from the device\u2019s L3 offload card (VLANs tab). Routed traffic then ' +
+      'bypasses the CPU, so firewall filter and NAT rules no longer apply to it: check that nothing relies on them first. ' +
+      'Only VLAN interfaces on a hardware-offloaded bridge with VLAN filtering are routed in hardware.',
+    objects: [chip['name'] || 'switch1', ...routed],
+    docUrl: 'https://help.mikrotik.com/docs/spaces/ROS/pages/62390319/L3+Hardware+Offloading',
+  }];
+}
+
+/** A switch chip that supports L3 hardware offloading: Marvell Prestera 98DX. */
+export function isL3HwChip(type: string | undefined): boolean {
+  return /^Marvell-98DX/i.test(type || '');
+}
+
 export function auditConfig(snap: DeviceSnapshot, device: GuardDevice): ConfigFinding[] {
   const findings = [
     ...ruleIpOnBridgePort(snap),
@@ -527,6 +823,10 @@ export function auditConfig(snap: DeviceSnapshot, device: GuardDevice): ConfigFi
     ...ruleMultipleHwBridges(snap),
     ...ruleMtuExceedsL2Mtu(snap),
     ...ruleDuplicateAddress(snap),
+    ...ruleStpDisabled(snap),
+    ...ruleStpLegacyMode(snap),
+    ...ruleDeviceMode(snap),
+    ...ruleL3HwOffloadOff(snap),
   ];
   return findings.sort(
     (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || a.rule.localeCompare(b.rule)
@@ -545,7 +845,22 @@ export interface ConfigHealthResult {
  */
 export async function runConfigHealth(device: GuardDevice): Promise<ConfigHealthResult> {
   const snap = await captureSnapshot(device);
-  const findings = auditConfig(snap, device);
+  let findings = auditConfig(snap, device);
+  // Spanning-tree checks that need the rest of the fleet (#260).
+  try {
+    const [fleetBridges, devices, neighbours, sightings] = await Promise.all([
+      query<StpBridge>(`SELECT device_id, bridge_name, bridge_id, root_bridge, root_bridge_id, root_port, root_path_cost, designated_bridge_id, designated_port_id FROM device_bridges`),
+      query<{ id: number; name: string; device_type: string | null }>(`SELECT id, name, device_type FROM devices`),
+      query<{ from_interface: string | null; to_device_id: number | null; neighbor_caps: string | null }>(
+        `SELECT from_interface, to_device_id, neighbor_caps FROM topology_links WHERE from_device_id = $1`, [device.id]),
+      query<StpLink>(`SELECT DISTINCT NULL::int AS from_device_id, NULL::int AS to_device_id, neighbor_mac, neighbor_identity FROM topology_links WHERE neighbor_mac IS NOT NULL`),
+    ]);
+    const fleet = stpFleetRules(snap, { deviceId: device.id, deviceName: device.name, fleetBridges, devices, neighbours, sightings });
+    findings = [...findings.filter((f) => !fleet.replaces.includes(f.fingerprint)), ...fleet.findings]
+      .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || a.rule.localeCompare(b.rule));
+  } catch (e) {
+    console.warn(`[config-health] spanning-tree fleet checks skipped for ${device.name}: ${(e as Error).message}`);
+  }
   const checkedAt = new Date();
 
   for (const f of findings) {

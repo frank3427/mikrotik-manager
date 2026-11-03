@@ -1,12 +1,17 @@
+import { seal } from '../utils/sealed';
 import { Router, Request, Response } from 'express';
 import { randomBytes, createHash } from 'crypto';
 import { query, queryOne } from '../config/database';
-import { requireAuth, requireAdmin, requireWrite } from '../middleware/auth';
+import { requireAuth, requireAdmin, requireWrite, fleetOnly } from '../middleware/auth';
+import { canSeeDeviceSecrets, maskUrl } from '../utils/redactSecrets';
 import { webhookService, WEBHOOK_EVENTS } from '../services/WebhookService';
 import { reportService, computeNextRun } from '../services/ReportService';
 
 const router = Router();
 router.use(requireAuth);
+// Webhooks and scheduled reports are fleet-wide: an account limited to some
+// sites neither reads nor changes them (GHSA-28hr-v457-cc6g).
+router.use(['/webhooks', '/reports'], fleetOnly);
 
 // Linear email check — no backtracking regex (avoids ReDoS on user-supplied lists).
 function isValidEmail(addr: string): boolean {
@@ -54,13 +59,17 @@ router.delete('/tokens/:id', requireAdmin, async (req: Request, res: Response) =
 
 // ─── Webhooks ──────────────────────────────────────────────────────────────────
 
-router.get('/webhooks', async (_req: Request, res: Response) => {
-  const rows = await query(
+router.get('/webhooks', async (req: Request, res: Response) => {
+  const rows = await query<{ url: string }>(
     `SELECT id, name, url, (secret IS NOT NULL AND secret != '') AS has_secret,
             events, enabled, last_status, last_fired_at, created_at
      FROM webhooks ORDER BY created_at DESC`);
-  res.json({ webhooks: rows, availableEvents: WEBHOOK_EVENTS });
+  // A webhook URL often is the credential (a token in its path or query), so
+  // read-only accounts see only where it points (GHSA-28hr-v457-cc6g).
+  const webhooks = canSeeDeviceSecrets(req.user) ? rows : rows.map((r) => ({ ...r, url: maskUrl(r.url) }));
+  res.json({ webhooks, availableEvents: WEBHOOK_EVENTS });
 });
+
 
 router.post('/webhooks', requireWrite, async (req: Request, res: Response) => {
   const { name, url, secret, events } = req.body as { name?: string; url?: string; secret?: string; events?: string[] };
@@ -71,7 +80,8 @@ router.post('/webhooks', requireWrite, async (req: Request, res: Response) => {
 
   const row = await queryOne<{ id: number }>(
     `INSERT INTO webhooks (name, url, secret, events) VALUES ($1,$2,$3,$4) RETURNING id`,
-    [name.trim().slice(0, 100), url.trim(), secret?.trim() || null, evts]);
+    // The signing secret is stored encrypted (S7).
+    [name.trim().slice(0, 100), url.trim(), secret?.trim() ? seal(secret.trim()) : null, evts]);
   res.status(201).json({ id: row!.id });
 });
 
@@ -97,7 +107,8 @@ router.put('/webhooks/:id', requireWrite, async (req: Request, res: Response) =>
        events  = COALESCE($5, events),
        enabled = COALESCE($6, enabled)
      WHERE id = $1`,
-    [id, name?.trim().slice(0, 100) ?? null, url?.trim() ?? null, secret ?? null, evts ?? null, enabled ?? null]);
+    [id, name?.trim().slice(0, 100) ?? null, url?.trim() ?? null,
+     secret == null ? null : (secret.trim() ? seal(secret.trim()) : ''), evts ?? null, enabled ?? null]);
   res.json({ ok: true });
 });
 

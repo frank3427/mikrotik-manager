@@ -7,6 +7,11 @@ import clsx from 'clsx';
 import { useCanWrite } from '../../hooks/useCanWrite';
 import CopyVlanModal from './CopyVlanModal';
 import { LockoutVerdictDialog, lockoutVerdictOf, type LockoutVerdict } from '../ChangeGuardDialog';
+import ReviewChangesButton from '../common/ReviewChangesButton';
+import L3HwCard from './L3HwCard';
+import SwitchVlanCard from './SwitchVlanCard';
+import { invalidateDevice } from '../../utils/invalidateDevice';
+import VlanInterfacesCard from './VlanInterfacesCard';
 
 interface PortForm {
   tagged_ports: string;
@@ -25,7 +30,7 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
   // that re-sends the same change with confirm_lockout once the user accepts.
   const [lockout, setLockout] = useState<{ verdict: LockoutVerdict; retry: () => void } | null>(null);
 
-  const { data: vlans = [], isLoading, refetch, isFetching } = useQuery({
+  const { data: vlans = [], isLoading, isFetching } = useQuery({
     queryKey: ['vlans', deviceId],
     queryFn: () => devicesApi.getVlans(deviceId).then((r) => r.data),
     refetchInterval: 60_000,
@@ -36,11 +41,38 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
     queryFn: () => devicesApi.getPorts(deviceId).then((r) => r.data),
   });
   const ports: SwitchPort[] = portsData?.ports ?? [];
+  // Older switch chips keep VLANs in their own table (#278). There, bridge VLAN
+  // filtering moves switching to the CPU, so the nudge to turn it on is wrong.
+  const { data: switchVlans } = useQuery({
+    queryKey: ['switch-vlans', deviceId],
+    queryFn: () => devicesApi.getSwitchVlans(deviceId).then((r) => r.data),
+    staleTime: 60_000,
+    retry: false,
+  });
+  const chipVlans = !!switchVlans?.supported;
+  // /interface/vlan entries (#309); same query as the card, so one read.
+  const { data: vlanInterfaces = [] } = useQuery({
+    queryKey: ['vlan-interfaces', deviceId],
+    queryFn: () => devicesApi.getVlanInterfaces(deviceId).then((r) => r.data),
+    staleTime: 60_000,
+    refetchInterval: 60_000,
+    retry: false,
+  });
 
   // Find bridges where vlan-filtering is not enabled (stored as 'yes' from RouterOS or 'true' after toggle)
   const bridgesWithoutFiltering = ports.filter(
     (p) => p.type === 'bridge' && p.config_json?.['vlan-filtering'] !== 'yes' && p.config_json?.['vlan-filtering'] !== 'true'
   );
+
+  // Refresh reads interfaces and VLANs from the device (a scoped sync), then
+  // reloads the tab. The bridge VLAN table and ports are stored by the poller,
+  // so a plain reload showed the same rows until the next slow poll. Viewers
+  // can't start a sync and get the reload.
+  const refresh = useMutation({
+    meta: { inlineError: true },
+    mutationFn: async () => { if (canWrite) await devicesApi.sync(deviceId, 'vlans'); },
+    onSettled: () => invalidateDevice(queryClient, deviceId),
+  });
 
   // ── Copy VLAN modal ──
   const [showCopyModal, setShowCopyModal] = useState(false);
@@ -58,21 +90,27 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
   // ── Delete error ──
   const [deleteError, setDeleteError] = useState('');
 
-  const bridgeOptions = [...new Set((vlans as Vlan[]).map((v) => v.bridge).filter(Boolean))];
+  // Every bridge on the device, not just those that already have VLANs: a bridge
+  // with none could never get its first one (outside review U14).
+  const bridgeOptions = [...new Set([
+    ...ports.filter((p) => p.type === 'bridge').map((p) => p.name),
+    ...(vlans as Vlan[]).map((v) => v.bridge),
+  ].filter(Boolean))];
 
   // ── Mutations ──
+  const addRequest = (confirm: boolean) => {
+    const tagged = addForm.tagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
+    const untagged = addForm.untagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
+    return devicesApi.addVlan(deviceId, {
+      bridge: addForm.bridge,
+      vlan_id: parseInt(addForm.vlan_id, 10),
+      tagged_ports: tagged,
+      untagged_ports: untagged,
+      ...(confirm ? { confirm_lockout: true } : {}),
+    });
+  };
   const addMutation = useMutation({
-    mutationFn: (confirm: boolean) => {
-      const tagged = addForm.tagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
-      const untagged = addForm.untagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
-      return devicesApi.addVlan(deviceId, {
-        bridge: addForm.bridge,
-        vlan_id: parseInt(addForm.vlan_id, 10),
-        tagged_ports: tagged,
-        untagged_ports: untagged,
-        ...(confirm ? { confirm_lockout: true } : {}),
-      });
-    },
+    mutationFn: addRequest,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['vlans', deviceId] });
       setAddForm({ vlan_id: '', bridge: bridgeOptions[0] || '', tagged_ports: '', untagged_ports: '' });
@@ -88,17 +126,18 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
     },
   });
 
+  const updateRequest = (confirm: boolean) => {
+    if (!editingVlan) throw new Error('No VLAN selected');
+    const tagged = editForm.tagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
+    const untagged = editForm.untagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
+    return devicesApi.updateVlan(deviceId, editingVlan.id, {
+      tagged_ports: tagged,
+      untagged_ports: untagged,
+      ...(confirm ? { confirm_lockout: true } : {}),
+    });
+  };
   const updateMutation = useMutation({
-    mutationFn: (confirm: boolean) => {
-      if (!editingVlan) throw new Error('No VLAN selected');
-      const tagged = editForm.tagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
-      const untagged = editForm.untagged_ports.split(',').map((s) => s.trim()).filter(Boolean);
-      return devicesApi.updateVlan(deviceId, editingVlan.id, {
-        tagged_ports: tagged,
-        untagged_ports: untagged,
-        ...(confirm ? { confirm_lockout: true } : {}),
-      });
-    },
+    mutationFn: updateRequest,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['vlans', deviceId] });
       setEditingVlan(null);
@@ -112,6 +151,17 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
       setEditError(msg || 'Failed to update VLAN');
     },
   });
+
+  const submitAdd = () => {
+    // A whole number from 1 to 4094; parseInt read "10.5" as VLAN 10 (U14).
+    const id = addForm.vlan_id.trim();
+    if (!/^\d+$/.test(id) || Number(id) < 1 || Number(id) > 4094) {
+      setAddError('VLAN ID must be a whole number from 1 to 4094.');
+      return;
+    }
+    if (!addForm.bridge) { setAddError('Choose a bridge.'); return; }
+    addMutation.mutate(false);
+  };
 
   const deleteMutation = useMutation({
     mutationFn: ({ vlanDbId, confirm = false }: { vlanDbId: number; confirm?: boolean }) =>
@@ -146,8 +196,14 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
 
   return (
     <div className="space-y-4">
+      {/* Routing between VLANs in hardware or on the CPU (#254) */}
+      <L3HwCard deviceId={deviceId} />
+
+      {/* VLANs in the switch chip's own table (#278) */}
+      {chipVlans && switchVlans && <SwitchVlanCard view={switchVlans} deviceId={deviceId} />}
+
       {/* VLAN Filtering warning */}
-      {bridgesWithoutFiltering.length > 0 && (
+      {bridgesWithoutFiltering.length > 0 && !chipVlans && (
         <div className="flex items-start gap-3 rounded-lg border border-amber-300 dark:border-amber-600 bg-amber-50 dark:bg-amber-900/20 px-4 py-3">
           <Network className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
           <div className="flex-1 text-sm text-amber-800 dark:text-amber-300">
@@ -179,14 +235,16 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => refetch()}
-            disabled={isFetching}
+            onClick={() => refresh.mutate()}
+            disabled={isFetching || refresh.isPending}
             className="btn-secondary flex items-center gap-2 text-sm"
+            title={canWrite ? 'Read interfaces and VLANs from the device now' : 'Reload'}
           >
-            <RefreshCw className={clsx('w-3.5 h-3.5', isFetching && 'animate-spin')} />
+            <RefreshCw className={clsx('w-3.5 h-3.5', (isFetching || refresh.isPending) && 'animate-spin')} />
             Refresh
           </button>
-          {canWrite && deviceType === 'switch' && (
+          {/* Bridge VLANs aren't how this switch chip does VLANs (#278): no adding or copying them here. */}
+          {canWrite && deviceType === 'switch' && !chipVlans && (
             <button
               onClick={() => setShowCopyModal(true)}
               className="btn-secondary flex items-center gap-2 text-sm"
@@ -196,7 +254,7 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
               Copy from Switch
             </button>
           )}
-          {canWrite && (
+          {canWrite && !chipVlans && (
             <button
               onClick={() => {
                 setShowAdd(!showAdd);
@@ -276,13 +334,15 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
           )}
           <div className="flex gap-2">
             <button
-              onClick={() => addMutation.mutate(false)}
+              onClick={submitAdd}
               disabled={!addForm.vlan_id || !addForm.bridge || addMutation.isPending}
               className="btn-primary flex items-center gap-2 text-sm"
             >
               {addMutation.isPending && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
               Add VLAN
             </button>
+            <ReviewChangesButton request={() => addRequest(false)} onApply={submitAdd} applyLabel="Add VLAN"
+              deviceName={deviceName} disabled={!addForm.vlan_id || !addForm.bridge || addMutation.isPending} />
             <button onClick={() => setShowAdd(false)} className="btn-secondary text-sm">Cancel</button>
           </div>
         </div>
@@ -345,6 +405,8 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
                 : <Check className="w-3.5 h-3.5" />}
               Save Changes
             </button>
+            <ReviewChangesButton request={() => updateRequest(false)} onApply={() => updateMutation.mutate(false)}
+              applyLabel="Save changes" deviceName={deviceName} disabled={updateMutation.isPending} />
             <button onClick={() => setEditingVlan(null)} className="btn-secondary text-sm">Cancel</button>
           </div>
         </div>
@@ -365,7 +427,11 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
       <div className="card overflow-hidden">
         {(vlans as Vlan[]).length === 0 ? (
           <div className="text-center py-8 text-gray-400 dark:text-slate-500">
-            No VLANs configured on this device, or device not synced yet.
+            {chipVlans
+              ? 'No bridge VLANs. On this switch chip, VLANs are set in the switch chip table above.'
+              : vlanInterfaces.length > 0
+                ? 'No bridge VLANs. This device’s VLANs are VLAN interfaces, listed below.'
+                : 'No VLANs configured on this device, or device not synced yet.'}
           </div>
         ) : (
           <table className="w-full text-sm">
@@ -454,8 +520,12 @@ export default function VlansTab({ deviceId, deviceName, deviceType, onGoToPorts
         )}
       </div>
 
+      {/* /interface/vlan entries: router-on-a-stick VLANs (#309) */}
+      <VlanInterfacesCard deviceId={deviceId} />
+
       {lockout && (
         <LockoutVerdictDialog
+          deviceId={deviceId}
           verdict={lockout.verdict}
           confirmPhrase={deviceName || 'confirm'}
           pending={addMutation.isPending || updateMutation.isPending || deleteMutation.isPending}

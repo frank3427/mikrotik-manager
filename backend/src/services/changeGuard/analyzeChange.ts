@@ -7,21 +7,59 @@
  * before and violated after is a predicted lockout, and the invariant explains
  * itself, so the warning names the actual mechanism instead of being generic.
  */
+import { planVlanWrite } from '../../utils/bridgeVlanPlan';
 import { evaluate, INVARIANTS, type InvariantStatus } from './invariants';
 import { resolveManagementPath, expandVlanIds, type DeviceSnapshot, type ManagementPath, type RosRow } from './pathModel';
 import type { GuardDevice } from './ChangeGuard';
 
 export type PlannedChange =
   | { kind: 'bridge.vlan-filtering'; bridge: string; enabled: boolean }
-  | { kind: 'port.vlan'; port: string; pvid: number; tagged: number[]; untagged: number[] }
+  | {
+      kind: 'port.vlan'; port: string; pvid: number; tagged: number[]; untagged: number[];
+      /** Tagged list is the complete set: unlisted static tagged rows lose the port (#165). */
+      replaceTagged?: boolean;
+      /**
+       * Set when the caller is also changing frame admission. Present from
+       * v0.24.20; absent means only the PVID and membership move, which is a
+       * materially smaller change (#151).
+       */
+      mode?: 'access' | 'trunk';
+    }
   | { kind: 'vlan.add'; bridge: string; vlanId: number; tagged: string[]; untagged: string[] }
   | { kind: 'vlan.update'; bridge: string; vlanId: number; tagged: string[]; untagged: string[] }
   | { kind: 'vlan.delete'; bridge: string; vlanId: number }
   | { kind: 'ip.remove'; addressId: string }
+  /** Edit an address in place (#285); `fields` use RouterOS names, '' clears. */
+  | { kind: 'ip.set'; addressId: string; fields: Record<string, string> }
   | { kind: 'interface.disable'; name: string; disabled: boolean }
   | { kind: 'bond.delete'; name: string }
+  /** Ports into a bridge, or out of any bridge with `bridge: null` (#258). */
+  | { kind: 'bridge-port.move'; ports: string[]; bridge: string | null }
+  /** Delete a bridge; only empty ones are, but the model doesn't assume it. */
+  | { kind: 'bridge.delete'; bridge: string }
   | { kind: 'route.remove'; routeId: string }
-  | { kind: 'service.toggle'; serviceId: string; disabled: boolean };
+  /** A static route; `table` is the routing table (blank = main). */
+  | { kind: 'route.add'; dstAddress: string; gateway: string; distance?: number; table?: string }
+  | { kind: 'service.toggle'; serviceId: string; disabled: boolean }
+  /**
+   * Firewall filter edits. `fields` use RouterOS names; in firewall.set an
+   * empty value clears the property, as DeviceCollector.setItem does.
+   */
+  | { kind: 'firewall.add'; fields: Record<string, string>; placeBefore?: string }
+  | { kind: 'firewall.set'; ruleId: string; fields: Record<string, string> }
+  | { kind: 'firewall.move'; ruleId: string; destination?: string }
+  | { kind: 'firewall.remove'; ruleId: string }
+  | { kind: 'address-list.add'; fields: Record<string, string> }
+  | { kind: 'address-list.set'; entryId: string; fields: Record<string, string> }
+  | { kind: 'address-list.remove'; entryId: string }
+  /**
+   * A change the model can't simulate on an object the management path uses
+   * (port speed, a bond's settings): not predicted to break, but reported as
+   * a warning so auto-revert is required.
+   */
+  | { kind: 'path-object.change'; name: string; what: string }
+  /** Several changes applied in order, e.g. a VLAN copy. */
+  | { kind: 'batch'; changes: PlannedChange[] };
 
 export type Severity = 'safe' | 'warning' | 'critical';
 
@@ -78,25 +116,50 @@ export function simulate(snap: DeviceSnapshot, change: PlannedChange): DeviceSna
     case 'port.vlan': {
       const port = s.bridgePorts.find((p) => p['interface'] === change.port);
       if (port) port['pvid'] = String(change.pvid);
+      // Frame admission, when the caller is changing it. This matters more than
+      // the PVID for lockout: admit-only-vlan-tagged on the port carrying
+      // untagged management traffic cuts it off even though every VLAN row
+      // still lists the port (#151).
+      if (port && change.mode) {
+        port['frame-types'] = change.mode === 'access'
+          ? 'admit-only-untagged-and-priority-tagged'
+          : 'admit-only-vlan-tagged';
+        port['ingress-filtering'] = 'true';
+      }
       const bridge = port?.['bridge'];
       if (!bridge) break;
 
-      // setPortVlanConfig only rewrites rows for the VLANs actually listed in the
-      // request, and silently skips VLANs that have no row. Crucially it does NOT
-      // strip the port from VLANs the caller didn't mention — modelling it as a
-      // full replacement would invent violations that the real change never causes.
-      for (const row of s.bridgeVlans) {
-        if (row['bridge'] !== bridge) continue;
-        const vids = expandVlanIds(row['vlan-ids']);
-        const wantTagged = vids.some((v) => change.tagged.includes(v));
-        const wantUntagged = vids.some((v) => change.untagged.includes(v));
-        if (!wantTagged && !wantUntagged) continue;
+      // Exactly what setPortVlanConfig does, using its own planner (P2-7):
+      // the tagged VLANs first, then the untagged ones, each moving the port
+      // between the lists, so a VLAN in both ends up untagged. Each VLAN's
+      // row is the one whose vlan-ids is exactly that VLAN (the device query
+      // the writer makes); with none, or only a dynamic one, a new static row
+      // is added. VLANs not mentioned are left alone.
+      const applyVlan = (vid: number, role: 'tagged' | 'untagged'): void => {
+        const row = s.bridgeVlans.find((r) => r['bridge'] === bridge && (r['vlan-ids'] || '').trim() === String(vid));
+        const plan = planVlanWrite(row ? { ...row, '.id': row['.id'] || 'sim' } : undefined, change.port, role);
+        if (plan.action === 'noop') return;
+        if (plan.action === 'set' && row) { setMembership(row, csv(plan.tagged), csv(plan.untagged)); return; }
+        const added: RosRow = { bridge, 'vlan-ids': String(vid), dynamic: 'false' };
+        setMembership(added, csv(plan.tagged), csv(plan.untagged));
+        s.bridgeVlans.push(added);
+      };
+      for (const vid of change.tagged) applyVlan(vid, 'tagged');
+      for (const vid of change.untagged) applyVlan(vid, 'untagged');
 
-        const tagged = csv(row['current-tagged'] ?? row['tagged']).filter((p) => p !== change.port);
-        const untagged = csv(row['current-untagged'] ?? row['untagged']).filter((p) => p !== change.port);
-        if (wantTagged) tagged.push(change.port);
-        if (wantUntagged) untagged.push(change.port);
-        setMembership(row, tagged, untagged);
+      // The removal half, when requested. Mirrors planTaggedRemovals: static
+      // rows only, whole rows only — a range row that still covers a kept VLAN
+      // is left as it is, exactly as the device write leaves it.
+      if (change.replaceTagged) {
+        const keep = new Set(change.tagged);
+        for (const row of s.bridgeVlans) {
+          if (row['bridge'] !== bridge || isDynamic(row)) continue;
+          const tagged = csv(row['current-tagged'] ?? row['tagged']);
+          if (!tagged.includes(change.port)) continue;
+          const vids = expandVlanIds(row['vlan-ids']);
+          if (vids.some((v) => keep.has(v))) continue;
+          setMembership(row, tagged.filter((p) => p !== change.port), csv(row['current-untagged'] ?? row['untagged']));
+        }
       }
       break;
     }
@@ -131,15 +194,82 @@ export function simulate(snap: DeviceSnapshot, change: PlannedChange): DeviceSna
       break;
     }
 
+    case 'ip.set': {
+      s.addresses = s.addresses.map((a) => {
+        if (a['.id'] !== change.addressId) return a;
+        const row = mergeFields(a, change.fields);
+        // As RouterOS does: an address on a bridge port is held by the bridge.
+        const to = change.fields['interface'];
+        if (to) {
+          const port = s.bridgePorts.find((p) => p['interface'] === to && p['disabled'] !== 'true' && p['disabled'] !== 'yes');
+          row['actual-interface'] = port?.['bridge'] || to;
+        }
+        return row;
+      });
+      break;
+    }
+
     case 'interface.disable': {
-      const iface = s.interfaces.find((i) => i['name'] === change.name);
+      // By name, or by RouterOS id for callers that only have that (WireGuard).
+      const iface = s.interfaces.find((i) => i['name'] === change.name || i['.id'] === change.name);
       if (iface) iface['disabled'] = change.disabled ? 'true' : 'false';
+      break;
+    }
+
+    // What moveBridgePorts does: a port in a bridge moves with its row (PVID and
+    // frame admission back to the defaults), one that isn't gets a new row, and
+    // the old bridges' static VLAN rows stop listing it.
+    case 'bridge-port.move': {
+      for (const port of change.ports) {
+        const row = s.bridgePorts.find((p) => p['interface'] === port);
+        const from = row?.['bridge'];
+        if (from === (change.bridge ?? undefined)) continue;
+        if (from) {
+          for (const v of s.bridgeVlans) {
+            if (v['bridge'] !== from || isDynamic(v)) continue;
+            const tagged = csv(v['current-tagged'] ?? v['tagged']);
+            const untagged = csv(v['current-untagged'] ?? v['untagged']);
+            if (!tagged.includes(port) && !untagged.includes(port)) continue;
+            setMembership(v, tagged.filter((m) => m !== port), untagged.filter((m) => m !== port));
+          }
+        }
+        if (!change.bridge) {
+          s.bridgePorts = s.bridgePorts.filter((p) => p['interface'] !== port);
+        } else if (row) {
+          row['bridge'] = change.bridge;
+          row['pvid'] = '1';
+          row['frame-types'] = 'admit-all';
+        } else {
+          s.bridgePorts.push({ interface: port, bridge: change.bridge, pvid: '1', 'frame-types': 'admit-all', disabled: 'false' });
+        }
+      }
+      break;
+    }
+
+    case 'bridge.delete': {
+      s.bridges = s.bridges.filter((b) => b['name'] !== change.bridge);
+      s.interfaces = s.interfaces.filter((i) => i['name'] !== change.bridge);
+      s.bridgePorts = s.bridgePorts.filter((p) => p['bridge'] !== change.bridge);
+      s.addresses = s.addresses.filter((a) => a['interface'] !== change.bridge);
       break;
     }
 
     case 'bond.delete': {
       s.interfaces = s.interfaces.filter((i) => i['name'] !== change.name);
       s.bridgePorts = s.bridgePorts.filter((p) => p['interface'] !== change.name);
+      break;
+    }
+
+    case 'route.add': {
+      const row: RosRow = {
+        '.id': '*simulated',
+        'dst-address': change.dstAddress,
+        gateway: change.gateway,
+        distance: String(change.distance ?? 1),
+        'routing-table': change.table || 'main',
+        active: 'true',
+      };
+      s.routes = [...s.routes, row];
       break;
     }
 
@@ -153,10 +283,129 @@ export function simulate(snap: DeviceSnapshot, change: PlannedChange): DeviceSna
       if (svc) svc['disabled'] = change.disabled ? 'true' : 'false';
       break;
     }
+
+    // RouterOS appends a new rule to the end of the table unless told where.
+    case 'firewall.add': {
+      const row: RosRow = { '.id': '*simulated', ...change.fields };
+      const at = change.placeBefore ? s.firewallFilter.findIndex((r) => r['.id'] === change.placeBefore) : -1;
+      if (at >= 0) s.firewallFilter.splice(at, 0, row); else s.firewallFilter.push(row);
+      break;
+    }
+
+    case 'firewall.set': {
+      s.firewallFilter = s.firewallFilter.map((r) => (r['.id'] === change.ruleId ? mergeFields(r, change.fields) : r));
+      break;
+    }
+
+    // `move` puts the rule before `destination`, or at the end without one.
+    case 'firewall.move': {
+      const from = s.firewallFilter.findIndex((r) => r['.id'] === change.ruleId);
+      if (from < 0) break;
+      const [rule] = s.firewallFilter.splice(from, 1);
+      const to = change.destination ? s.firewallFilter.findIndex((r) => r['.id'] === change.destination) : -1;
+      if (to >= 0) s.firewallFilter.splice(to, 0, rule); else s.firewallFilter.push(rule);
+      break;
+    }
+
+    case 'firewall.remove': {
+      s.firewallFilter = s.firewallFilter.filter((r) => r['.id'] !== change.ruleId);
+      break;
+    }
+
+    case 'address-list.add': {
+      s.addressLists = [...(s.addressLists ?? []), { '.id': '*simulated', ...change.fields }];
+      break;
+    }
+
+    case 'address-list.set': {
+      const entry = (s.addressLists ?? []).find((e) => e['.id'] === change.entryId);
+      if (entry) {
+        s.addressLists = (s.addressLists ?? []).map((e) => (e === entry ? mergeFields(e, change.fields) : e));
+      } else if (change.fields['list']) {
+        // An entry we didn't read is moving into a list; that list can no
+        // longer be vouched for.
+        s.addressListsRead = (s.addressListsRead ?? []).filter((l) => l !== change.fields['list']);
+      }
+      break;
+    }
+
+    case 'address-list.remove': {
+      s.addressLists = (s.addressLists ?? []).filter((e) => e['.id'] !== change.entryId);
+      break;
+    }
+
+    case 'path-object.change':
+      break; // not simulated; see analyzeChange
+
+    case 'batch': {
+      let cur = s;
+      for (const c of change.changes) cur = simulate(cur, c);
+      return cur;
+    }
   }
 
   return s;
 }
+
+/** RouterOS property names; anything else in a request is ignored. */
+const ROS_PROPERTY = /^[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*$/;
+
+/**
+ * A row with edited fields applied; an empty value clears the property.
+ * Builds a new row from RouterOS-shaped names only, so request-supplied keys
+ * never land on an existing object (CodeQL js/remote-property-injection).
+ */
+function mergeFields(row: RosRow, fields: Record<string, string>): RosRow {
+  const edits = new Map(Object.entries(fields).filter(([k]) => ROS_PROPERTY.test(k)));
+  const kept = Object.entries(row).filter(([k]) => !edits.has(k));
+  const set = [...edits].filter(([, v]) => v !== '');
+  return Object.fromEntries([...kept, ...set]);
+}
+
+/** Ports, bonds and the bridge itself, among those of `bridge`, that a change touches. */
+function touchedPorts(snap: DeviceSnapshot, change: PlannedChange, bridge: string): string[] {
+  const inScope = (n: string): boolean =>
+    n === bridge
+    || snap.bridgePorts.some((p) => p['interface'] === n && p['bridge'] === bridge)
+    || snap.bonds.some((b) => b['name'] === n);
+  const names = (c: PlannedChange): string[] => {
+    switch (c.kind) {
+      case 'batch': return c.changes.flatMap(names);
+      case 'port.vlan': return [c.port];
+      case 'bridge-port.move': return c.ports;
+      case 'interface.disable': return [c.name];
+      case 'bond.delete': return [c.name];
+      case 'path-object.change': return [c.name];
+      case 'vlan.add':
+      case 'vlan.update': return [...c.tagged, ...c.untagged];
+      case 'vlan.delete':
+      case 'bridge.delete':
+      case 'bridge.vlan-filtering': return [c.bridge];
+      default: return [];
+    }
+  };
+  return [...new Set(names(change).filter(inScope))];
+}
+
+/** Objects the management path runs through, by name. */
+function pathObjects(path: ManagementPath): Set<string> {
+  const names = path.hops.map((h) => h.name);
+  if (path.mgmtInterface) names.push(path.mgmtInterface);
+  if (path.ingressPort) names.push(path.ingressPort);
+  if (path.ingressBond) names.push(path.ingressBond);
+  if (path.bridge) names.push(path.bridge);
+  return new Set(names);
+}
+
+function pathObjectChanges(change: PlannedChange): { name: string; what: string }[] {
+  if (change.kind === 'path-object.change') return [{ name: change.name, what: change.what }];
+  if (change.kind === 'batch') return change.changes.flatMap(pathObjectChanges);
+  return [];
+}
+
+const touchesFirewall = (change: PlannedChange): boolean =>
+  change.kind.startsWith('firewall.') || change.kind.startsWith('address-list.')
+  || (change.kind === 'batch' && change.changes.some(touchesFirewall));
 
 /**
  * Compare invariants before and after. The management path is resolved once, on the
@@ -177,6 +426,16 @@ export function analyzeChange(
   for (const inv of INVARIANTS) {
     const b = before.get(inv.id);
     const a = after.get(inv.id);
+    // A violation already present is not this change's doing, but one that gets
+    // WORSE is: a pre-existing warning must not hide a new critical break.
+    const worse = !!b && !b.ok && !!a && !a.ok
+      && (a.severity ?? 'critical') === 'critical' && (b.severity ?? 'critical') === 'warning';
+    if (worse && a) {
+      violations.push({
+        id: inv.id, title: inv.title, before: false, after: false,
+        detail: a.detail, severity: 'critical',
+      });
+    }
     if (b && !b.ok) {
       preexisting.push({
         id: inv.id,
@@ -196,6 +455,51 @@ export function analyzeChange(
         after: false,
         detail: a.detail,
         severity: a.severity ?? 'critical',
+      });
+    } else if (a?.ok && a.uncertain && (!b?.uncertain || a.failed || touchesFirewall(change))) {
+      // Not predicted to break, but the check can't vouch for it either:
+      // either this change made it uncertain, or it edits the very rules the
+      // check couldn't fully evaluate.
+      violations.push({
+        id: inv.id,
+        title: inv.title,
+        before: true,
+        after: true,
+        detail: a.detail,
+        severity: 'warning',
+      });
+    }
+  }
+
+  const onPath = pathObjects(path);
+  for (const p of pathObjectChanges(change)) {
+    if (!onPath.has(p.name)) continue;
+    violations.push({
+      id: 'path-object-change',
+      title: 'An object the management path uses is being changed',
+      before: true,
+      after: true,
+      detail: `${p.what} on ${p.name}, which the manager's connection runs through. ` +
+        `This can't be simulated, so it runs only with auto-revert.`,
+      severity: 'warning',
+    });
+  }
+
+  // Port-level changes judged without knowing where management enters. Nothing
+  // above can fail for a port it cannot name, so the verdict would be a clean
+  // "safe"; make it a warning, which makes auto-revert mandatory. (A guess from
+  // the default gateway is left to the invariants: it is still a named port.)
+  if (path.bridge && path.ingressPortSource === 'unknown') {
+    const touched = touchedPorts(snap, change, path.bridge);
+    if (touched.length > 0) {
+      violations.push({
+        id: 'ingress-port-unknown',
+        title: 'Where management enters the device is not certain',
+        before: true,
+        after: true,
+        detail: `Which port management arrives on could not be determined, and this change touches ${touched.join(', ')} on ${path.bridge}. ` +
+          `It can't be checked, so it runs only with auto-revert.`,
+        severity: 'warning',
       });
     }
   }

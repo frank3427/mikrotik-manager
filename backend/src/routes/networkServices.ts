@@ -1,11 +1,41 @@
 import { Router, Request, Response } from 'express';
-import { query } from '../config/database';
+import { deviceSiteAccess, deviceIdQuery, strictId } from '../utils/siteAccess';
+import { deviceWriteLock, deviceIdFromQuery } from '../services/changeGuard/deviceLock';
+import { withGuardedChange } from '../services/changeGuard/guardedRoute';
+import type { PlannedChange } from '../services/changeGuard/analyzeChange';
+import { query, queryOne } from '../config/database';
+import { readManagementTunnel, tunnelWriteRule, type ManagementTunnel, type TunnelVerdict } from '../services/changeGuard/wireguardPath';
 import { requireAuth, requireWrite } from '../middleware/auth';
+import { maskSecretsForReadOnly } from '../utils/redactSecrets';
+import { siteScopeDevices } from '../utils/siteScope';
+import { poolState } from '../utils/dhcpPools';
+import { activeSite, writableScope } from '../middleware/site';
+import { liveForDevices } from '../services/liveCache';
 import { DeviceCollector, DeviceRow } from '../services/mikrotik/DeviceCollector';
 import { netflowCollector } from '../services/netflow/NetflowCollector';
+import { getLldpStatuses, setLldpForTypes, parseDeviceTypes, LLDP_DEVICE_TYPES } from '../services/lldpApply';
+import { applySnmpConfig, getSnmpStatuses, getSnmpTemplates, SnmpInputError, type SnmpConfigInput, type SnmpTarget } from '../services/snmpApply';
 
 const router = Router();
 router.use(requireAuth);
+// A site-scoped account only reaches devices in its own sites, with its role there (P1-7).
+router.use(deviceSiteAccess(deviceIdQuery));
+// Viewers and read-only tokens never receive device secrets (Wi-Fi keys,
+// WireGuard private keys, SNMP communities, hotspot passwords).
+router.use(maskSecretsForReadOnly);
+// One write at a time per device, so a Change Guard revert can't undo another write.
+router.use(deviceWriteLock(deviceIdFromQuery));
+// A change made here shows straight away: the device's cached summaries
+// (#302) are dropped once the change succeeds, and re-read on next view.
+router.use((req, res, next) => {
+  if (req.method === 'GET') return next();
+  res.on('finish', () => {
+    if (res.statusCode >= 400) return;
+    const id = deviceIdFromQuery(req);
+    if (id != null) void query(`DELETE FROM device_live_cache WHERE device_id = $1`, [id]).catch(() => {});
+  });
+  next();
+});
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
@@ -30,57 +60,121 @@ async function withDevice<T>(
 }
 
 function deviceIdParam(req: Request, res: Response): number | null {
-  const id = parseInt(req.query.deviceId as string);
+  // Read as the site check reads it (GHSA-j9x4-qwcj-p8v8): "0x14" is not 20.
+  const id = strictId(req.query.deviceId);
   if (!id) { res.status(400).json({ error: 'deviceId query param is required' }); return null; }
   return id;
 }
 
 // ─── Overview (all online devices, all services) ──────────────────────────────
 
-router.get('/overview', async (_req: Request, res: Response) => {
-  const devices = await query<DeviceRow>(`SELECT * FROM devices WHERE status = 'online' ORDER BY name`);
+// ─── LLDP, fleet-wide ──────────────────────────────────────────────────────────
+// Every RouterOS device has neighbour-discovery settings, not only routers and
+// switches. ?types= / device_types narrow it (router, switch, wireless_ap, other);
+// omitted means every type. Both are scoped to the active site.
 
-  const results = await Promise.allSettled(
-    devices.map(async (device: DeviceRow) => {
-      const collector = new DeviceCollector(device);
-      try {
-        await collector.connect();
-        const [dhcpV4, dhcpV6, dns, ntp, wg, syslogActions] = await Promise.allSettled([
-          collector.getDhcpServers('ipv4'),
-          collector.getDhcpServers('ipv6'),
-          collector.getDnsSettings(),
-          collector.getNtpSettings(),
-          collector.getWireGuardInterfaces(),
-          collector.getSyslogActions(),
-        ]);
+router.get('/lldp', async (req: Request, res: Response) => {
+  const types = parseDeviceTypes(req.query.types);
+  if (!types) return res.status(400).json({ error: `types must be from: ${LLDP_DEVICE_TYPES.join(', ')}` });
+  return res.json(await getLldpStatuses(types, activeSite(req)));
+});
 
-        const v4Servers    = dhcpV4.status === 'fulfilled' ? dhcpV4.value : [];
-        const v6Servers    = dhcpV6.status === 'fulfilled' ? dhcpV6.value : [];
-        const dnsRow       = dns.status === 'fulfilled' ? dns.value : null;
-        const ntpRow       = ntp.status === 'fulfilled' ? ntp.value : null;
-        const wgIfaces     = wg.status === 'fulfilled' ? wg.value : [];
-        const syslogActs   = syslogActions.status === 'fulfilled' ? syslogActions.value : [];
+router.put('/lldp', requireWrite, async (req: Request, res: Response) => {
+  const { enabled, device_types } = req.body ?? {};
+  if (typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: '"enabled" (boolean) is required' });
+  }
+  const types = parseDeviceTypes(device_types);
+  if (!types) return res.status(400).json({ error: `device_types must be from: ${LLDP_DEVICE_TYPES.join(', ')}` });
+  return res.json(await setLldpForTypes(types, enabled, writableScope(req)));
+});
 
-        return {
-          id: device.id, name: device.name, ip_address: device.ip_address,
-          dhcp_v4: { total: v4Servers.length, enabled: v4Servers.filter(s => s['disabled'] !== 'true').length },
-          dhcp_v6: { total: v6Servers.length, enabled: v6Servers.filter(s => s['disabled'] !== 'true').length },
-          dns: dnsRow ? { allow_remote: dnsRow['allow-remote-requests'] === 'yes', servers: dnsRow['servers'] || '' } : null,
-          ntp: ntpRow ? { server_enabled: ntpRow.server['enabled'] === 'yes', client_enabled: ntpRow.client['enabled'] === 'yes' } : null,
-          wireguard: { total: wgIfaces.length, running: wgIfaces.filter(i => i['running'] === 'true').length },
-          syslog: { remote_count: syslogActs.filter(a => a['type'] === 'remote').length },
-        };
-      } catch (err) {
-        return { id: device.id, name: device.name, ip_address: device.ip_address,
-          dhcp_v4: null, dhcp_v6: null, dns: null, ntp: null, wireguard: null, syslog: null,
-          error: (err as Error).message };
-      } finally {
-        collector.disconnect();
-      }
-    })
+// ─── SNMP, fleet-wide ──────────────────────────────────────────────────────────
+// Every device type, like LLDP. Changes go only to the devices named in
+// device_ids, or to every online device in the site with "all" (optionally
+// narrowed by device_types). There is no default: a request that doesn't say
+// which devices is refused.
+
+router.get('/snmp', async (req: Request, res: Response) => {
+  const types = req.query.types ? parseDeviceTypes(req.query.types) : undefined;
+  if (types === null) return res.status(400).json({ error: `types must be from: ${LLDP_DEVICE_TYPES.join(', ')}` });
+  return res.json(await getSnmpStatuses(activeSite(req), types));
+});
+
+// The contact / location / trap destination last applied, as typed (#164).
+router.get('/snmp/templates', async (_req: Request, res: Response) => {
+  return res.json(await getSnmpTemplates());
+});
+
+router.put('/snmp', requireWrite, async (req: Request, res: Response) => {
+  const { device_ids, device_types, ...config } = (req.body ?? {}) as Record<string, unknown>;
+  let target: SnmpTarget;
+  if (device_ids === 'all') {
+    const types = device_types === undefined ? undefined : parseDeviceTypes(device_types);
+    if (types === null) return res.status(400).json({ error: `device_types must be from: ${LLDP_DEVICE_TYPES.join(', ')}` });
+    target = { all: true, deviceTypes: types };
+  } else if (Array.isArray(device_ids) && device_ids.every((id) => Number.isInteger(id))) {
+    target = { deviceIds: device_ids as number[] };
+  } else {
+    return res.status(400).json({ error: 'device_ids is required: a list of device ids, or "all"' });
+  }
+  try {
+    return res.json(await applySnmpConfig(target, config as SnmpConfigInput, writableScope(req)));
+  } catch (e) {
+    if (e instanceof SnmpInputError) return res.status(400).json({ error: e.message });
+    throw e;
+  }
+});
+
+// Cached per device and refreshed a few at a time (#302): this used to open a
+// connection to every device on every load and every minute.
+const SERVICES_MAX_AGE_MS = 10 * 60_000;
+async function servicesSummary(collector: DeviceCollector) {
+  const [dhcpV4, dhcpV6, dns, ntp, wg, syslogActions] = await Promise.allSettled([
+    collector.getDhcpServers('ipv4'),
+    collector.getDhcpServers('ipv6'),
+    collector.getDnsSettings(),
+    collector.getNtpSettings(),
+    collector.getWireGuardInterfaces(),
+    collector.getSyslogActions(),
+  ]);
+  const v4Servers    = dhcpV4.status === 'fulfilled' ? dhcpV4.value : [];
+  const v6Servers    = dhcpV6.status === 'fulfilled' ? dhcpV6.value : [];
+  const dnsRow       = dns.status === 'fulfilled' ? dns.value : null;
+  const ntpRow       = ntp.status === 'fulfilled' ? ntp.value : null;
+  const wgIfaces     = wg.status === 'fulfilled' ? wg.value : [];
+  const syslogActs   = syslogActions.status === 'fulfilled' ? syslogActions.value : [];
+  return {
+    dhcp_v4: { total: v4Servers.length, enabled: v4Servers.filter(s => s['disabled'] !== 'true').length },
+    dhcp_v6: { total: v6Servers.length, enabled: v6Servers.filter(s => s['disabled'] !== 'true').length },
+    dns: dnsRow ? { allow_remote: dnsRow['allow-remote-requests'] === 'yes', servers: dnsRow['servers'] || '' } : null,
+    ntp: ntpRow ? { server_enabled: ntpRow.server['enabled'] === 'yes', client_enabled: ntpRow.client['enabled'] === 'yes' } : null,
+    wireguard: { total: wgIfaces.length, running: wgIfaces.filter(i => i['running'] === 'true').length },
+    // RouterOS calls it `target`; the built-in `remote` action points at
+    // 0.0.0.0 until configured, so it isn't a destination (C7).
+    syslog: { remote_count: syslogActs.filter(a => a['target'] === 'remote' && !!a['remote'] && a['remote'] !== '0.0.0.0').length },
+  };
+}
+
+router.get('/overview', async (req: Request, res: Response) => {
+  const siteFilter = siteScopeDevices(activeSite(req));
+  const devices = await query<DeviceRow>(
+    `SELECT * FROM devices WHERE status = 'online' AND NOT ssh_only
+       ${siteFilter ? `AND ${siteFilter}` : ''} ORDER BY name`
   );
-
-  res.json(results.map(r => r.status === 'fulfilled' ? r.value : { error: (r.reason as Error).message }));
+  const live = await liveForDevices('services', devices, (c) => servicesSummary(c), {
+    maxAgeMs: SERVICES_MAX_AGE_MS, refresh: req.query.refresh === '1', waitMs: 3000,
+  });
+  res.json(devices.map((device) => {
+    const e = live.get(device.id)!;
+    const empty = { dhcp_v4: null, dhcp_v6: null, dns: null, ntp: null, wireguard: null, syslog: null };
+    return {
+      id: device.id, name: device.name, ip_address: device.ip_address,
+      ...(e.data ?? empty),
+      ...(e.error && !e.data ? { error: e.error } : {}),
+      fetched_at: e.fetchedAt, refreshing: e.refreshing,
+    };
+  }));
 });
 
 // ─── DHCP ─────────────────────────────────────────────────────────────────────
@@ -154,6 +248,18 @@ router.put('/dhcp/server', requireWrite, async (req: Request, res: Response) => 
   });
 });
 
+// GET /api/network-services/dhcp/pool-usage — how full each pool is, across
+// the devices in the active site (#156). From the slow poll, not live.
+router.get('/dhcp/pool-usage', async (req: Request, res: Response) => {
+  const scope = siteScopeDevices(activeSite(req), 'd');
+  const rows = await query<{ device_id: number; device_name: string; name: string; ranges: string | null; size: number | null; used: number; updated_at: string }>(
+    `SELECT p.device_id, d.name AS device_name, p.name, p.ranges, p.size, p.used, p.updated_at
+       FROM dhcp_pool_usage p JOIN devices d ON d.id = p.device_id
+      ${scope ? `WHERE ${scope}` : ''}
+      ORDER BY (p.used::float / NULLIF(p.size, 0)) DESC NULLS LAST, d.name, p.name`);
+  res.json(rows.map((r) => ({ ...r, device_name: r.device_name.trim(), state: poolState(r.used, r.size) })));
+});
+
 // GET /api/network-services/dhcp/pools?deviceId=X&protocol=X
 router.get('/dhcp/pools', async (req: Request, res: Response) => {
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
@@ -204,6 +310,9 @@ router.post('/dhcp/static-lease', requireWrite, async (req: Request, res: Respon
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
   const { protocol, ...params } = req.body;
   if (protocol !== 'ipv4' && protocol !== 'ipv6') return res.status(400).json({ error: 'protocol required' });
+  if (protocol === 'ipv6' && params['mac-address'] !== undefined) {
+    return res.status(400).json({ error: 'An IPv6 binding is matched by the client DUID, not a MAC address.' });
+  }
   await withDevice(deviceId, res, async (collector) => {
     await collector.addStaticDhcpLease(params, protocol as 'ipv4' | 'ipv6');
     res.json({ success: true });
@@ -326,20 +435,53 @@ router.get('/wireguard', async (req: Request, res: Response) => {
       collector.getWireGuardInterfaces(),
       collector.getWireGuardPeers(),
     ]);
+    // Which interface and peers carry the manager's own connection, so the
+    // page can mark them and not offer to delete or disable them (#205).
+    const device = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [deviceId]);
+    const tunnel = device ? await readManagementTunnel(device) : null;
     res.json({
       interfaces: interfaces.status === 'fulfilled' ? interfaces.value : [],
       peers: peers.status === 'fulfilled' ? peers.value : [],
+      management: tunnel?.interface
+        ? { interface: tunnel.interface, interface_id: tunnel.interfaceId, peer_ids: tunnel.peerIds, peer_certain: tunnel.peerCertain,
+            manager_ip: tunnel.managerIp, reason: tunnel.reason }
+        : null,
     });
   });
 });
 
-// POST /api/network-services/wireguard?deviceId=X — create interface
+// WireGuard writes run under Change Guard (outside review P2-8). On top of that,
+// the tunnel the manager arrives through is protected (#205): it and every peer
+// on it are left alone from here, so any write to them is refused. The page
+// shows them read-only.
+
+/**
+ * Look up the management tunnel and apply the rule to it. Returns false when
+ * the write was refused (the 409 is already sent). A device that can't be read
+ * falls back to the ordinary Change Guard checks.
+ */
+async function tunnelGate(deviceId: number, res: Response, rule: (t: ManagementTunnel) => TunnelVerdict): Promise<boolean> {
+  const device = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [deviceId]);
+  const tunnel = device ? await readManagementTunnel(device) : null;
+  if (!tunnel?.interface) return true;
+  const verdict = rule(tunnel);
+  if (verdict) {
+    res.status(409).json({ lockout: true, reason: `${verdict.refuse} ${tunnel.reason}`, management_tunnel: true });
+    return false;
+  }
+  return true;
+}
+
+const bodyIface = (req: Request): string | null => {
+  const v = (req.body as { interface?: unknown } | undefined)?.interface;
+  return v === undefined || v === null || v === '' ? null : String(v);
+};
+
+// POST /api/network-services/wireguard?deviceId=X — add interface
 router.post('/wireguard', requireWrite, async (req: Request, res: Response) => {
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
-  await withDevice(deviceId, res, async (collector) => {
-    const interfaces = await collector.addWireGuardInterface(req.body);
-    res.json(interfaces);
-  });
+  await withGuardedChange(deviceId, req, res, { kind: 'wireguard.add', summary: 'Add WireGuard interface' },
+    async (c) => { await c.addWireGuardInterface(req.body); return { success: true }; });
 });
 
 // PUT /api/network-services/wireguard/toggle — enable/disable (must be before /:id)
@@ -348,58 +490,62 @@ router.put('/wireguard/toggle', requireWrite, async (req: Request, res: Response
   const { interfaceId, disabled } = req.body;
   if (!interfaceId) return res.status(400).json({ error: 'interfaceId is required' });
   if (typeof disabled !== 'boolean') return res.status(400).json({ error: 'disabled (boolean) is required' });
-  await withDevice(deviceId, res, async (collector) => {
-    await collector.setWireGuardInterfaceDisabled(interfaceId, disabled);
-    res.json({ success: true });
-  });
+  if (!await tunnelGate(deviceId, res, (t) => tunnelWriteRule(t, { ifaceIdOrName: String(interfaceId) }))) return;
+  await withGuardedChange(deviceId, req, res,
+    { kind: 'wireguard.toggle', summary: `${disabled ? 'Disable' : 'Enable'} WireGuard interface`,
+      change: { kind: 'interface.disable', name: String(interfaceId), disabled } },
+    async (c) => { await c.setWireGuardInterfaceDisabled(interfaceId, disabled); return { success: true }; });
 });
 
 // PUT /api/network-services/wireguard/:id?deviceId=X — update interface
 router.put('/wireguard/:id', requireWrite, async (req: Request, res: Response) => {
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
-  await withDevice(deviceId, res, async (collector) => {
-    await collector.updateWireGuardInterface(req.params.id, req.body);
-    const updated = await collector.getWireGuardInterfaces();
-    res.json(updated);
-  });
+  if (!await tunnelGate(deviceId, res, (t) => tunnelWriteRule(t, { ifaceIdOrName: req.params.id }))) return;
+  await withGuardedChange(deviceId, req, res,
+    { kind: 'wireguard.set', summary: 'Edit WireGuard interface',
+      change: { kind: 'path-object.change', name: String(req.body?.name ?? req.params.id), what: 'Changing this WireGuard interface' } },
+    async (c) => { await c.updateWireGuardInterface(req.params.id, req.body); return { success: true }; });
 });
 
 // DELETE /api/network-services/wireguard/:id?deviceId=X — delete interface
 router.delete('/wireguard/:id', requireWrite, async (req: Request, res: Response) => {
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
-  await withDevice(deviceId, res, async (collector) => {
-    await collector.removeWireGuardInterface(req.params.id);
-    res.json({ success: true });
-  });
+  if (!await tunnelGate(deviceId, res, (t) => tunnelWriteRule(t, { ifaceIdOrName: req.params.id }))) return;
+  await withGuardedChange(deviceId, req, res,
+    // For reachability, a deleted tunnel is a disabled one.
+    { kind: 'wireguard.remove', summary: 'Delete WireGuard interface',
+      change: { kind: 'interface.disable', name: req.params.id, disabled: true } },
+    async (c) => { await c.removeWireGuardInterface(req.params.id); return { success: true }; });
 });
+
+// Peers change what the tunnel carries; a peer on the manager's tunnel is flagged.
+const peerChange = (req: Request): PlannedChange | undefined => {
+  const iface = bodyIface(req);
+  return iface ? { kind: 'path-object.change', name: iface, what: 'Changing a WireGuard peer' } : undefined;
+};
 
 // POST /api/network-services/wireguard/peer?deviceId=X — add peer
 router.post('/wireguard/peer', requireWrite, async (req: Request, res: Response) => {
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
-  await withDevice(deviceId, res, async (collector) => {
-    await collector.addWireGuardPeer(req.body);
-    const peers = await collector.getWireGuardPeers();
-    res.json(peers);
-  });
+  if (!await tunnelGate(deviceId, res, (t) => tunnelWriteRule(t, { targetIface: bodyIface(req) }))) return;
+  await withGuardedChange(deviceId, req, res, { kind: 'wireguard.peer.add', summary: 'Add WireGuard peer', change: peerChange(req) },
+    async (c) => { await c.addWireGuardPeer(req.body); return { success: true }; });
 });
 
 // PUT /api/network-services/wireguard/peer/:id?deviceId=X — update peer
 router.put('/wireguard/peer/:id', requireWrite, async (req: Request, res: Response) => {
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
-  await withDevice(deviceId, res, async (collector) => {
-    await collector.updateWireGuardPeer(req.params.id, req.body);
-    const peers = await collector.getWireGuardPeers();
-    res.json(peers);
-  });
+  if (!await tunnelGate(deviceId, res, (t) => tunnelWriteRule(t, { peerId: req.params.id, targetIface: bodyIface(req) }))) return;
+  await withGuardedChange(deviceId, req, res, { kind: 'wireguard.peer.set', summary: 'Edit WireGuard peer', change: peerChange(req) },
+    async (c) => { await c.updateWireGuardPeer(req.params.id, req.body); return { success: true }; });
 });
 
 // DELETE /api/network-services/wireguard/peer/:id?deviceId=X — delete peer
 router.delete('/wireguard/peer/:id', requireWrite, async (req: Request, res: Response) => {
   const deviceId = deviceIdParam(req, res); if (!deviceId) return;
-  await withDevice(deviceId, res, async (collector) => {
-    await collector.removeWireGuardPeer(req.params.id);
-    res.json({ success: true });
-  });
+  if (!await tunnelGate(deviceId, res, (t) => tunnelWriteRule(t, { peerId: req.params.id }))) return;
+  await withGuardedChange(deviceId, req, res, { kind: 'wireguard.peer.remove', summary: 'Delete WireGuard peer' },
+    async (c) => { await c.removeWireGuardPeer(req.params.id); return { success: true }; });
 });
 
 // ─── Syslog ───────────────────────────────────────────────────────────────────
@@ -520,54 +666,45 @@ function targetMatchesCollector(
 }
 
 // GET /api/network-services/netflow/fleet — traffic-flow state for all online devices
-router.get('/netflow/fleet', async (_req: Request, res: Response) => {
+router.get('/netflow/fleet', async (req: Request, res: Response) => {
   const settings = await getNetflowAppSettings();
   const stats = netflowCollector.getStats();
   const statsByDevice = new Map(stats.exporters.map((e) => [e.deviceId, e]));
-  const devices = await query<DeviceRow>(`SELECT * FROM devices WHERE status = 'online' ORDER BY name`);
-
-  const results = await Promise.allSettled(
-    devices.map(async (device: DeviceRow) => {
-      const collector = new DeviceCollector(device);
-      try {
-        await collector.connect();
-        const [tfSettings, targets] = await Promise.all([
-          collector.getTrafficFlowSettings(),
-          collector.getTrafficFlowTargets(),
-        ]);
-        const exporterStats = statsByDevice.get(device.id);
-        return {
-          id: device.id,
-          name: device.name,
-          ip_address: device.ip_address,
-          enabled: tfSettings?.['enabled'] === 'true' || tfSettings?.['enabled'] === 'yes',
-          interfaces: tfSettings?.['interfaces'] || '',
-          targets: targets.map((t) => ({
-            id: t['.id'],
-            dst_address: t['dst-address'],
-            port: Number(t['port']) || 0,
-            version: t['version'] || '',
-            disabled: t['disabled'] === 'true',
-          })),
-          target_matches_collector: targetMatchesCollector(targets, settings),
-          flows_received: exporterStats?.flows || 0,
-          last_flow_at: exporterStats?.lastSeen || null,
-        };
-      } catch (err) {
-        return {
-          id: device.id, name: device.name, ip_address: device.ip_address,
-          enabled: null, interfaces: '', targets: [], target_matches_collector: false,
-          flows_received: 0, last_flow_at: null, error: (err as Error).message,
-        };
-      } finally {
-        collector.disconnect();
-      }
-    })
+  const siteFilter = siteScopeDevices(activeSite(req));
+  const devices = await query<DeviceRow>(
+    `SELECT * FROM devices WHERE status = 'online' AND NOT ssh_only
+       ${siteFilter ? `AND ${siteFilter}` : ''} ORDER BY name`
   );
+  // The device's traffic-flow settings, cached (#302): this page used to read
+  // them from every device every 10 seconds. Flow counts are live, from the
+  // collector, as before. A change made here refreshes the device's entry.
+  const live = await liveForDevices('traffic-flow', devices, async (c) => {
+    const [tfSettings, targets] = await Promise.all([c.getTrafficFlowSettings(), c.getTrafficFlowTargets()]);
+    return { tfSettings, targets };
+  }, { maxAgeMs: SERVICES_MAX_AGE_MS, refresh: req.query.refresh === '1', waitMs: 3000 });
 
   res.json({
     collector: { ...settings, listening: stats.listening },
-    devices: results.map((r) => (r.status === 'fulfilled' ? r.value : { error: (r.reason as Error).message })),
+    devices: devices.map((device) => {
+      const e = live.get(device.id)!;
+      const exporterStats = statsByDevice.get(device.id);
+      const base = { id: device.id, name: device.name, ip_address: device.ip_address, fetched_at: e.fetchedAt, refreshing: e.refreshing,
+        flows_received: exporterStats?.flows || 0, last_flow_at: exporterStats?.lastSeen || null };
+      if (!e.data) {
+        return { ...base, enabled: null, interfaces: '', targets: [], target_matches_collector: false, ...(e.error ? { error: e.error } : {}) };
+      }
+      const { tfSettings, targets } = e.data as { tfSettings: Record<string, string> | null; targets: Record<string, string>[] };
+      return {
+        ...base,
+        enabled: tfSettings?.['enabled'] === 'true' || tfSettings?.['enabled'] === 'yes',
+        interfaces: tfSettings?.['interfaces'] || '',
+        targets: targets.map((t) => ({
+          id: t['.id'], dst_address: t['dst-address'], port: Number(t['port']) || 0,
+          version: t['version'] || '', disabled: t['disabled'] === 'true',
+        })),
+        target_matches_collector: targetMatchesCollector(targets, settings),
+      };
+    }),
   });
 });
 

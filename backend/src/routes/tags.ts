@@ -1,17 +1,40 @@
 import { Router, Request, Response } from 'express';
+import { decodedPath } from '../utils/requestPath';
+import { resourceSiteAccess, guardIdParams, strictIdList } from '../utils/siteAccess';
 import { query } from '../config/database';
 import { requireAuth, requireWrite, requireAdmin } from '../middleware/auth';
 
 const router = Router();
 router.use(requireAuth);
+// Ids are plain numbers, read the same way by the site check and the handler (GHSA-j9x4-qwcj-p8v8).
+guardIdParams(router, ['id', 'deviceId'], 'Not found');
+// Tagging devices, or reading one device's tags, is limited to the account's
+// own sites for a site-scoped account (P1-7).
+router.use(resourceSiteAccess(async (req) => {
+  // Decoded, as the handlers' params are (GHSA-6xq3-q9m5-7hxp); undecodable is refused.
+  const path = decodedPath(req);
+  if (path === null) return [];
+  const one = /^\/device\/(\d+)(?:\/|$)/.exec(path);
+  if (one) return [parseInt(one[1], 10)];
+  if (req.method === 'POST' && /^\/\d+\/devices\/?$/.test(path)) {
+    const ids = (req.body as { deviceIds?: unknown })?.deviceIds;
+    return Array.isArray(ids) ? strictIdList(ids) ?? [] : null;
+  }
+  return null;
+}, 'Device not found'));
 
 // GET /api/tags — list all tags with device count
-router.get('/', async (_req: Request, res: Response) => {
+router.get('/', async (req: Request, res: Response) => {
+  // Tags are shared across the fleet, but a site-scoped account (P1-7) only
+  // counts the devices it can see, not how many other sites have.
+  const own = req.user?.siteRoles ? Object.keys(req.user.siteRoles).map(Number) : null;
   const tags = await query<{ id: number; name: string; color: string; device_count: string }>(
-    `SELECT t.id, t.name, t.color, COUNT(dt.device_id)::text AS device_count
+    `SELECT t.id, t.name, t.color, COUNT(d.id)::text AS device_count
      FROM tags t
      LEFT JOIN device_tags dt ON dt.tag_id = t.id
-     GROUP BY t.id ORDER BY t.name`
+     LEFT JOIN devices d ON d.id = dt.device_id ${own ? 'AND d.site_id = ANY($1::int[])' : ''}
+     GROUP BY t.id ORDER BY t.name`,
+    own ? [own] : []
   );
   res.json(tags.map(t => ({ ...t, device_count: parseInt(t.device_count, 10) })));
 });
@@ -50,25 +73,29 @@ router.delete('/:id', requireAdmin, async (req: Request, res: Response) => {
 // POST /api/tags/:id/devices — assign tag to devices (operator+)
 router.post('/:id/devices', requireWrite, async (req: Request, res: Response) => {
   const tagId = parseInt(req.params.id, 10);
-  const { deviceIds, action } = req.body as { deviceIds: number[]; action: 'add' | 'remove' };
-  if (!Array.isArray(deviceIds) || deviceIds.length === 0) {
+  const { deviceIds, action } = req.body as { deviceIds: unknown; action: 'add' | 'remove' };
+  const ids = Array.isArray(deviceIds) ? deviceIds.map(Number).filter((n) => Number.isInteger(n) && n > 0) : [];
+  if (ids.length === 0) {
     res.status(400).json({ error: 'deviceIds array required' });
     return;
   }
-  if (action === 'remove') {
-    await query(
-      `DELETE FROM device_tags WHERE tag_id = $1 AND device_id = ANY($2::int[])`,
-      [tagId, deviceIds]
-    );
-  } else {
-    for (const deviceId of deviceIds) {
-      await query(
-        `INSERT INTO device_tags (device_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-        [deviceId, tagId]
-      );
-    }
+  const tag = await query(`SELECT id FROM tags WHERE id = $1`, [tagId]);
+  if (!tag.length) {
+    res.status(404).json({ error: 'Tag not found' });
+    return;
   }
-  res.json({ ok: true });
+  // One statement either way. Used for bulk tagging from the Devices page
+  // (#161), where a selection can be hundreds of devices.
+  const changed = action === 'remove'
+    ? await query(
+        `DELETE FROM device_tags WHERE tag_id = $1 AND device_id = ANY($2::int[]) RETURNING device_id`,
+        [tagId, ids])
+    : await query(
+        `INSERT INTO device_tags (device_id, tag_id)
+         SELECT d.id, $1 FROM devices d WHERE d.id = ANY($2::int[])
+         ON CONFLICT DO NOTHING RETURNING device_id`,
+        [tagId, ids]);
+  res.json({ ok: true, changed: changed.length });
 });
 
 // GET /api/tags/device/:deviceId — tags for a specific device

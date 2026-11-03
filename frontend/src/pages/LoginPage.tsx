@@ -6,6 +6,17 @@ import { useAuthStore } from '../store/authStore';
 import { useThemeStore } from '../store/themeStore';
 import CircuitBackground from '../components/CircuitBackground';
 
+const SSO_ERRORS = new Map<string, string>([
+  ['expired', 'That sign-in expired or was started in a different browser. Please sign in again.'],
+  ['disabled', 'Single sign-on is turned off. Sign in with your username and password.'],
+  ['unverified', 'Your identity provider did not confirm your email address, so your domain could not be checked.'],
+  ['domain', 'Your email domain is not allowed to sign in here.'],
+  ['no_account', 'There is no account for you here, and new accounts are not created automatically. Ask an administrator.'],
+  ['not_configured', 'Single sign-on is not fully set up yet. Ask an administrator.'],
+  ['provider', 'Your identity provider refused the sign-in. Please try again, or ask an administrator.'],
+  ['failed', 'Single sign-on failed. Please try again.'],
+]);
+
 export default function LoginPage() {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -17,6 +28,10 @@ export default function LoginPage() {
   const totpInputRef = useRef<HTMLInputElement>(null);
 
   const [sso, setSso] = useState<{ enabled: boolean; button_label: string }>({ enabled: false, button_label: 'Sign in with SSO' });
+  // Shown only while the admin account still has its default password.
+  const [showDefaultHint, setShowDefaultHint] = useState(false);
+  // False on SSO-only installs (PASSWORD_LOGIN=false): only the SSO button shows (#226).
+  const [passwordLogin, setPasswordLogin] = useState(true);
 
   const setAuth = useAuthStore((s) => s.setAuth);
   const navigate = useNavigate();
@@ -24,10 +39,15 @@ export default function LoginPage() {
 
   useEffect(() => {
     authApi.oidcStatus().then((r) => setSso(r.data)).catch(() => {});
-    // Surface an SSO error passed back on the redirect (?error=sso&reason=...).
+    authApi.loginHints().then((r) => {
+      setShowDefaultHint(r.data.default_credentials);
+      setPasswordLogin(r.data.password_login !== false);
+    }).catch(() => {});
+    // An SSO failure comes back as a fixed code. Only our own wording is shown:
+    // text taken from the URL could be anyone's (outside review U8).
     const params = new URLSearchParams(window.location.search);
     if (params.get('error') === 'sso') {
-      setError(params.get('reason') || 'Single sign-on failed. Please try again.');
+      setError(SSO_ERRORS.get(params.get('code') ?? '') ?? SSO_ERRORS.get('failed')!);
       window.history.replaceState({}, '', window.location.pathname);
     }
   }, []);
@@ -43,7 +63,7 @@ export default function LoginPage() {
       try {
         const { data } = await authApi.totpVerify(totpToken, totpCode);
         setAuth(data.token, data.user!);
-        navigate('/dashboard');
+        navigate(data.user?.must_change_password ? '/change-password' : '/dashboard');
       } catch (err: unknown) {
         const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
         setError(msg || 'Invalid code. Please try again.');
@@ -66,7 +86,12 @@ export default function LoginPage() {
         setTimeout(() => totpInputRef.current?.focus(), 50);
       } else {
         setAuth(data.token!, data.user!);
-        navigate('/dashboard');
+        if (data.user?.must_change_password) {
+          // Carried in memory only, so the current password needn't be typed twice.
+          navigate('/change-password', { state: { currentPassword: password } });
+        } else {
+          navigate('/dashboard');
+        }
       }
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
@@ -123,6 +148,19 @@ export default function LoginPage() {
             Sign in to your account
           </h2>
 
+          {!passwordLogin ? (
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={() => { window.location.href = '/api/auth/oidc/login'; }}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-medium rounded-lg transition-colors"
+              >
+                <LogIn className="w-4 h-4" />
+                {sso.button_label || 'Sign in with SSO'}
+              </button>
+              {error && <p className="text-sm text-red-500">{error}</p>}
+            </div>
+          ) : (
           <form onSubmit={handleSubmit} className="space-y-4">
             {totpToken ? (
               /* Step 2: TOTP code */
@@ -269,11 +307,14 @@ export default function LoginPage() {
               </>
             )}
           </form>
+          )}
         </div>
 
-        <p className={`text-center text-xs mt-6 ${isDark ? 'text-slate-600' : 'text-slate-500'}`}>
-          Default credentials: admin / admin
-        </p>
+        {showDefaultHint && passwordLogin && (
+          <p className={`text-center text-xs mt-6 ${isDark ? 'text-slate-600' : 'text-slate-500'}`}>
+            Default credentials: admin / admin (you&apos;ll set a new password after signing in)
+          </p>
+        )}
       </div>
     </div>
   );

@@ -357,3 +357,91 @@ describe('auditConfig', () => {
     expect(found[found.length - 1].severity).toBe('warning');
   });
 });
+
+describe('spanning tree', () => {
+  // RouterOS accepts protocol-mode=none silently, and on correct cabling nothing
+  // happens — which is exactly why it needs saying.
+  it('flags STP turned off on a bridge that could loop', () => {
+    const snap = healthy({
+      bridges: [{ name: 'bridge', 'vlan-filtering': 'true', pvid: '1', 'protocol-mode': 'none' }],
+    });
+    const f = auditConfig(snap, device).find((x) => x.rule === 'stp-disabled')!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe('warning');
+    expect(f.objects).toContain('bridge');
+    expect(f.remediation).toContain('protocol-mode=rstp');
+  });
+
+  // A bridge with one port cannot form a loop, so warning about it is noise.
+  it('ignores a single-port bridge', () => {
+    const snap = healthy({
+      bridges: [{ name: 'bridge', 'protocol-mode': 'none' }],
+      bridgePorts: [{ interface: 'ether1', bridge: 'bridge', pvid: '1', disabled: 'false' }],
+    });
+    expect(rules(snap)).not.toContain('stp-disabled');
+  });
+
+  // Disabled ports cannot carry a loop either.
+  it('does not count disabled ports toward the loop risk', () => {
+    const snap = healthy({
+      bridges: [{ name: 'bridge', 'protocol-mode': 'none' }],
+      bridgePorts: [
+        { interface: 'ether1', bridge: 'bridge', pvid: '1', disabled: 'false' },
+        { interface: 'ether2', bridge: 'bridge', pvid: '1', disabled: 'true' },
+      ],
+    });
+    expect(rules(snap)).not.toContain('stp-disabled');
+  });
+
+  it('flags classic STP where RSTP would converge in a fraction of the time', () => {
+    const snap = healthy({
+      bridges: [{ name: 'bridge', 'vlan-filtering': 'true', pvid: '1', 'protocol-mode': 'stp' }],
+    });
+    const f = auditConfig(snap, device).find((x) => x.rule === 'stp-legacy-mode')!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe('info');
+  });
+
+  it('is quiet on rstp and mstp', () => {
+    for (const mode of ['rstp', 'mstp', 'RSTP']) {
+      const snap = healthy({
+        bridges: [{ name: 'bridge', 'vlan-filtering': 'true', pvid: '1', 'protocol-mode': mode }],
+      });
+      expect(rules(snap)).not.toContain('stp-disabled');
+      expect(rules(snap)).not.toContain('stp-legacy-mode');
+    }
+  });
+
+  // The base fixture reports no protocol-mode at all; absence must not be read
+  // as "none", or every device with a partial snapshot would be flagged.
+  it('does not treat a missing protocol-mode as disabled', () => {
+    expect(rules(healthy())).not.toContain('stp-disabled');
+  });
+});
+
+describe('device-mode (#230)', () => {
+  // As a wAP ax in basic mode reports it (from the test bench).
+  const wapBasic = {
+    mode: 'basic', flagged: 'false', scheduler: 'true', fetch: 'true', 'bandwidth-test': 'false',
+    'traffic-gen': 'false', sniffer: 'true', hotspot: 'false', container: 'false',
+  };
+  it('flags the features the manager uses that device-mode blocks', () => {
+    const f = auditConfig(healthy({ deviceMode: wapBasic }), device);
+    expect(f.map((x) => x.rule)).toEqual(['device-mode-blocks-features']);
+    expect(f[0].severity).toBe('info');
+    expect(f[0].objects).toEqual(['bandwidth-test', 'hotspot']);
+    expect(f[0].title).toMatch(/basic/);
+  });
+  it('warns when the scheduler is blocked, since Change Guard depends on it', () => {
+    const f = auditConfig(healthy({ deviceMode: { ...wapBasic, scheduler: 'false' } }), device);
+    expect(f.find((x) => x.rule === 'device-mode-no-scheduler')?.severity).toBe('warning');
+  });
+  it('warns when RouterOS has flagged the device', () => {
+    expect(rules(healthy({ deviceMode: { ...wapBasic, flagged: 'true' } }))).toContain('device-mode-flagged');
+  });
+  it('says nothing for advanced mode, or when device-mode is unreadable', () => {
+    const advanced = { ...wapBasic, mode: 'advanced', 'bandwidth-test': 'true', hotspot: 'true' };
+    expect(auditConfig(healthy({ deviceMode: advanced }), device)).toEqual([]);
+    expect(auditConfig(healthy({ deviceMode: null }), device)).toEqual([]);
+  });
+});

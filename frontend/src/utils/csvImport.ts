@@ -1,0 +1,374 @@
+import type { BulkAddDeviceItem, CredentialPreset } from '../services/api';
+import { isValidDeviceAddress, stripIPv6Brackets } from './deviceAddress';
+
+/**
+ * Parsing a device list for bulk import (#160).
+ *
+ * Requested by an operator with ~1,500 devices. Rows become items for the
+ * existing bulk-add job, so adding, progress and cancel all behave the same as
+ * "Try All" on discovered devices.
+ *
+ * Every row is checked before anything is sent, and problems are reported per
+ * line. A 500-row file with three typos should show three errors, not fail at
+ * row 212 of a running job.
+ */
+
+export const MAX_ROWS = 500; // the bulk-add endpoint's own limit
+
+const DEVICE_TYPES: Record<string, string> = {
+  router: 'router', rtr: 'router',
+  switch: 'switch', sw: 'switch',
+  wireless_ap: 'wireless_ap', ap: 'wireless_ap', wireless: 'wireless_ap', wap: 'wireless_ap',
+  other: 'other',
+};
+
+/** Header aliases, so a spreadsheet exported from another tool mostly just works. */
+const COLUMNS: Record<string, keyof RowFields> = {
+  name: 'name', identity: 'name', hostname: 'name',
+  ip: 'ip_address', ip_address: 'ip_address', address: 'ip_address', host: 'ip_address',
+  type: 'device_type', device_type: 'device_type',
+  preset: 'credential_preset', credential_preset: 'credential_preset', credentials: 'credential_preset',
+  username: 'api_username', user: 'api_username', api_username: 'api_username',
+  password: 'api_password', api_password: 'api_password',
+  port: 'api_port', api_port: 'api_port',
+  // The port runs api-ssl (#257). Only needed on a port other than 8729.
+  api_ssl: 'api_ssl', ssl: 'api_ssl', api_tls: 'api_ssl', tls: 'api_ssl',
+  // SSH is optional. Left blank, SSH (backups, bulk commands, key deployment)
+  // uses the API username and password, which is the usual case.
+  ssh_username: 'ssh_username', ssh_user: 'ssh_username',
+  ssh_password: 'ssh_password', ssh_pass: 'ssh_password',
+  ssh_port: 'ssh_port',
+  // The API isn't enabled yet (#174): yes/true/1 adds the device over SSH.
+  ssh_only: 'ssh_only', sshonly: 'ssh_only', api_off: 'ssh_only', no_api: 'ssh_only',
+  // Several tags in one cell, separated by | or ; (or commas, inside quotes).
+  tags: 'tags', tag: 'tags', groups: 'tags', group: 'tags',
+  notes: 'notes', note: 'notes', comment: 'notes',
+  // The site each device joins, made if there's none by that name, and the
+  // group (customer) a new site goes in (#306). "group" stays tags, as it was.
+  site: 'site', site_name: 'site',
+  site_group: 'site_group', customer: 'site_group', client: 'site_group',
+};
+
+interface RowFields {
+  name?: string;
+  ip_address?: string;
+  device_type?: string;
+  credential_preset?: string;
+  api_username?: string;
+  api_password?: string;
+  api_port?: string;
+  api_ssl?: string;
+  ssh_username?: string;
+  ssh_password?: string;
+  ssh_port?: string;
+  ssh_only?: string;
+  tags?: string;
+  notes?: string;
+  site?: string;
+  site_group?: string;
+}
+
+export interface ParsedRow {
+  /** 1-based line number in the file, for error messages. */
+  line: number;
+  item: BulkAddDeviceItem | null;
+  errors: string[];
+  warnings: string[];
+  /**
+   * Already managed at this address. Not sent: the bulk job reports an existing
+   * device as a duplicate-serial failure and leaves it unchanged, so including
+   * it would only add a failed row to the results.
+   */
+  skip: boolean;
+}
+
+export interface ParseResult {
+  rows: ParsedRow[];
+  /** Problems with the file itself rather than a row. */
+  fileErrors: string[];
+  /** Header names that were not recognised and will be ignored. */
+  ignoredColumns: string[];
+  /** How a column is read, where that might surprise (#306). */
+  notes?: string[];
+}
+
+/**
+ * The separator a file uses. Excel writes semicolons instead of commas in many
+ * locales (wherever the decimal separator is a comma), and some exports use
+ * tabs. Decided from the header line, counting only characters outside quotes.
+ */
+export function detectDelimiter(headerLine: string): string {
+  const counts: Record<string, number> = { ',': 0, ';': 0, '\t': 0 };
+  let inQuotes = false;
+  for (const ch of headerLine) {
+    if (ch === '"') inQuotes = !inQuotes;
+    else if (!inQuotes && ch in counts) counts[ch]++;
+  }
+  const [best, n] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  return n > 0 ? best : ',';
+}
+
+/**
+ * Split a whole file into records per RFC 4180 (outside review U9): a quoted
+ * cell may contain the delimiter, doubled quotes and line breaks, so a note
+ * with a newline stays one cell instead of splitting into a broken row. Cells
+ * come back exactly as written; the caller decides what to trim. `line` is
+ * where each record starts, for error messages.
+ */
+export function parseCsvRecords(text: string, delimiter = ','): { line: number; cells: string[] }[] {
+  const records: { line: number; cells: string[] }[] = [];
+  let cells: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  let line = 1;
+  let start = 1;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charAt(i);
+    if (inQuotes) {
+      if (ch === '"' && text.charAt(i + 1) === '"') { cur += '"'; i++; }
+      else if (ch === '"') inQuotes = false;
+      else { if (ch === '\n') line++; cur += ch; }
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === delimiter) { cells.push(cur); cur = ''; }
+    else if (ch === '\r' && text.charAt(i + 1) === '\n') { /* the \n ends the record */ }
+    else if (ch === '\n') {
+      cells.push(cur);
+      records.push({ line: start, cells });
+      cells = []; cur = ''; line++; start = line;
+    } else cur += ch;
+  }
+  if (cur !== '' || cells.length > 0) { cells.push(cur); records.push({ line: start, cells }); }
+  return records;
+}
+
+/** Fields whose value is used exactly as written: never trimmed (U9). */
+const VERBATIM: ReadonlySet<keyof RowFields> = new Set(['api_password', 'ssh_password']);
+
+/** Split one CSV line, honouring quotes and doubled quotes inside them. */
+export function splitCsvLine(line: string, delimiter = ','): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') inQuotes = false;
+      else cur += ch;
+    } else if (ch === '"') inQuotes = true;
+    else if (ch === delimiter) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out.map((f) => f.trim());
+}
+
+export function parseDeviceCsv(
+  text: string,
+  presets: Pick<CredentialPreset, 'id' | 'name'>[],
+  existingAddresses: string[] = [],
+  tags: { id: number; name: string }[] = [],
+  /** Sites there are, and whether this account may make new ones (#306). */
+  sites: { names: string[]; canCreate: boolean } = { names: [], canCreate: false },
+): ParseResult {
+  const siteNames = new Set(sites.names.map((n) => n.trim().toLowerCase()));
+  const newSitesNoted = new Set<string>();
+  const tagByName = new Map(tags.map((t) => [t.name.trim().toLowerCase(), t.id]));
+  const fileErrors: string[] = [];
+  const body = text.replace(/^\uFEFF/, '');
+
+  // The separator, from the first non-blank, non-comment line.
+  const firstLine = body.split(/\r?\n/).find((l) => l.trim() && !l.trim().startsWith('#'));
+  if (firstLine === undefined) return { rows: [], fileErrors: ['The file is empty.'], ignoredColumns: [] };
+  const delimiter = detectDelimiter(firstLine);
+
+  const isBlankOrComment = (cells: string[]) =>
+    cells.every((c) => !c.trim()) || (cells[0] ?? '').trim().startsWith('#');
+  const records = parseCsvRecords(body, delimiter).filter((rec) => !isBlankOrComment(rec.cells));
+  const headerRec = records.shift();
+  if (!headerRec) return { rows: [], fileErrors: ['The file is empty.'], ignoredColumns: [] };
+
+  const header = headerRec.cells.map((h) => h.trim().toLowerCase().replace(/\s+/g, '_'));
+  const columnMap = new Map(Object.entries(COLUMNS));
+  const mapping = header.map((h) => columnMap.get(h));
+  const ignoredColumns = header.filter((h, i) => h && !mapping[i]);
+  if (!mapping.includes('ip_address')) {
+    fileErrors.push('No address column. Add a header row with at least "ip_address" (or "ip", "address", "host").');
+    return { rows: [], fileErrors, ignoredColumns };
+  }
+  // Two columns meaning the same thing (ip and address, say) used to let the
+  // later one silently win. Refuse instead (U9).
+  const byField = new Map<string, string[]>();
+  header.forEach((h, i) => { const k = mapping[i]; if (k) byField.set(k, [...(byField.get(k) ?? []), h]); });
+  for (const cols of byField.values()) {
+    if (cols.length > 1) fileErrors.push(`Columns ${cols.map((c) => `"${c}"`).join(' and ')} mean the same thing. Keep only one.`);
+  }
+  if (fileErrors.length > 0) return { rows: [], fileErrors, ignoredColumns };
+
+  const notes: string[] = [];
+  if (header.some((h) => h === 'group' || h === 'groups')) {
+    notes.push(`The "${header.find((h) => h === 'group' || h === 'groups')}" column is read as tags. For the group (customer) a new site goes in, use "site_group".`);
+  }
+  const presetByName = new Map(presets.map((p) => [p.name.trim().toLowerCase(), p.id]));
+  const existing = new Set(existingAddresses.map((a) => a.trim().toLowerCase()));
+  const seen = new Map<string, number>();
+  const rows: ParsedRow[] = [];
+
+  for (const rec of records) {
+    const f: RowFields = {};
+    mapping.forEach((key, c) => {
+      const raw = rec.cells[c];
+      if (!key || raw === undefined) return;
+      // Passwords exactly as written: a significant space is part of them (U9).
+      const v = VERBATIM.has(key) ? raw : raw.trim();
+      if (v !== '') f[key] = v;
+    });
+
+    const line = rec.line;
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    const addr = stripIPv6Brackets((f.ip_address || '').trim());
+
+    if (!addr) errors.push('Missing address.');
+    else if (!isValidDeviceAddress(addr)) errors.push(`"${addr}" is not a valid IP address or hostname.`);
+
+    const key = addr.toLowerCase();
+    if (addr && seen.has(key)) errors.push(`Same address as line ${seen.get(key)}.`);
+    else if (addr) seen.set(key, line);
+    // The template's example rows use 192.0.2.0/24, which is reserved for
+    // documentation (RFC 5737) and never a real device. Left in by mistake,
+    // they are skipped rather than queued as devices that can never connect.
+    const example = /^192\.0\.2\.\d{1,3}$/.test(addr);
+    const managed = !!addr && existing.has(key);
+    const skip = example || managed;
+    if (example) warnings.push('Example row from the template. Skipped.');
+    else if (managed) warnings.push('Already managed. Skipped.');
+
+    let deviceType: string | undefined;
+    if (f.device_type) {
+      deviceType = DEVICE_TYPES[f.device_type.toLowerCase()];
+      if (!deviceType) errors.push(`Unknown type "${f.device_type}". Use router, switch, ap or other.`);
+    }
+
+    let sshOnly = false;
+    if (f.ssh_only) {
+      if (/^(yes|y|true|1|x|ssh|ssh[-_ ]?only)$/i.test(f.ssh_only)) sshOnly = true;
+      else if (!/^(no|n|false|0|-)$/i.test(f.ssh_only)) errors.push(`ssh_only "${f.ssh_only}" should be yes or no.`);
+    }
+
+    let apiSsl: boolean | undefined;
+    if (f.api_ssl) {
+      if (/^(yes|y|true|1|x|ssl|tls|api[-_ ]?ssl)$/i.test(f.api_ssl)) apiSsl = true;
+      else if (/^(no|n|false|0|-|plain|api)$/i.test(f.api_ssl)) apiSsl = false;
+      else errors.push(`api_ssl "${f.api_ssl}" should be yes or no.`);
+    }
+
+    let presetId: number | undefined;
+    if (f.credential_preset) {
+      presetId = presetByName.get(f.credential_preset.trim().toLowerCase());
+      if (presetId === undefined) errors.push(`No credential preset called "${f.credential_preset}".`);
+    } else if (sshOnly && f.ssh_username && f.ssh_password && !f.api_username && !f.api_password) {
+      // SSH only with just an SSH login: it is tried on the API later too.
+    } else if (!f.api_username || !f.api_password) {
+      errors.push(sshOnly
+        ? 'Needs a credential preset, a username and password, or an SSH username and password.'
+        : 'Needs a credential preset, or both username and password.');
+    }
+
+    const portOf = (v: string | undefined, label: string): number | undefined => {
+      if (!v) return undefined;
+      const n = Number(v);
+      if (Number.isInteger(n) && n >= 1 && n <= 65535) return n;
+      errors.push(`${label} "${v}" is not valid.`);
+      return undefined;
+    };
+    const port = portOf(f.api_port, 'Port');
+    const sshPort = portOf(f.ssh_port, 'SSH port');
+
+    // A username without a password (or the reverse) is half a credential, and
+    // the device would end up with SSH that can never log in.
+    const hasSsh = !!(f.ssh_username || f.ssh_password);
+    if (hasSsh && !(f.ssh_username && f.ssh_password)) {
+      errors.push('SSH needs both ssh_username and ssh_password, or neither.');
+    }
+    if (presetId !== undefined && (hasSsh || sshPort)) {
+      warnings.push('Uses the preset\'s SSH settings. The SSH columns on this line are ignored.');
+    }
+
+    // Existing tags only: creating tags is an admin action, and a typo should
+    // be caught here rather than quietly start a new group.
+    const tagIds: number[] = [];
+    for (const name of (f.tags ?? '').split(/[|;,]/).map((t) => t.trim()).filter(Boolean)) {
+      const id = tagByName.get(name.toLowerCase());
+      if (id === undefined) errors.push(`No tag called "${name}". Create it under Settings → Tags first.`);
+      else if (!tagIds.includes(id)) tagIds.push(id);
+    }
+
+    // A site by name: an existing one, or a new one where the account may make sites.
+    const siteName = f.site?.trim();
+    if (siteName && !siteNames.has(siteName.toLowerCase())) {
+      if (!sites.canCreate) errors.push(`No site called "${siteName}".`);
+      else if (!newSitesNoted.has(siteName.toLowerCase())) {
+        newSitesNoted.add(siteName.toLowerCase());
+        warnings.push(`Makes a new site "${siteName}"${f.site_group ? ` in the group "${f.site_group}"` : ''}.`);
+      }
+    }
+    if (f.site_group && !siteName) warnings.push('A group only applies with a site. Ignored.');
+    else if (f.site_group && siteName && siteNames.has(siteName.toLowerCase())) {
+      warnings.push(`"${siteName}" already exists, so its group is left as it is.`);
+    }
+
+    const item: BulkAddDeviceItem | null = errors.length ? null : {
+      name: f.name?.trim() || addr,
+      ip_address: addr,
+      ...(deviceType ? { device_type: deviceType } : {}),
+      ...(presetId !== undefined ? { credential_preset_id: presetId } : {
+        api_username: f.api_username, api_password: f.api_password,
+      }),
+      ...(port ? { api_port: port } : {}),
+      ...(apiSsl !== undefined ? { api_tls: apiSsl } : {}),
+      ...(presetId === undefined && hasSsh ? { ssh_username: f.ssh_username, ssh_password: f.ssh_password } : {}),
+      ...(presetId === undefined && sshPort ? { ssh_port: sshPort } : {}),
+      ...(tagIds.length ? { tag_ids: tagIds } : {}),
+      ...(f.notes ? { notes: f.notes } : {}),
+      ...(sshOnly ? { ssh_only: true } : {}),
+      ...(siteName ? { site_name: siteName, ...(f.site_group ? { group_name: f.site_group } : {}) } : {}),
+    };
+    rows.push({ line, item, errors, warnings, skip });
+  }
+
+  if (rows.length === 0) fileErrors.push('The file has a header but no device rows.');
+  if (rows.length > MAX_ROWS) {
+    fileErrors.push(`${rows.length} rows; the limit per import is ${MAX_ROWS}. Split the file and import it in parts.`);
+  }
+  return { rows, fileErrors, ignoredColumns, ...(notes.length ? { notes } : {}) };
+}
+
+/**
+ * A starter file, offered as a download so people do not have to guess the
+ * columns. No comment lines: most people open this in a spreadsheet, where a
+ * "#" note shows up as a row of data. The example rows explain themselves in
+ * the notes column instead, and use documentation addresses (192.0.2.x) so
+ * they are skipped if left in.
+ *
+ * `presetName` is one of the installation's own presets, when it has any, so
+ * the preset example works as written.
+ */
+export function buildCsvTemplate(presetName?: string, tagName?: string): string {
+  const q = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+  const rows: string[][] = [
+    ['name', 'ip_address', 'type', 'preset', 'username', 'password', 'ssh_username', 'ssh_password', 'ssh_only', 'tags', 'site', 'site_group', 'notes'],
+  ];
+  const tag = tagName ?? '';
+  if (presetName) {
+    rows.push(['example-switch', '192.0.2.10', 'switch', presetName, '', '', '', '', '', tag, '', '',
+      'Example: logs in with a saved credential preset. Replace these rows with your devices.']);
+  }
+  rows.push(['example-router', '192.0.2.1', 'router', '', 'admin', 'your-password', '', '', '', tag, '', '',
+    'Example: username and password instead of a preset. A site column puts it in that site, made if new, and site_group in a customer group.']);
+  rows.push(['example-ap', '192.0.2.20', 'ap', '', 'admin', 'your-password', 'backup', 'ssh-password', '', '', '', '',
+    'Example: separate SSH login. Leave SSH blank to use the same login.']);
+  rows.push(['example-no-api', '192.0.2.30', 'router', '', 'admin', 'your-password', '', '', 'yes', '', '', '',
+    'Example: API not enabled yet. Added over SSH; switches to the API once it answers.']);
+  return rows.map((r) => r.map(q).join(',')).join('\r\n') + '\r\n';
+}

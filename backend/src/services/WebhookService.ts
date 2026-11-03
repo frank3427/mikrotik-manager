@@ -2,6 +2,7 @@
 // signature so receivers can verify authenticity. Fired from the alert
 // pipeline (all alert event types) and the firmware orchestrator.
 
+import { unseal } from '../utils/sealed';
 import { createHmac } from 'crypto';
 import * as https from 'https';
 import * as http from 'http';
@@ -9,47 +10,24 @@ import * as dns from 'dns';
 import { isIP } from 'net';
 import { URL } from 'url';
 import { query } from '../config/database';
+import { isBlockedAddress } from '../utils/deviceAddress';
 
 const dnsLookup = dns.promises.lookup;
 
-/**
- * True if an IP literal is in a range we must never let a webhook reach —
- * loopback, private, link-local (incl. cloud metadata 169.254.169.254), CGNAT,
- * or unspecified. Guards against SSRF to internal services.
- */
-export function isBlockedAddress(ip: string): boolean {
-  const v = isIP(ip);
-  if (v === 4) {
-    const o = ip.split('.').map(Number);
-    if (o.length !== 4 || o.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
-    const [a, b] = o;
-    if (a === 0 || a === 10 || a === 127) return true;               // this-net, private, loopback
-    if (a === 169 && b === 254) return true;                          // link-local + metadata
-    if (a === 172 && b >= 16 && b <= 31) return true;                 // private
-    if (a === 192 && b === 168) return true;                         // private
-    if (a === 100 && b >= 64 && b <= 127) return true;               // CGNAT
-    if (a >= 224) return true;                                        // multicast/reserved/broadcast
-    return false;
-  }
-  if (v === 6) {
-    const lower = ip.toLowerCase();
-    if (lower === '::1' || lower === '::') return true;
-    // IPv4-mapped (::ffff:1.2.3.4) — validate the embedded IPv4
-    const mapped = lower.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isBlockedAddress(mapped[1]);
-    const head = lower.split(':')[0];
-    if (head.startsWith('fe8') || head.startsWith('fe9') || head.startsWith('fea') || head.startsWith('feb')) return true; // fe80::/10
-    if (head.startsWith('fc') || head.startsWith('fd')) return true; // fc00::/7 unique-local
-    return false;
-  }
-  return true; // not a valid IP literal → refuse
-}
+// isBlockedAddress (loopback/private/link-local/CGNAT/unspecified) lives in
+// utils/deviceAddress.ts, shared with device-address classification. Guards
+// against SSRF to internal services.
+export { isBlockedAddress };
 
-async function assertPublicHost(hostname: string): Promise<string> {
+export async function assertPublicHost(hostname: string): Promise<string> {
+  // URL.hostname keeps the brackets of an IPv6 literal ("[::ffff:7f00:1]"),
+  // which isIP doesn't accept: without stripping them every IPv6 webhook fell
+  // through to a DNS lookup of the bracketed text.
+  const host = hostname.replace(/^\[|\]$/g, '');
   // Already an IP literal — check directly.
-  if (isIP(hostname)) {
-    if (isBlockedAddress(hostname)) throw new Error('URL resolves to a blocked (private/internal) address');
-    return hostname;
+  if (isIP(host)) {
+    if (isBlockedAddress(host)) throw new Error('URL resolves to a blocked (private/internal) address');
+    return host;
   }
   const results = await dnsLookup(hostname, { all: true }).catch(() => {
     throw new Error('Could not resolve webhook host');
@@ -67,6 +45,14 @@ export const WEBHOOK_EVENTS = [
   'high_cpu', 'high_memory', 'cert_expiry', 'device_discovered',
   'firmware_update_available', 'config_drift',
   'rollout_completed', 'rollout_failed',
+  'device_degraded', 'device_health_restored',
+  'device_identity_changed',
+  'cve_active',
+  'wireguard_stale',
+  'interface_errors', 'interface_flapping', 'optic_degraded',
+  'routing_peer_down',
+  'platform_backup_failed',
+  'device_cert_renewal_failed',
 ] as const;
 export type WebhookEvent = typeof WEBHOOK_EVENTS[number] | 'test';
 
@@ -144,8 +130,10 @@ export class WebhookService {
 
   private async deliver(hook: WebhookRow, body: string): Promise<number> {
     const headers: Record<string, string> = { 'User-Agent': 'MikroTik-Manager-Webhook' };
+    // The signing secret is stored encrypted (S7). One that can't be opened
+    // (lost key) fails the delivery rather than signing with ciphertext.
     if (hook.secret) {
-      headers['X-MTM-Signature'] = 'sha256=' + createHmac('sha256', hook.secret).update(body).digest('hex');
+      headers['X-MTM-Signature'] = 'sha256=' + createHmac('sha256', unseal(hook.secret)).update(body).digest('hex');
     }
     let status: number;
     try {

@@ -1,0 +1,253 @@
+# Sites
+
+[← Documentation index](README.md)
+
+A **site** is a named collection of devices whose data — clients, events, topology,
+backups, statistics — is viewed separately from every other site's.
+
+By default sites only separate what you **see**: every account can see every site. To
+separate who can see and change what, give accounts [per-site access](#per-site-access), so
+that a customer's staff reach only their own sites.
+
+## If you run one network, ignore this page
+
+On upgrade, a single site named **Default Site** is created and every existing device is
+assigned to it. Nothing moves, no figure changes, and the site selector does not appear.
+You will never meet the concept unless you create a second site.
+
+## Creating and switching
+
+The selector sits under the logo in the top-left, below the brand block. It lists your
+sites and offers **New site**, **rename** (the pencil, on hover) and **All sites**.
+
+Switching site reloads the data you are looking at. This is intentional and not a
+performance bug: every cached figure belonged to the site you just left, and showing it
+under another site's name would be worse than a brief reload.
+
+## Groups
+
+A group is a set of sites belonging to one customer: useful for an MSP whose customers have
+several sites each (#306). Choose a group in the site switcher and every page narrows to its
+sites, as it would to one site. A site belongs to at most one group, and devices belong through
+their site, so moving a site into a group brings its devices with it.
+
+Make groups on the **Sites** page under **Groups**: name it and tick its sites. Ticking a site
+that's in another group moves it. A site's group can also be set when editing the site. Deleting
+a group leaves its sites and devices where they are, without a group. Groups are managed by
+fleet-wide accounts, since putting a site in a group gives everyone with access to that group
+access to the site.
+
+With many sites, the switcher has a search box, and the Sites page can be filtered.
+
+The Sites page also holds the **RoMON** settings, per site, per group and fleet-wide; see
+[RoMON](security.md#romon).
+
+## Moving devices
+
+A device belongs to exactly one site. Move it from **Device → Physical Details → Site**;
+the picker only appears when more than one site exists. To move several at once, tick them on
+the Devices page and choose **Move to site…** in the bar above the list (#306).
+
+Moving a device takes its history with it — clients, events, backups, interface
+statistics. Nothing is copied or lost, because none of that data carries a site of its
+own: it hangs off the device, and the device carries the site.
+
+Devices added through the UI or API join whichever site you were viewing, falling back
+to the default site. A device belonging to no site would be invisible the moment any
+site is selected, so the field is always set rather than left empty.
+
+## The all-sites view
+
+**All sites** in the selector opens a table of every site with its address and device
+count, plus a world map with a pin per geocoded site. Selecting a row switches to that
+site.
+
+Choosing **All sites** also makes every other page fleet-wide, which is the honest reading
+of "all sites" — useful for a fleet-wide search, less so for a dashboard that averages
+several unrelated networks.
+
+Pins require an address, which is geocoded via Nominatim when you save it. If
+**Settings → Maps enabled** is off, no geocoding or tile request is made and the map is
+hidden; addresses are still stored and shown as text.
+
+## Site address and device locations
+
+A device uses its site's address unless it has its own location. That covers the dashboard
+map, the Devices location filter and the SNMP `{location}` variable. Set a device's own
+location under **Overview → Physical Details** only when it isn't at the site's address, for
+example another building. Clear it to go back to the site's address.
+
+Nothing is copied into the devices, so changing a site's address updates every device that
+uses it.
+
+## Per-site access
+
+An account can be limited to particular sites, with its own role in each: **admin**,
+**operator** or **viewer**. Everyone else keeps fleet-wide access under their normal role,
+which is every account until you change it, so upgrading changes nothing.
+
+Set it under **Settings → Users & Roles**: click the globe icon on a user, choose
+**Specific sites** (**Specific groups and sites** once there are groups), and pick a role for
+each. A role in a group reaches every site in it, including sites added to the group later; a
+site reached both ways gets the higher of the two roles. **Whole fleet** undoes it. It applies on
+the account's next request; nobody has to sign in again. You can't limit your own account,
+so there is always a fleet administrator.
+
+What a site-limited account gets:
+
+- **Only its sites.** The site switcher lists only them, and "All my sites" covers all of
+  them. Devices, clients, events, backups, topology, search and the rest show nothing from
+  other sites. A device in another site answers "not found", so its existence doesn't leak.
+  Tags are shared across the fleet, but their device counts include only its sites.
+  Traffic analytics shows only its sites' traffic (see [Traffic](traffic.md)).
+- **Edits stay in its sites.** Renaming a client, setting its category or editing its notes
+  changes the records in its sites only, even if the same MAC is on record elsewhere.
+- **It lands in the right place.** An account with one site opens on that site; one with
+  several opens on "All my sites". A site left selected in the browser by someone else who
+  used it doesn't carry over, and if a site is taken away while the account is signed in,
+  the interface drops back to its remaining sites rather than showing an empty page.
+- **Its role, site by site.** An operator in one site and a viewer in another can change
+  devices in the first and only look at the second. Write controls follow the site selected.
+- **Site admins** can do everything an operator can in their sites, plus admin-level device
+  actions such as trusting a changed certificate. They can't manage users, SSO, alerting, API
+  tokens, encryption or other fleet settings, and admin-only fleet-wide credential presets are
+  as closed to them as to an operator. They do manage their own sites' credential presets
+  under **Operations → Credentials**.
+- **Bulk work within its sites.** Bulk commands and firmware rollouts are available only if
+  every device in them is in the account's sites. "Apply to all" actions (SNMP, LLDP, Backup
+  all) skip sites where it's only a viewer.
+- **Terminals and live updates** follow the same rules: a shell opens only on a device in a
+  site where the account is an operator or admin, and live-update events for other sites
+  never reach it.
+
+Not available to site-limited accounts, because each covers the whole fleet:
+
+- Alert rules, channels and history; Settings other than **My Password**.
+- Creating or deleting sites, editing shared command templates, poller health, and
+  dismissing insights.
+
+Moving a device between sites needs admin in both, since it changes who can reach the device.
+Adding a device that's already managed in a site the account can't see is refused, without
+saying which device or site it is.
+
+API tokens stay fleet-wide and only fleet admins can create them. Accounts from SSO are
+fleet-wide under their mapped role until an admin assigns them sites.
+
+## What sites scope, and what they do not
+
+Scoped to the selected site:
+
+- Devices, clients, events, topology, search
+- Dashboard and Operations insights, metrics summary
+- Wireless (APs, CAPsMAN, RF channels and signals)
+- Backups, Firmware, Bulk commands
+
+Also scoped: the Operations feed (Things to Handle, Recent Activity, capacity), Config
+Health findings, anomaly detection, the Connected Clients chart, and traffic analytics.
+
+Dismissing an insight hides it in the view it was dismissed in: one site, or all sites. A
+finding with the same wording at another site still shows. (Dismissals made before 0.24.47
+apply nowhere and simply reappear.)
+
+Collection keeps sites apart as well. Topology links a neighbour to a managed device only in
+the same site, a MAC scan fills in client addresses only in its own site, and NetFlow matches
+client addresses within the exporter's site, so overlapping address plans (two customers on
+the RouterOS default 192.168.88.0/24) don't join two networks.
+
+Deliberately **not** scoped:
+
+- **Polling.** Collection always runs across the whole fleet. Sites are a view over data
+  already gathered, not a change to how it is gathered — a device does not stop being
+  monitored because you are looking at another site.
+- **The audit log**, in Recent Activity. Audit rows record who changed the install; they
+  carry no device and so belong to no site. Repeating "admin changed a setting" into every
+  site would misattribute it, so the audit feed appears only in the all-sites view.
+- **NetFlow collector health**, which is one service for the install. Site-limited accounts
+  see only their own exporters in it.
+- **Rogue AP detection.** The scans are site-scoped, but the "these access points are
+  ours" set stays fleet-wide. An AP of yours in another site is still yours, and scoping
+  that set would report your own hardware as a rogue. Your SSIDs, on the other hand, are
+  matched per site: a neighbour at one site broadcasting "Guest" isn't flagged because a
+  managed AP at another site is also called "Guest". One of your own AP addresses heard on
+  a channel that radio isn't using is flagged as a likely spoof.
+- **Install-wide configuration**: users, alert rules, webhooks, config templates,
+  fleet-wide credential presets, tags, maintenance windows and settings. A credential preset
+  can also belong to one site (see [Device credentials](devices.md#device-credentials)).
+
+Bulk actions — Backup all, Sync all, firmware check-all, bulk commands — obey the
+selector. A bulk operation that silently spanned two customers is precisely the blast
+radius the wave and halt-on-failure guards exist to contain.
+
+## Deleting a site
+
+Deleting a site never deletes the devices in it. If devices remain, the deletion is
+refused and you are asked to move them first, so their destination is a decision rather
+than a side effect.
+
+Deleting a site, or a group, that is some account's only access is refused too, naming the
+accounts: an account with no sites or groups left would otherwise become fleet-wide. Give
+them access elsewhere, or remove them, first. An account whose only group has no sites in it
+yet sees nothing, never the whole fleet.
+
+## API
+
+The active site travels as an `X-Site-Id` header, or a `?site_id=` query parameter.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -H "X-Site-Id: 2" https://mtm.example.com/api/devices
+```
+
+**Omitting the header means unscoped**, returning the whole fleet exactly as the API did
+before sites existed. Existing scripts and API tokens keep working untouched. For a
+site-limited account, omitting it means all of its own sites, and naming a site it can't see
+returns `403` with `code: "site_forbidden"`. Fleet-wide features refuse such accounts with
+`403` and `code: "fleet_only"`.
+
+A group travels as `X-Site-Group: <id>` and scopes the request to its sites; a group with no
+sites matches nothing. For a site-limited account it covers the group's sites that are its own,
+and a group holding none of them returns `403` `site_forbidden`. `X-Site-Id` wins when both are sent.
+
+Per-site access is set on the user, as lists of sites and groups; both empty makes the account
+fleet-wide:
+
+```bash
+curl -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  https://mtm.example.com/api/settings/users/12 \
+  -d '{"site_roles":[{"site_id":2,"role":"operator"}],"group_roles":[{"group_id":3,"role":"viewer"}]}'
+```
+
+`GET /api/settings/users` returns each account's `site_roles` and `group_roles`.
+
+Adding a device (`POST /api/devices`, or the items of a bulk add) can name its site: `site_id`,
+or `site_name` to use or make a site by name, with `group_name` for the group a new site goes in.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/sites` | List sites with device counts |
+| `POST` | `/api/sites` | Create a site |
+| `PUT` | `/api/sites/:id` | Rename, set address, notes or `group_id` |
+| `DELETE` | `/api/sites/:id` | Delete (refused while devices remain, or if it's an account's only access) |
+| `POST` | `/api/sites/:id/devices` | Move devices into the site |
+| `GET` | `/api/site-groups` | List groups with their sites and device counts |
+| `POST` | `/api/site-groups` | Create a group: `name`, optional `site_ids` |
+| `PUT` | `/api/site-groups/:id` | Rename, or replace its sites with `site_ids` |
+| `DELETE` | `/api/site-groups/:id` | Delete; its sites stay, without a group |
+
+## The Connected Clients chart
+
+Client totals are deduplicated — a client seen by two access points is one client — so the
+chart cannot be a sum of per-device series. A per-site deduplicated series is recorded
+alongside the fleet-wide one, and it starts accumulating from the upgrade.
+
+That would have cost every existing install its chart history, so there is one shortcut,
+and it is an identity rather than an approximation: **when a site contains every device,
+its total is the fleet total**, and the chart reads the fleet-wide series with all of its
+history. Single-site installs therefore lose nothing. Once you genuinely split the fleet,
+each site's chart builds its own history from that point.
+
+## A note on client counts
+
+A client is counted in a site when a device in that site has seen it. On genuinely
+separate networks the sites do not overlap. If two sites share one broadcast domain —
+common in a lab — the same MAC is legitimately seen by hardware in both, and appears in
+both counts.

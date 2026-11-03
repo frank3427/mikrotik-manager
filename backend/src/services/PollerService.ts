@@ -1,13 +1,39 @@
+import { logSafe } from '../utils/logSafe';
 import { Queue, Worker, Job } from 'bullmq';
-import { createRedisConnection } from '../config/redis';
-import { query } from '../config/database';
+import { hasRadios } from './mikrotik/capsman';
+import { checkApi, promoteToApi, recordApiCheck, refreshOverSsh, type SshOnlyDevice } from './sshOnly';
+import { apiCheckIntervalMs } from '../utils/sshOnly';
+import { cleanOverrides, effectiveValues } from '../utils/pollOverrides';
+import { createRedisConnection, redis } from '../config/redis';
+import { query, queryOne } from '../config/database';
+import { pooledSessionCount } from './mikrotik/sessionPool';
 import { DeviceCollector, DeviceRow } from './mikrotik/DeviceCollector';
 import { Server as SocketServer } from 'socket.io';
 import { getWriteApi } from '../config/influxdb';
 import { Point } from '@influxdata/influxdb-client';
 import { alertService } from './AlertService';
+import { logAlertCandidates } from '../utils/logAlerts';
+import { firewallPacketLogSql } from '../utils/firewallEventSql';
 import { runConfigHealth } from './changeGuard/configHealth';
 import type { GuardDevice } from './changeGuard/ChangeGuard';
+import { cronMatches } from '../utils/cron';
+import { reconcileProxyUsage } from './ProxyUsageService';
+import { checkInterfaceErrors, purgeInterfaceErrorEvents } from './interfaceErrors';
+import { checkOptics, purgeOpticReadings } from './opticLevels';
+import { checkWireGuardStale } from './wireguardStale';
+import { checkRoutingPeers } from './routingPeerAlerts';
+import { isRestoring, scheduleTick as platformBackupTick } from './platformBackup/service';
+import { renewalTick as deviceCertRenewalTick } from './deviceCa';
+import { resolveModules, describeDisabled } from '../utils/pollModules';
+import { updateAvailable } from '../utils/rosVersion';
+import { certExpiryState, needsAttention, describeCert } from '../utils/certExpiry';
+import { offlineAction, recoveryAlert, describeDuration } from '../utils/intermittent';
+import { runHealthCheck } from './healthCheck';
+import { gateTtlSeconds } from '../utils/schedulerGate';
+import { runPollJob, pollJobAborted } from '../utils/pollJobContext';
+import { refreshCveFeed } from './cveFeed';
+import { checkCveAlerts } from './cveAlerts';
+import { POLLER_ROLE, PROCESS_ID, EMIT_CHANNEL, HEARTBEAT_PREFIX } from './pollerRole';
 
 // ─── Tuning ───────────────────────────────────────────────────────────────────
 
@@ -45,7 +71,10 @@ const STALE_WAIT_MS: Record<string, number> = {
 const POLL_CONCURRENCY = Math.max(1, Number(process.env.POLLER_CONCURRENCY || 12));
 
 /** Scheduler tick — one fast poll per device per interval. */
-const POLL_INTERVAL_MS = Math.max(10_000, Number(process.env.POLLER_INTERVAL_MS || 30_000));
+// How often the scheduler looks at what's due. Each device's fast, slow and
+// log polls have their own intervals (Settings, overridable per site and per
+// device, #261), so this only needs to be as short as the shortest of them.
+const POLL_INTERVAL_MS = Math.max(10_000, Number(process.env.POLLER_INTERVAL_MS || 10_000));
 
 /**
  * Hard ceiling on a single poll.
@@ -55,13 +84,20 @@ const POLL_INTERVAL_MS = Math.max(10_000, Number(process.env.POLLER_INTERVAL_MS 
  */
 const JOB_TIMEOUT_MS = Math.max(5_000, Number(process.env.POLLER_JOB_TIMEOUT_MS || 45_000));
 
-/** Fails the job rather than letting it occupy a worker indefinitely. */
-function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+/**
+ * Fails the job rather than letting it occupy a worker indefinitely, and
+ * cancels its device sessions when it does (onTimeout). Without that the work
+ * carried on after the job had already been counted as failed.
+ */
+function withTimeout<T>(work: Promise<T>, ms: number, label: string, onTimeout?: () => void): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   return Promise.race([
     work.finally(() => clearTimeout(timer)),
     new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms`)), ms);
+      timer = setTimeout(() => {
+        try { onTimeout?.(); } catch { /* cancelling is best effort */ }
+        reject(new Error(`${label} exceeded ${ms}ms`));
+      }, ms);
     }),
   ]);
 }
@@ -69,8 +105,21 @@ function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T>
 
 interface PollJob {
   deviceId: number;
-  type: 'fast' | 'slow' | 'logs' | 'full' | 'macscan' | 'spectral' | 'apscan' | 'configsnap' | 'confighealth';
+  type: 'fast' | 'slow' | 'logs' | 'full' | 'macscan' | 'spectral' | 'apscan' | 'configsnap' | 'confighealth' | 'sshcheck';
 }
+
+/** Keep API sessions open between polls (#301); on unless switched off in Settings → Polling. */
+/**
+ * Sessions kept open between polls (#301) are opt-in: a long-lived session
+ * to every device is a change in how the manager behaves on the network, so
+ * it's switched on deliberately (Settings → Polling), not by upgrading.
+ */
+function persistentSessions(appSettings: Record<string, unknown>): boolean {
+  return appSettings['poller_persistent_sessions'] === true;
+}
+
+/** Job types recorded under their own kind in device_poll_stats rather than their queue's. */
+const OWN_STATS_ROW = new Set(['full', 'macscan', 'configsnap', 'confighealth', 'spectral', 'apscan']);
 
 export class PollerService {
   private fastQueue: Queue;
@@ -138,20 +187,144 @@ export class PollerService {
     }
   }
 
+  /** Device id → site, for routing live updates; refreshed after a minute. */
+  private deviceSite = new Map<number, { site: number | null; at: number }>();
+
+  /**
+   * Send a device's live update only to accounts that can see it: fleet-wide
+   * ones ('fleet' room) and those with access to its site (P1-7).
+   */
+  private async emitForDevice(event: string, payload: Record<string, unknown>, deviceId: number): Promise<void> {
+    if (!this.io) {
+      // A worker process has no browsers: the API process sends it on (#301).
+      if (POLLER_ROLE === 'worker') {
+        void redis.publish(EMIT_CHANNEL, JSON.stringify({ event, payload, deviceId })).catch(() => {});
+      }
+      return;
+    }
+    let hit = this.deviceSite.get(deviceId);
+    if (!hit || Date.now() - hit.at > 60_000) {
+      const row = await queryOne<{ site_id: number | null }>(`SELECT site_id FROM devices WHERE id = $1`, [deviceId]).catch(() => null);
+      hit = { site: row?.site_id ?? null, at: Date.now() };
+      this.deviceSite.set(deviceId, hit);
+    }
+    let target = this.io.to('fleet');
+    if (hit.site !== null) target = target.to(`site:${hit.site}`);
+    target.emit(event, payload);
+  }
+
   setSocketServer(io: SocketServer): void {
     this.io = io;
   }
 
   async start(): Promise<void> {
-    this.startWorkers();
-    this.startScheduler();
-    console.log('PollerService started');
+    const disabled = describeDisabled(resolveModules(await this.getAppSettings()));
+    if (disabled) console.log(`[Poller] Collectors disabled by settings: ${disabled}`);
+    // Worker containers (#301): POLLER_ROLE decides what runs here.
+    if (POLLER_ROLE !== 'api') {
+      this.startWorkers();
+      this.startHeartbeat();
+    }
+    if (POLLER_ROLE !== 'worker') {
+      this.startScheduler();
+      this.startEmitRelay();
+    }
+    console.log(`PollerService started (role: ${POLLER_ROLE})`);
+  }
+
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private relay: ReturnType<typeof createRedisConnection> | null = null;
+
+  /**
+   * Tell poller health this process is here, with its workers and open
+   * sessions (#301). Expires on its own if the process goes away.
+   */
+  private startHeartbeat(): void {
+    const beat = () => {
+      void redis.set(`${HEARTBEAT_PREFIX}${PROCESS_ID}`, JSON.stringify({
+        role: POLLER_ROLE, concurrency: POLL_CONCURRENCY, sessions: pooledSessionCount(), at: Date.now(),
+      }), 'EX', 45).catch(() => { /* health just won't count it this time */ });
+    };
+    beat();
+    this.heartbeatTimer = setInterval(beat, 15_000);
+    this.heartbeatTimer.unref();
+  }
+
+  /** Live updates published by worker processes, sent on to the browsers connected here. */
+  private startEmitRelay(): void {
+    const sub = createRedisConnection();
+    this.relay = sub;
+    sub.on('message', (_channel: string, raw: string) => {
+      try {
+        const m = JSON.parse(raw) as { event: string; payload: Record<string, unknown>; deviceId: number | null };
+        if (typeof m.event !== 'string') return;
+        if (m.deviceId == null) this.io?.emit(m.event, m.payload ?? {});
+        else void this.emitForDevice(m.event, m.payload ?? {}, m.deviceId);
+      } catch { /* not ours */ }
+    });
+    sub.on('error', () => { /* ioredis reconnects by itself */ });
+    void sub.connect().then(() => sub.subscribe(EMIT_CHANNEL)).catch((e: Error) =>
+      console.warn('[Poller] live-update relay not started:', e.message));
+  }
+
+  /**
+   * The slowest fast polls, each split into connecting, waiting on the device
+   * and the rest (database, processing, queue bookkeeping), so a slow site's
+   * time can be pinned on its link, its router or the manager (#301).
+   */
+  private async slowestPolls(limit = 15): Promise<Record<string, unknown>[]> {
+    const rows = await query<{
+      id: number; name: string; site: string | null; duration: number; connect: number | null; collect: number | null;
+      device: number | null; reused: boolean | null; error: string | null; at: string | null;
+    }>(
+      `SELECT d.id, d.name, s.name AS site, p.last_duration_ms AS duration, p.last_connect_ms AS connect,
+              p.last_collect_ms AS collect, p.last_device_ms AS device, p.last_session_reused AS reused,
+              p.last_error AS error, p.last_attempt_at AS at
+         FROM device_poll_stats p
+         JOIN devices d ON d.id = p.device_id
+         LEFT JOIN sites s ON s.id = d.site_id
+        WHERE p.kind = 'fast' AND p.last_duration_ms IS NOT NULL AND d.status != 'disabled'
+        ORDER BY p.last_duration_ms DESC
+        LIMIT $1`, [limit]).catch(() => []);
+    return rows.map((r) => ({
+      id: r.id, name: r.name, site: r.site, total_ms: r.duration,
+      connect_ms: r.connect, device_ms: r.device,
+      // Everything not spent connecting or waiting on the device.
+      other_ms: r.connect == null || r.device == null ? null : Math.max(0, r.duration - r.connect - r.device),
+      reused: r.reused, error: r.error, at: r.at,
+    }));
+  }
+
+  /** Every process running poll workers, from their heartbeats. */
+  private async pollerProcesses(): Promise<{ id: string; role: string; concurrency: number; sessions: number }[]> {
+    try {
+      const keys = await redis.keys(`${HEARTBEAT_PREFIX}*`);
+      if (!keys.length) return [];
+      const vals = await redis.mget(...keys);
+      return keys.flatMap((k, i) => {
+        try {
+          const v = JSON.parse(vals[i] ?? '') as { role: string; concurrency: number; sessions: number };
+          return [{ id: k.slice(HEARTBEAT_PREFIX.length), role: v.role, concurrency: Number(v.concurrency) || 0, sessions: Number(v.sessions) || 0 }];
+        } catch { return []; }
+      });
+    } catch { return []; }
+  }
+
+  /** A live update for every browser (no device to scope it by). */
+  private broadcast(event: string, payload: Record<string, unknown>): void {
+    if (this.io) { this.io.emit(event, payload); return; }
+    if (POLLER_ROLE === 'worker') {
+      void redis.publish(EMIT_CHANNEL, JSON.stringify({ event, payload, deviceId: null })).catch(() => {});
+    }
   }
 
   async stop(): Promise<void> {
     if (this.schedulerInterval) {
       clearInterval(this.schedulerInterval);
     }
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    await redis.del(`${HEARTBEAT_PREFIX}${PROCESS_ID}`).catch(() => {});
+    this.relay?.disconnect();
     await this.fastWorker?.close();
     await this.slowWorker?.close();
     await this.logsWorker?.close();
@@ -208,6 +381,8 @@ export class PollerService {
       await this.logsQueue.add('device-logs-poll', jobData, periodic);
     } else if (type === 'macscan') {
       await this.fastQueue.add('device-macscan', jobData, periodic);
+    } else if (type === 'sshcheck') {
+      await this.fastQueue.add('device-sshcheck', jobData, periodic);
     } else if (type === 'spectral') {
       await this.slowQueue.add('device-spectral', jobData, periodic);
     } else if (type === 'apscan') {
@@ -220,19 +395,35 @@ export class PollerService {
   }
 
   private startScheduler(): void {
-    this.schedulerInterval = setInterval(async () => {
-      await this.schedulePollCycle();
-    }, POLL_INTERVAL_MS);
+    this.schedulerInterval = setInterval(() => { void this.guardedCycle(); }, POLL_INTERVAL_MS);
 
     // Also run immediately
-    setTimeout(() => this.schedulePollCycle(), 5000);
+    setTimeout(() => { void this.guardedCycle(); }, 5000);
+  }
+
+  /** True while a scheduling cycle is running (J10). */
+  private cycleRunning = false;
+
+  /**
+   * One cycle at a time. During a Redis outage each cycle blocks on its queue
+   * calls; without this, every tick started another, and when Redis came back
+   * dozens of stacked cycles fired at once (outside review J10). A tick that
+   * finds the previous cycle still running is skipped.
+   */
+  private async guardedCycle(): Promise<void> {
+    // A platform restore is replacing the data; the restart that follows resumes polling.
+    if (this.cycleRunning || isRestoring()) return;
+    this.cycleRunning = true;
+    try {
+      await this.schedulePollCycle();
+    } finally {
+      this.cycleRunning = false;
+    }
   }
 
   private async schedulePollCycle(): Promise<void> {
     try {
       const appSettings = await this.getAppSettings();
-      const macScanEnabled  = appSettings['mac_scan_enabled']  !== false;
-      const macScanInterval = (appSettings['mac_scan_interval'] as number) || 300;
       const reverseDnsEnabled = appSettings['reverse_dns_enabled'] === true;
       const spectralEnabled       = appSettings['spectral_scan_enabled'] === true;
       const spectralIntervalHours = (appSettings['spectral_scan_interval_hours'] as number) || 24;
@@ -240,63 +431,79 @@ export class PollerService {
       const apScanIntervalHours   = (appSettings['ap_scan_interval_hours'] as number) || 24;
       const backupScheduleEnabled = appSettings['backup_schedule_enabled'] === true;
       const backupScheduleCron    = (appSettings['backup_schedule_cron'] as string) || '0 2 * * *';
-      const configSnapEnabled      = appSettings['config_snapshot_enabled'] !== false;
-      const configSnapIntervalMin  = (appSettings['config_snapshot_interval_min'] as number) || 60;
+      // Schedules are the operator's local time, not the container's (#117).
+      const appTimezone           = (appSettings['app_timezone'] as string) || 'UTC';
       const configHealthEnabled     = appSettings['config_health_enabled'] !== false;
       const configHealthIntervalMin = (appSettings['config_health_interval_min'] as number) || 60;
 
-      const devices = await query<DeviceRow>(
+      const devices = await query<DeviceRow & { poll_overrides?: unknown; site_id?: number | null }>(
         `SELECT * FROM devices WHERE status != 'disabled'`
       );
+      // Per-site and per-device overrides (#261). The global intervals in
+      // Settings used to be saved and never read: polls ran every 30 s, 5 min
+      // and 1 min whatever they said.
+      const siteRows = await query<{ id: number; poll_overrides: unknown }>(`SELECT id, poll_overrides FROM sites`).catch(() => []);
+      const siteOverrides = new Map(siteRows.map((r) => [r.id, cleanOverrides(r.poll_overrides)]));
+      const slowWindows = new Map<number, number>();
 
       const now = Date.now();
       for (const device of devices) {
-        // Fast poll every 30s
-        await this.scheduleDeviceSync(device.id, 'fast');
-
-        // Slow poll every 5min (300s)
-        const slowKey = `poll:slow:${device.id}`;
-        const lastSlow = await this.getTimestamp(slowKey);
-        if (now - lastSlow > 300_000) {
-          await this.scheduleDeviceSync(device.id, 'slow');
-          await this.setTimestamp(slowKey, now);
-        }
-
-        // Logs poll every 60s
-        const logsKey = `poll:logs:${device.id}`;
-        const lastLogs = await this.getTimestamp(logsKey);
-        if (now - lastLogs > 60_000) {
-          await this.scheduleDeviceSync(device.id, 'logs');
-          await this.setTimestamp(logsKey, now);
-        }
-
-        // MAC scan — switches only, user-configured interval
-        if (macScanEnabled && device.device_type === 'switch') {
-          const macKey = `poll:macscan:${device.id}`;
-          const lastMac = await this.getTimestamp(macKey);
-          if (now - lastMac > macScanInterval * 1_000) {
-            await this.scheduleDeviceSync(device.id, 'macscan');
-            await this.setTimestamp(macKey, now);
+        const eff = effectiveValues(appSettings, siteOverrides.get(device.site_id ?? -1) ?? null, cleanOverrides(device.poll_overrides));
+        const configSnapEnabled = eff.configSnapEnabled;
+        const configSnapIntervalMin = eff.configSnapMin;
+        slowWindows.set(device.id, eff.slowSec);
+        // Added over SSH only (#174): no API polling. A check every minute reads
+        // the basics over SSH and retries the API; config history still works,
+        // since it is an SSH export.
+        if (device.ssh_only) {
+          const sshKey = `poll:sshcheck:${device.id}`;
+          if (now - (await this.getTimestamp(sshKey)) > 60_000) {
+            await this.scheduleDeviceSync(device.id, 'sshcheck');
+            await this.setTimestamp(sshKey, now, 60_000);
           }
+          if (configSnapEnabled) {
+            const configKey = `poll:configsnap:${device.id}`;
+            if (now - (await this.getTimestamp(configKey)) > configSnapIntervalMin * 60_000) {
+              await this.scheduleDeviceSync(device.id, 'configsnap');
+              await this.setTimestamp(configKey, now, configSnapIntervalMin * 60_000);
+            }
+          }
+          continue;
         }
 
-        // Spectral scan — wireless_ap only, user-configured interval (default 24h)
-        if (spectralEnabled && device.device_type === 'wireless_ap') {
+        // Fast, slow and log polls, each at the device's own interval. A small
+        // allowance absorbs scheduler jitter, so a 30 s poll doesn't slip to 40.
+        const due = async (key: string, ms: number): Promise<boolean> => {
+          if (now - (await this.getTimestamp(key)) <= ms - POLL_INTERVAL_MS / 2) return false;
+          await this.setTimestamp(key, now, ms);
+          return true;
+        };
+        if (await due(`poll:fast:${device.id}`, eff.fastSec * 1000)) await this.scheduleDeviceSync(device.id, 'fast');
+        if (await due(`poll:slow:${device.id}`, eff.slowSec * 1000)) await this.scheduleDeviceSync(device.id, 'slow');
+        if (await due(`poll:logs:${device.id}`, eff.logsSec * 1000)) await this.scheduleDeviceSync(device.id, 'logs');
+
+        // MAC scan — switches only
+        if (eff.macScanEnabled && device.device_type === 'switch') {
+          if (await due(`poll:macscan:${device.id}`, eff.macScanSec * 1000)) await this.scheduleDeviceSync(device.id, 'macscan');
+        }
+
+        // Spectral scan — devices with radios (an all-in-one router too), user-configured interval (default 24h)
+        if (spectralEnabled && hasRadios(device as DeviceRow & { wifi_role?: string | null })) {
           const spectralKey = `poll:spectral:${device.id}`;
           const lastSpectral = await this.getTimestamp(spectralKey);
           if (now - lastSpectral > spectralIntervalHours * 3_600_000) {
             await this.scheduleDeviceSync(device.id, 'spectral');
-            await this.setTimestamp(spectralKey, now);
+            await this.setTimestamp(spectralKey, now, spectralIntervalHours * 3_600_000);
           }
         }
 
-        // AP scan — wireless_ap only, user-configured interval (default 24h)
-        if (apScanEnabled && device.device_type === 'wireless_ap') {
+        // AP scan — devices with radios, user-configured interval (default 24h)
+        if (apScanEnabled && hasRadios(device as DeviceRow & { wifi_role?: string | null })) {
           const apScanKey = `poll:apscan:${device.id}`;
           const lastApScan = await this.getTimestamp(apScanKey);
           if (now - lastApScan > apScanIntervalHours * 3_600_000) {
             await this.scheduleDeviceSync(device.id, 'apscan');
-            await this.setTimestamp(apScanKey, now);
+            await this.setTimestamp(apScanKey, now, apScanIntervalHours * 3_600_000);
           }
         }
 
@@ -310,7 +517,7 @@ export class PollerService {
             await this.scheduleDeviceSync(device.id, 'configsnap');
             // Keep the gate key alive for the full interval (+ buffer) so the
             // snapshot honours the configured cadence rather than the default TTL.
-            await this.setTimestamp(configKey, now, configSnapIntervalMin * 60 + 120);
+            await this.setTimestamp(configKey, now, configSnapIntervalMin * 60_000);
           }
         }
 
@@ -321,7 +528,7 @@ export class PollerService {
           const lastHealth = await this.getTimestamp(healthKey);
           if (now - lastHealth > configHealthIntervalMin * 60_000) {
             await this.scheduleDeviceSync(device.id, 'confighealth');
-            await this.setTimestamp(healthKey, now, configHealthIntervalMin * 60 + 120);
+            await this.setTimestamp(healthKey, now, configHealthIntervalMin * 60_000);
           }
         }
       }
@@ -331,7 +538,7 @@ export class PollerService {
         const rdnsKey = 'task:reverse_dns';
         const lastRdns = await this.getTimestamp(rdnsKey);
         if (now - lastRdns > 300_000) {
-          await this.setTimestamp(rdnsKey, now);
+          await this.setTimestamp(rdnsKey, now, 300_000);
           this.resolveClientHostnames().catch((e) =>
             console.error('[Poller] Reverse DNS error:', e)
           );
@@ -345,9 +552,81 @@ export class PollerService {
       const staleLinksKey = 'task:stale_topology_links';
       const lastStaleLinks = await this.getTimestamp(staleLinksKey);
       if (now - lastStaleLinks > 900_000) {
-        await this.setTimestamp(staleLinksKey, now);
-        query(`DELETE FROM topology_links WHERE discovered_at < NOW() - INTERVAL '20 minutes'`)
+        await this.setTimestamp(staleLinksKey, now, 900_000);
+        // Four missed slow polls, at each device's own slow interval (at least
+        // 20 minutes): a site polled every 30 minutes keeps its links (#261).
+        const ids = [...slowWindows.keys()];
+        query(
+          `DELETE FROM topology_links tl
+            USING (SELECT unnest($1::int[]) AS id, unnest($2::int[]) AS secs) w
+            WHERE tl.from_device_id = w.id
+              AND tl.discovered_at < NOW() - make_interval(secs => GREATEST(1200, w.secs * 4))`,
+          [ids, ids.map((id) => slowWindows.get(id)!)])
+          .then(() => query(
+            `DELETE FROM topology_links WHERE discovered_at < NOW() - INTERVAL '20 minutes'
+               AND NOT (from_device_id = ANY($1::int[]))`, [ids]))
           .catch((e) => console.error('[Poller] Stale topology-link cleanup error:', e));
+      }
+
+      // Certificate expiry — hourly (#143).
+      //
+      // The cert_expiry alert has been declared, styled, routed to webhooks and
+      // given a default rule of "14 days, once a day" since long before
+      // anything read a certificate. Nothing ever dispatched it, so an operator
+      // could enable the rule and wait indefinitely. This is the producer.
+      //
+      // Hourly is frequent enough for a threshold measured in days, and the
+      // rule's own cooldown decides how often anyone is actually told.
+      const certKey = 'task:cert_expiry';
+      const lastCert = await this.getTimestamp(certKey);
+      if (now - lastCert > 3_600_000) {
+        await this.setTimestamp(certKey, now, 3_600_000);
+        this.checkCertificateExpiry()
+          .catch((e) => console.error('[Poller] Certificate expiry check failed:', e));
+      }
+
+      // Stale WireGuard peers (#208) — every 5 minutes, after slow polls have
+      // refreshed the handshakes. Does nothing while the rule is off.
+      const wgKey = 'task:wireguard_stale';
+      const lastWg = await this.getTimestamp(wgKey);
+      if (now - lastWg > 300_000) {
+        await this.setTimestamp(wgKey, now, 300_000);
+        checkWireGuardStale().catch((e) => console.error('[Poller] WireGuard stale check failed:', e));
+      }
+
+      // BGP sessions and OSPF neighbours down (#279) — every minute, from what
+      // the slow polls stored. Does nothing while the rule is off.
+      const rpKey = 'task:routing_peer_down';
+      const lastRp = await this.getTimestamp(rpKey);
+      if (now - lastRp > 60_000) {
+        await this.setTimestamp(rpKey, now, 60_000);
+        checkRoutingPeers().catch((e) => console.error('[Poller] Routing peer check failed:', e));
+      }
+
+      // Interface errors and flapping (#249) — every minute, from what the
+      // fast polls recorded. Does nothing while both rules are off. The week-old
+      // rows are cleared once an hour.
+      const ifErrKey = 'task:interface_errors';
+      const lastIfErr = await this.getTimestamp(ifErrKey);
+      if (now - lastIfErr > 60_000) {
+        await this.setTimestamp(ifErrKey, now, 60_000);
+        checkInterfaceErrors().catch((e) => console.error('[Poller] Interface error check failed:', e));
+      }
+      const ifErrPurgeKey = 'task:interface_errors_purge';
+      const lastIfErrPurge = await this.getTimestamp(ifErrPurgeKey);
+      if (now - lastIfErrPurge > 3_600_000) {
+        await this.setTimestamp(ifErrPurgeKey, now, 3_600_000);
+        purgeInterfaceErrorEvents().catch((e) => console.error('[Poller] Interface error purge failed:', e));
+        purgeOpticReadings().catch((e) => console.error('[Poller] Optic reading purge failed:', e));
+      }
+
+      // Optic light levels — every 5 minutes, after slow polls have read them.
+      // Does nothing while the rule is off.
+      const opticKey = 'task:optic_degraded';
+      const lastOptic = await this.getTimestamp(opticKey);
+      if (now - lastOptic > 300_000) {
+        await this.setTimestamp(opticKey, now, 300_000);
+        checkOptics().catch((e) => console.error('[Poller] Optic check failed:', e));
       }
 
       // Stale pending sweep — every 5 minutes. Cheap when there is nothing to do,
@@ -356,7 +635,7 @@ export class PollerService {
       const staleKey = 'task:stale_pending';
       const lastStale = await this.getTimestamp(staleKey);
       if (now - lastStale > 300_000) {
-        await this.setTimestamp(staleKey, now);
+        await this.setTimestamp(staleKey, now, 300_000);
         this.dropStalePending().catch((e) =>
           console.error('[Poller] Stale-pending sweep error:', e));
       }
@@ -364,11 +643,28 @@ export class PollerService {
       // Firmware update check — runs once per day
       const firmwareKey = 'task:firmware_check';
       const lastFirmware = await this.getTimestamp(firmwareKey);
-      if (now - lastFirmware > 86_400_000) {
-        await this.setTimestamp(firmwareKey, now);
-        this.checkAllDevicesFirmware(devices).catch((e) =>
+      // Dark Site Mode: each device contacts MikroTik itself for this, so on an
+      // isolated network it can only fail, once a day, on every device.
+      if (appSettings['device_update_check_enabled'] !== false && now - lastFirmware > 86_400_000) {
+        await this.setTimestamp(firmwareKey, now, 86_400_000);
+        // Over the API; an SSH-only device (#174) has none yet.
+        this.checkAllDevicesFirmware(devices.filter((d) => !d.ssh_only)).catch((e) =>
           console.error('[Poller] Firmware check error:', e)
         );
+      }
+
+      // RouterOS vulnerability list (#175) — once a day, unless Dark Site Mode
+      // turned it off. One request to NVD and one to CISA for the whole fleet.
+      const cveKey = 'task:cve_feed';
+      const lastCve = await this.getTimestamp(cveKey);
+      if (appSettings['cve_feed_enabled'] !== false && now - lastCve > 86_400_000) {
+        await this.setTimestamp(cveKey, now, 86_400_000);
+        refreshCveFeed().catch((e) =>
+          console.warn('[Poller] RouterOS vulnerability list not refreshed:', (e as Error).message))
+          // Then any new serious CVE affecting the fleet (#224), against the
+          // stored list even when the refresh failed (offline, say).
+          .finally(() => checkCveAlerts().catch((e) =>
+            console.warn('[Poller] CVE alert check failed:', (e as Error).message)));
       }
 
       // NetFlow data retention — runs once per day. Purges old client_traffic
@@ -376,7 +672,7 @@ export class PollerService {
       const netflowPruneKey = 'task:netflow_retention';
       const lastNetflowPrune = await this.getTimestamp(netflowPruneKey);
       if (now - lastNetflowPrune > 86_400_000) {
-        await this.setTimestamp(netflowPruneKey, now, 86_400 + 3_600);
+        await this.setTimestamp(netflowPruneKey, now, 86_400_000);
         this.purgeNetflowData().catch((e) =>
           console.error('[Poller] NetFlow retention error:', e)
         );
@@ -387,19 +683,54 @@ export class PollerService {
       const pruneKey = 'task:prune_clients';
       const lastPrune = await this.getTimestamp(pruneKey);
       if (now - lastPrune > 3_600_000) {
-        await this.setTimestamp(pruneKey, now);
+        await this.setTimestamp(pruneKey, now, 3_600_000);
         this.pruneStaleClients(appSettings).catch((e) =>
           console.error('[Poller] Client prune error:', e)
         );
       }
 
+      // Event pruning — runs once per hour.
+      //
+      // retention_events_days has existed as a setting since the table did, was
+      // seeded by the migration, and was read by nothing. Meanwhile events grew
+      // to 95% of the database on a five-device fleet. A retention control that
+      // does not retain is worse than none, because it is believed.
+      const eventPruneKey = 'task:prune_events';
+      const lastEventPrune = await this.getTimestamp(eventPruneKey);
+      if (now - lastEventPrune > 3_600_000) {
+        await this.setTimestamp(eventPruneKey, now, 3_600_000);
+        this.pruneOldEvents(appSettings).catch((e) =>
+          console.error('[Poller] Event prune error:', e)
+        );
+        this.pruneProxyConnections(appSettings).catch((e) =>
+          console.error('[Poller] Proxy prune error:', e)
+        );
+        // Once a day, recompute the last 48 hours of the proxy usage rollup from the raw
+        // rows, so a crash or a rolling deploy cannot leave it drifting.
+        const reconcileKey = 'task:proxy_usage_reconcile';
+        if (now - await this.getTimestamp(reconcileKey) > 86_400_000) {
+          await this.setTimestamp(reconcileKey, now, 86_400_000);
+          reconcileProxyUsage().catch((e) =>
+            console.error('[Poller] Proxy usage reconcile error:', e)
+          );
+        }
+        this.pruneHistoryTables(appSettings).catch((e) =>
+          console.error('[Poller] History prune error:', e)
+        );
+      }
+
+      // Platform backups of MikroTik Manager itself — checked every minute; the
+      // schedule's own last-run time stops a double run.
+      platformBackupTick(appTimezone).catch((e) => console.error('[Poller] Platform backup schedule error:', e));
+      deviceCertRenewalTick().catch((e) => console.error('[Poller] Device certificate renewal error:', e));
+
       // Scheduled backups — fire when the cron expression matches the current minute/hour.
       // Redis key with 1-hour TTL prevents double-firing within the same cron window.
-      if (backupScheduleEnabled && this.cronMatchesNow(backupScheduleCron)) {
+      if (backupScheduleEnabled && cronMatches(backupScheduleCron, new Date(), appTimezone)) {
         const backupKey = 'task:scheduled_backup';
         const lastBackup = await this.getTimestamp(backupKey);
         if (now - lastBackup > 3_600_000) {
-          await this.setTimestamp(backupKey, now);
+          await this.setTimestamp(backupKey, now, 3_600_000);
           this.runScheduledBackups().catch((e) =>
             console.error('[Poller] Scheduled backup error:', e)
           );
@@ -412,14 +743,11 @@ export class PollerService {
 
   private async getAppSettings(): Promise<Record<string, unknown>> {
     try {
+      // Every setting, not a list of keys. A list drifted: Config Health's
+      // on/off switch and interval were read here but never selected, so
+      // turning it off did nothing and it always ran hourly.
       const rows = await query<{ key: string; value: unknown }>(
-        `SELECT key, value FROM app_settings
-         WHERE key IN ('mac_scan_enabled', 'mac_scan_interval', 'reverse_dns_enabled',
-                       'retention_clients_days', 'spectral_scan_enabled',
-                       'spectral_scan_interval_hours', 'ap_scan_enabled',
-                       'ap_scan_interval_hours', 'backup_schedule_enabled',
-                       'backup_schedule_cron', 'config_snapshot_enabled',
-                       'config_snapshot_interval_min')`
+        `SELECT key, value FROM app_settings`
       );
       const map: Record<string, unknown> = {};
       for (const row of rows) map[row.key] = row.value;
@@ -429,49 +757,6 @@ export class PollerService {
     }
   }
 
-  // Returns true if the 5-part cron expression matches the current time.
-  // Evaluates all five fields — minute, hour, day-of-month, month, day-of-week —
-  // so weekly (e.g. `0 3 * * 0`) and monthly (`0 3 1 * *`) schedules fire only on
-  // the right day, not every day. Supports: *, exact numbers, comma lists,
-  // ranges (a-b), and step values (*/n). Day-of-month and day-of-week follow the
-  // standard cron rule: when both are restricted the job runs if either matches;
-  // when only one is restricted, only that one must match.
-  private cronMatchesNow(cron: string): boolean {
-    const parts = cron.trim().split(/\s+/);
-    if (parts.length < 5) return false;
-    const [minuteField, hourField, domField, monthField, dowField] = parts;
-    const now = new Date();
-    const matchField = (field: string, val: number): boolean => {
-      if (field === '*') return true;
-      return field.split(',').some((f) => {
-        if (f.includes('/')) {
-          const [base, step] = f.split('/');
-          const start = base === '*' ? 0 : Number(base);
-          return val >= start && (val - start) % Number(step) === 0;
-        }
-        if (f.includes('-')) {
-          const [lo, hi] = f.split('-').map(Number);
-          return val >= lo && val <= hi;
-        }
-        return Number(f) === val;
-      });
-    };
-
-    if (!matchField(minuteField, now.getMinutes())) return false;
-    if (!matchField(hourField, now.getHours())) return false;
-    if (!matchField(monthField, now.getMonth() + 1)) return false; // cron months are 1-12
-
-    // Day-of-month (1-31) and day-of-week (0-6, Sun=0). getDay() returns 0 for Sunday.
-    const domRestricted = domField !== '*';
-    const dowRestricted = dowField !== '*';
-    const domMatch = matchField(domField, now.getDate());
-    const dowMatch = matchField(dowField, now.getDay());
-    let dayMatch: boolean;
-    if (!domRestricted && !dowRestricted) dayMatch = true;
-    else if (domRestricted && dowRestricted) dayMatch = domMatch || dowMatch;
-    else dayMatch = domRestricted ? domMatch : dowMatch;
-    return dayMatch;
-  }
 
   private async runScheduledBackups(): Promise<void> {
     const { BackupService } = await import('./BackupService');
@@ -507,17 +792,20 @@ export class PollerService {
     const results = await Promise.allSettled(
       clients.map(async (c) => {
         const names = await reverse(c.ip_address);
-        return { mac: c.mac_address, hostname: names[0] };
+        return { mac: c.mac_address, ip: c.ip_address, hostname: names[0] };
       })
     );
 
     let updated = 0;
     for (const r of results) {
       if (r.status === 'fulfilled') {
+        // Only the records holding the address that was looked up. The name
+        // comes from the manager's own resolver; written to every record of the
+        // MAC it landed on other sites' clients too (outside review P2-19).
         await query(
           `UPDATE clients SET hostname = $1
-           WHERE mac_address = $2 AND (hostname IS NULL OR hostname = '')`,
-          [r.value.hostname, r.value.mac]
+           WHERE mac_address = $2 AND ip_address = $3 AND (hostname IS NULL OR hostname = '')`,
+          [r.value.hostname, r.value.mac, r.value.ip]
         );
         updated++;
       }
@@ -525,7 +813,7 @@ export class PollerService {
 
     if (updated > 0) {
       console.log(`[Poller] Reverse DNS enriched ${updated} client hostname(s)`);
-      this.io?.emit('clients:updated', {});
+      this.broadcast('clients:updated', {});
     }
   }
 
@@ -571,6 +859,119 @@ export class PollerService {
     }
   }
 
+  /**
+   * Delete ordinary events and firewall packet logs using separate retention.
+   *
+   * Both are deleted in bounded batches so a busy or long-unpruned install
+   * does not hold locks or generate excessive WAL in one statement.
+   */
+  private async pruneOldEvents(settings: Record<string, unknown>): Promise<void> {
+    const eventDays = Number(settings['retention_events_days']);
+    const firewallDays = Number(
+      settings['retention_firewall_events_days'] ?? 7
+    );
+
+    const BATCH = 20_000;
+    const MAX_BATCHES = 50; // ~1M rows per class/run; hourly runs continue
+
+    const prune = async (
+      label: string,
+      days: number,
+      predicate: string
+    ): Promise<void> => {
+      if (!Number.isFinite(days) || days <= 0) return;
+
+      let total = 0;
+
+      for (let i = 0; i < MAX_BATCHES; i++) {
+        const deleted = await query<{ id: number }>(
+          `DELETE FROM events
+            WHERE id IN (
+              SELECT id FROM events
+               WHERE ${predicate}
+                 AND event_time < NOW() - ($1 || ' days')::interval
+               LIMIT $2
+            )
+           RETURNING id`,
+          [String(days), BATCH]
+        );
+
+        total += deleted.length;
+        if (deleted.length < BATCH) break;
+      }
+
+      if (total > 0) {
+        console.log(
+          `[Poller] Pruned ${total} ${label} older than ${days} days`
+        );
+      }
+    };
+
+    await prune(
+      'non-firewall events',
+      eventDays,
+      `NOT ${firewallPacketLogSql()}`
+    );
+
+    await prune(
+      'firewall events',
+      firewallDays,
+      firewallPacketLogSql()
+    );
+  }
+
+  /**
+   * Retention for history tables that used to grow without limit (outside
+   * review J11): scan results, LTE cell history, alert history, the audit log
+   * and ended outages. Batched like the event prune. An outage still in
+   * progress is never deleted.
+   */
+  private async pruneHistoryTables(settings: Record<string, unknown>): Promise<void> {
+    const tables: Array<{ table: string; where: string; setting: string; fallback: number }> = [
+      { table: 'spectral_scan_data', where: 'scanned_at < $1', setting: 'retention_scan_days', fallback: 30 },
+      { table: 'ap_scan_data', where: 'scanned_at < $1', setting: 'retention_scan_days', fallback: 30 },
+      { table: 'lte_cell_history', where: 'at < $1', setting: 'retention_lte_history_days', fallback: 90 },
+      { table: 'alert_history', where: 'sent_at < $1', setting: 'retention_alert_history_days', fallback: 180 },
+      { table: 'audit_log', where: 'created_at < $1', setting: 'retention_audit_days', fallback: 365 },
+      { table: 'device_availability', where: 'came_back_online_at IS NOT NULL AND came_back_online_at < $1', setting: 'retention_availability_days', fallback: 400 },
+    ];
+    const BATCH = 20_000;
+    const settingMap = new Map(Object.entries(settings));
+    for (const t of tables) {
+      const days = Number(settingMap.get(t.setting) ?? t.fallback);
+      if (!Number.isFinite(days) || days <= 0) continue;
+      const cutoff = new Date(Date.now() - days * 86_400_000);
+      let total = 0;
+      for (let i = 0; i < 50; i++) {
+        // Table names and conditions come from the fixed list above.
+        const deleted = await query<{ n: number }>(
+          `WITH gone AS (
+             DELETE FROM ${t.table} WHERE ctid IN (SELECT ctid FROM ${t.table} WHERE ${t.where} LIMIT ${BATCH})
+             RETURNING 1
+           ) SELECT COUNT(*)::int AS n FROM gone`, [cutoff]);
+        const n = deleted[0]?.n ?? 0;
+        total += n;
+        if (n < BATCH) break;
+      }
+      if (total > 0) console.log(`[Poller] Pruned ${total} ${t.table} row(s) older than ${days} days`);
+    }
+  }
+
+  /** Delete parsed proxy connections older than retention_proxy_days (default 30). */
+  private async pruneProxyConnections(settings: Record<string, unknown>): Promise<void> {
+    const days = Number(settings['retention_proxy_days'] ?? 30);
+    if (!Number.isFinite(days) || days <= 0) return;
+    const deleted = await query<{ id: number }>(
+      `DELETE FROM proxy_connections WHERE event_time < NOW() - ($1 || ' days')::interval RETURNING id`,
+      [String(days)]
+    );
+    if (deleted.length > 0) {
+      console.log(`[Poller] Pruned ${deleted.length} proxy connections older than ${days} days`);
+    }
+    await query(`DELETE FROM proxy_sources WHERE last_seen < NOW() - ($1 || ' days')::interval`, [String(days)]);
+    await query(`DELETE FROM proxy_usage_hourly WHERE bucket < NOW() - ($1 || ' days')::interval`, [String(days)]);
+  }
+
   private async pruneStaleClients(settings: Record<string, unknown>): Promise<void> {
     // Delete inactive clients not seen for longer than the configured retention period.
     // Default: 7 days. Preserves any client that was active within the window so
@@ -589,7 +990,7 @@ export class PollerService {
     const count = parseInt(result[0]?.count || '0', 10);
     if (count > 0) {
       console.log(`[Poller] Pruned ${count} stale client record(s) (inactive > ${retentionDays} days)`);
-      this.io?.emit('clients:updated', {});
+      this.broadcast('clients:updated', {});
     }
   }
 
@@ -683,6 +1084,8 @@ export class PollerService {
   private async recordPollOutcome(
     deviceId: number, kind: string, durationMs: number, error: string | null,
   ): Promise<void> {
+    const ph = this.phases.get(`${deviceId}:${kind}`);
+    this.phases.delete(`${deviceId}:${kind}`);
     try {
       await query(
         `INSERT INTO device_poll_stats (device_id, kind, last_attempt_at, last_success_at,
@@ -699,6 +1102,12 @@ export class PollerService {
            failures         = device_poll_stats.failures + CASE WHEN $4::text IS NULL THEN 0 ELSE 1 END`,
         [deviceId, kind, durationMs, error]
       );
+      // Where the time went (#301): opening or reusing the session, and the work.
+      if (ph && !error) {
+        await query(
+          `UPDATE device_poll_stats SET last_connect_ms = $3, last_collect_ms = $4, last_session_reused = $5, last_device_ms = $6
+            WHERE device_id = $1 AND kind = $2`, [deviceId, kind, ph.connectMs, ph.collectMs, ph.reused, ph.deviceMs]);
+      }
     } catch { /* never let bookkeeping break a poll */ }
   }
 
@@ -745,10 +1154,25 @@ export class PollerService {
       console.error('[Poller] Health: timing query failed:', (e as Error).message);
     }
 
-    // Can the workers keep up? Arrival is one fast poll per device per cycle.
+    // Can the workers keep up? Arrival is each device's fast poll at its own
+    // interval (#261): the global one, or its site's or its own override.
     const avgSec = (timing?.avg_ms || 0) / 1000;
-    const arrivalPerSec = deviceCount / (POLL_INTERVAL_MS / 1000);
-    const servicePerSec = avgSec > 0 ? POLL_CONCURRENCY / avgSec : null;
+    const appSettings = await this.getAppSettings();
+    const globalFastSec = effectiveValues(appSettings, null, null).fastSec;
+    let arrivalPerSec = deviceCount / globalFastSec;
+    try {
+      const rows = await query<{ dev: unknown; site: unknown }>(
+        `SELECT d.poll_overrides AS dev, s.poll_overrides AS site
+           FROM devices d LEFT JOIN sites s ON s.id = d.site_id WHERE d.status != 'disabled'`);
+      if (rows.length) {
+        arrivalPerSec = rows.reduce((sum, r) =>
+          sum + 1 / effectiveValues(appSettings, cleanOverrides(r.site), cleanOverrides(r.dev)).fastSec, 0);
+      }
+    } catch { /* fall back to the global interval for every device */ }
+    // Workers in every process (#301), or this one's before any heartbeat.
+    const procs = await this.pollerProcesses();
+    const totalConcurrency = procs.length ? procs.reduce((n, p) => n + p.concurrency, 0) : POLL_CONCURRENCY;
+    const servicePerSec = avgSec > 0 ? totalConcurrency / avgSec : null;
 
     const headroom = servicePerSec == null || arrivalPerSec === 0
       ? null
@@ -771,13 +1195,46 @@ export class PollerService {
       : backlog > deviceCount * 3      ? 'draining'
       : 'ok';
 
+    // Where poll time goes (#301): session setup (new vs reused) and the work.
+    let phases: Record<string, unknown> | null = null;
+    try {
+      const [p] = await query<{ new_connect: number | null; reused_connect: number | null; collect: number | null; device: number | null; reused_pct: number | null; n: number }>(
+        `SELECT AVG(last_connect_ms) FILTER (WHERE NOT last_session_reused)::int AS new_connect,
+                AVG(last_connect_ms) FILTER (WHERE last_session_reused)::int AS reused_connect,
+                AVG(last_collect_ms)::int AS collect,
+                AVG(last_device_ms)::int AS device,
+                (100.0 * COUNT(*) FILTER (WHERE last_session_reused) / NULLIF(COUNT(*), 0))::int AS reused_pct,
+                COUNT(*)::int AS n
+           FROM device_poll_stats WHERE kind = 'fast' AND last_connect_ms IS NOT NULL`);
+      phases = {
+        persistent_sessions: persistentSessions(appSettings),
+        pipelined_reads: appSettings['poller_pipelined_reads'] !== false,
+        open_sessions: procs.length ? procs.reduce((n, p) => n + p.sessions, 0) : pooledSessionCount(),
+        avg_connect_new_ms: p?.new_connect ?? null,
+        avg_connect_reused_ms: p?.reused_connect ?? null,
+        avg_collect_ms: p?.collect ?? null,
+        // Of the collecting, waiting on the device; the rest is the database and processing.
+        avg_device_ms: p?.device ?? null,
+        reused_pct: p?.reused_pct ?? null,
+        devices_measured: p?.n ?? 0,
+        slowest: await this.slowestPolls(),
+      };
+    } catch (e) {
+      console.error('[Poller] Health: phase query failed:', (e as Error).message);
+    }
+
     return {
       status,
       queues,
+      phases,
       workers: {
-        concurrency: POLL_CONCURRENCY,
+        // Every process's workers (#301); `processes` lists them when there are worker containers.
+        concurrency: totalConcurrency,
+        processes: procs.map((p) => ({ role: p.role, concurrency: p.concurrency, sessions: p.sessions })),
         job_timeout_ms: JOB_TIMEOUT_MS,
         poll_interval_ms: POLL_INTERVAL_MS,
+        /** The global fast-poll interval; sites and devices may override it (#261). */
+        fast_interval_sec: globalFastSec,
       },
       capacity: {
         devices: deviceCount,
@@ -799,10 +1256,16 @@ export class PollerService {
     };
   }
 
-  private async setTimestamp(key: string, ts: number, ttlSec = 600): Promise<void> {
+  /**
+   * Record when a gated task last ran. The key must outlive the task's own
+   * interval: a missing key reads as "never ran". It used to expire after a
+   * fixed 10 minutes, so every "daily" or "hourly" task (the firmware check,
+   * certificate check, spectral and AP scans) ran about every 10 minutes.
+   */
+  private async setTimestamp(key: string, ts: number, intervalMs: number): Promise<void> {
     try {
       const { redis } = await import('../config/redis');
-      await redis.set(key, String(ts), 'EX', ttlSec);
+      await redis.set(key, String(ts), 'EX', gateTtlSeconds(intervalMs));
     } catch { /* redis unavailable — timestamp not cached */ }
   }
 
@@ -821,11 +1284,22 @@ export class PollerService {
     const run = (kind: string, fn: (data: PollJob) => Promise<void>) =>
       async (job: Job<PollJob>) => {
         const started = Date.now();
+        // Full syncs and MAC scans ride the fast queue; each keeps its own stats
+        // row so a slow full sync doesn't overwrite the fast poll's (J1). The
+        // same for the jobs sharing the slow queue (config snapshots and health,
+        // AP and spectral scans), which were counted as slow polls and replaced
+        // the slow poll's duration and last success with their own (#301).
+        const type = (job.data as { type?: string }).type;
+        const statKind = type && OWN_STATS_ROW.has(type) ? type : kind;
         try {
-          await withTimeout(fn(job.data), JOB_TIMEOUT_MS, `${kind} poll`);
-          await this.recordPollOutcome(job.data.deviceId, kind, Date.now() - started, null);
+          const { promise, abortJob } = runPollJob(() => fn(job.data));
+          // A cancelled job's own rejection arrives after the timeout's; it has
+          // nowhere to go, so it is handled here rather than left unhandled.
+          promise.catch(() => {});
+          await withTimeout(promise, JOB_TIMEOUT_MS, `${kind} poll`, abortJob);
+          await this.recordPollOutcome(job.data.deviceId, statKind, Date.now() - started, null);
         } catch (err) {
-          await this.recordPollOutcome(job.data.deviceId, kind, Date.now() - started, (err as Error).message);
+          await this.recordPollOutcome(job.data.deviceId, statKind, Date.now() - started, (err as Error).message);
           throw err;
         }
       };
@@ -844,9 +1318,13 @@ export class PollerService {
       { ...workerOptions, connection: createRedisConnection() }
     );
 
+    // The one place a failed fast poll is handled (the job itself only throws).
+    // Caught: this is an event listener, and a rejection here (the database
+    // restarting, say) used to be unhandled, which ends a Node process.
     this.fastWorker.on('failed', (job, err) => {
       if (job) {
-        this.handleDeviceFailure(job.data.deviceId, err.message);
+        this.handleDeviceFailure(job.data.deviceId, err.message).catch((e) =>
+          console.error(`[Poller] Could not record device ${job.data.deviceId} as failed:`, (e as Error).message));
       }
     });
   }
@@ -854,48 +1332,117 @@ export class PollerService {
   private async processPollJob(data: PollJob): Promise<void> {
     const device = await this.getDevice(data.deviceId);
     if (!device) return;
+    // Whatever was asked for (a full sync after adding, say), a device without
+    // its API yet gets the SSH check (#174).
+    if (device.ssh_only) {
+      await this.processSshOnlyJob(device);
+      return;
+    }
+    const appSettings = await this.getAppSettings();
+    const pollModules = resolveModules(appSettings);
 
     const prevStatus = device.status; // capture before poll
     const collector = new DeviceCollector(device);
+    collector.modules = pollModules;
+    // A fast poll's reads sent together (#301), unless switched off.
+    collector.pipelineReads = appSettings['poller_pipelined_reads'] !== false;
+    // Sessions kept open between polls (#301): fast polls on the fast lane, a
+    // full sync on the slow one; a MAC scan keeps its own connection.
+    const pooling = persistentSessions(appSettings) && data.type !== 'macscan';
+    let ok = false;
     try {
-      await collector.connect();
+      await collector.connectPooled(data.type === 'full' ? 'slow' : 'fast', pooling);
+      const collectStarted = Date.now();
 
       if (data.type === 'full') {
         await collector.collectAll();
+        await this.checkHealth(collector, device);
       } else if (data.type === 'macscan') {
         await collector.runMacScan();
-        this.io?.emit('clients:updated', { deviceId: device.id });
+        ok = true;
+        void this.emitForDevice('clients:updated', { deviceId: device.id }, device.id);
         return;
       } else {
         await collector.collectFast();
       }
+      ok = true;
+      this.notePhases(device.id, data.type === 'full' ? 'full' : 'fast', collector.timings, Date.now() - collectStarted, collector.deviceTime());
 
-      // Device came online (first poll after add, or recovery from offline)
-      if (prevStatus !== 'online') {
+      this.recordPollSuccess(device, prevStatus);
+
+      void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
+      void this.emitForDevice('clients:updated', { deviceId: device.id }, device.id);
+    } finally {
+      // A failure is recorded by the worker's 'failed' listener, which also
+      // sees timeouts. Recording it here as well counted every failure twice.
+      // A pooled session is kept only when the poll succeeded.
+      collector.release(ok);
+    }
+  }
+
+  /** Phase timings of the poll that just ran, picked up by recordPollOutcome (#301). */
+  private phases = new Map<string, { connectMs: number; collectMs: number; deviceMs: number; reused: boolean }>();
+  private notePhases(deviceId: number, kind: string, t: { connectMs: number; reused: boolean }, collectMs: number, deviceMs: number): void {
+    this.phases.set(`${deviceId}:${kind}`, { connectMs: t.connectMs, collectMs, deviceMs: Math.min(deviceMs, collectMs), reused: t.reused });
+  }
+
+  /** A poll reached the device: close any open outage, and announce a recovery. */
+  private recordPollSuccess(device: DeviceRow, prevStatus: string): void {
+    // Any open outage ends with a successful poll, whatever the status said
+    // before it. Keyed on the pre-poll status, an outage opened while this
+    // poll was running (a timeout) was never closed, and the device's uptime
+    // kept falling while it was up.
+    query(
+      `UPDATE device_availability
+       SET came_back_online_at = NOW(),
+           duration_seconds = EXTRACT(EPOCH FROM (NOW() - went_offline_at))::INTEGER
+       WHERE device_id = $1 AND came_back_online_at IS NULL`,
+      [device.id]
+    ).catch(() => {});
+
+    // Device came online (first poll after add, or recovery from offline)
+    if (prevStatus !== 'online') {
+      // Intermittent devices (#168) only announce recovery if their
+      // long-offline alert went out; otherwise they came and went quietly.
+      const d = device as DeviceRow & { intermittent?: boolean; intermittent_alerted_at?: string | null };
+      if (recoveryAlert(!!d.intermittent, !!d.intermittent_alerted_at)) {
         alertService.dispatch('device_online', `${device.name} is back online`, {
           deviceId: device.id,
           deviceName: device.name,
         }).catch(() => {});
-        // Close the open outage row if one exists
-        if (prevStatus === 'offline') {
-          query(
-            `UPDATE device_availability
-             SET came_back_online_at = NOW(),
-                 duration_seconds = EXTRACT(EPOCH FROM (NOW() - went_offline_at))::INTEGER
-             WHERE device_id = $1 AND came_back_online_at IS NULL`,
-            [device.id]
-          ).catch(() => {});
-        }
       }
-
-      this.io?.emit('device:updated', { deviceId: device.id });
-      this.io?.emit('clients:updated', { deviceId: device.id });
-    } catch (err) {
-      await this.handleDeviceFailure(device.id, (err as Error).message);
-      throw err;
-    } finally {
-      collector.disconnect();
+      if (d.intermittent_alerted_at) {
+        query(`UPDATE devices SET intermittent_alerted_at = NULL WHERE id = $1`, [device.id]).catch(() => {});
+      }
     }
+  }
+
+  /**
+   * A device added over SSH only (#174). Tries the API when it is due (every
+   * minute, every 15 after a refused login) and, when it answers, makes the
+   * device an ordinary one and starts a full sync. Otherwise reads the basics
+   * over SSH; a failure there throws, and is recorded as offline as usual.
+   */
+  private async processSshOnlyJob(device: DeviceRow): Promise<void> {
+    const dev = device as unknown as SshOnlyDevice;
+    const prevStatus = device.status;
+    const now = Date.now();
+    const gate = `poll:apicheck:${device.id}`;
+    if (now >= (await this.getTimestamp(gate))) {
+      const check = await checkApi(dev);
+      if (check.ok) {
+        await promoteToApi(dev, check);
+        await this.scheduleDeviceSync(device.id, 'full');
+        void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
+        return;
+      }
+      await recordApiCheck(device.id, check.message);
+      const wait = apiCheckIntervalMs(check.kind);
+      await this.setTimestamp(gate, now + wait, wait);
+    }
+    await refreshOverSsh(dev);
+    this.recordPollSuccess(device, prevStatus);
+    void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
   }
 
   private static aggregateSpectralRows(
@@ -923,53 +1470,6 @@ export class PollerService {
         magn: Math.round(sum / count),
         peak,
       }));
-  }
-
-  private static aggregateAPScanRows(
-    allRows: { iface: string; rows: Record<string, string>[] }[],
-    lookupVendor: (mac: string) => string
-  ): unknown[] {
-    interface BandEntry { bssid: string; vendor: string; signal: number; freq: number; band: string; channel_width: string }
-    interface NetworkEntry { ssid: string; security: string; hidden: boolean; entries: BandEntry[] }
-    const byKey = new Map<string, NetworkEntry>();
-
-    function normBand(band: string, freq: number): string {
-      if (band.includes('6ghz') || freq >= 5925) return '6 GHz';
-      if (band.includes('5ghz') || (freq >= 4900 && freq < 5925)) return '5 GHz';
-      return '2.4 GHz';
-    }
-
-    for (const { rows } of allRows) {
-      for (const row of rows) {
-        const ssid   = row['network-name'] || row['ssid'] || '';
-        const bssid  = (row['address'] || row['bssid'] || '').toLowerCase();
-        if (!bssid) continue;
-        const rawSig = row['signal-strength'] || row['signal'] || '-100';
-        const signal = parseInt(rawSig, 10) || -100;
-        const freq   = parseFloat(row['frequency'] || row['channel'] || '0');
-        const band   = normBand(row['band'] || row['radio-band'] || '', freq);
-        const security = row['security'] || row['authentication-types'] ? (row['security'] || 'WPA') : 'open';
-        const channelWidth = row['channel-width'] || '';
-        const key = ssid || `hidden:${bssid}`;
-
-        if (!byKey.has(key)) {
-          byKey.set(key, { ssid, security, hidden: !ssid, entries: [] });
-        }
-        const net = byKey.get(key)!;
-        const existing = net.entries.find(e => e.bssid === bssid && e.freq === freq);
-        if (existing) {
-          if (signal > existing.signal) existing.signal = signal;
-        } else {
-          net.entries.push({ bssid, vendor: lookupVendor(bssid), signal, freq, band, channel_width: channelWidth });
-        }
-      }
-    }
-
-    return Array.from(byKey.values()).sort((a, b) => {
-      const aBest = Math.max(...a.entries.map(e => e.signal));
-      const bBest = Math.max(...b.entries.map(e => e.signal));
-      return bBest - aBest;
-    });
   }
 
   private async processSpectralJob(data: PollJob): Promise<void> {
@@ -1012,7 +1512,11 @@ export class PollerService {
       `SELECT name FROM wireless_interfaces WHERE device_id = $1 AND disabled = FALSE`,
       [device.id]
     );
-    if (ifaces.length === 0) return;
+    if (ifaces.length === 0) {
+      // Said once per run, so a scan that never happens shows in the log (#295).
+      console.log(`[ap-scan] ${logSafe(device.name)}: no enabled wireless interfaces on record, nothing to scan`);
+      return;
+    }
 
     const { lookupVendor } = await import('../utils/oui');
     const collector = new DeviceCollector(device);
@@ -1025,7 +1529,8 @@ export class PollerService {
       }
       if (allRows.length === 0) return;
 
-      const aggregated = PollerService.aggregateAPScanRows(allRows, lookupVendor);
+      const { aggregateAPScanRows } = await import('../utils/apScan');
+      const aggregated = aggregateAPScanRows(allRows, lookupVendor);
       await query(
         `INSERT INTO ap_scan_data (device_id, data, scan_type) VALUES ($1, $2, 'scheduled')`,
         [device.id, JSON.stringify(aggregated)]
@@ -1050,7 +1555,8 @@ export class PollerService {
 
     const collector = new DeviceCollector(device);
     try {
-      await collector.connect();
+      // The snapshot is an SSH export; only an ordinary device opens the API session too.
+      if (!device.ssh_only) await collector.connect();
       await collector.snapshotConfig('scheduled');
     } catch (err) {
       console.error(`[Poller] Config snapshot failed for ${device.name}:`, (err as Error).message);
@@ -1071,10 +1577,75 @@ export class PollerService {
       const { findings } = await runConfigHealth(device as unknown as GuardDevice);
       const critical = findings.filter((f) => f.severity === 'critical').length;
       if (critical > 0) {
-        this.io?.emit('device:updated', { deviceId: device.id });
+        void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
       }
     } catch (err) {
       console.error(`[Poller] Config health audit failed for ${device.name}:`, (err as Error).message);
+    }
+  }
+
+
+  /**
+   * Warn about certificates at or past their expiry (#143).
+   *
+   * The window comes from the alert rule's threshold, so the operator's setting
+   * decides it. Each certificate gets its own cooldown key: a device with an
+   * expiring CA and an expiring client certificate has two problems, and
+   * collapsing them into one alert hides the second.
+   */
+  private async checkCertificateExpiry(): Promise<void> {
+    const rule = await alertService.getRule('cert_expiry');
+    if (!rule?.enabled) return;
+
+    const warnDays = rule.threshold ?? 14;
+    const rows = await query<{
+      device_id: number; device_name: string; name: string;
+      common_name: string | null; is_authority: boolean;
+      invalid_after: string | null; invalid_before: string | null;
+      revoked: boolean;
+    }>(
+      `SELECT c.device_id, d.name AS device_name, c.name, c.common_name,
+              c.is_authority, c.invalid_after, c.invalid_before, c.revoked
+         FROM device_certificates c
+         JOIN devices d ON d.id = c.device_id
+        WHERE c.invalid_after IS NOT NULL`
+    );
+
+    const now = new Date();
+    let flagged = 0;
+    for (const r of rows) {
+      // Revoked certificates resolve to their own state, which needsAttention()
+      // excludes on purpose — see certExpiry.ts.
+      const verdict = certExpiryState(r.invalid_after, now, warnDays, r.invalid_before, {
+        revoked: r.revoked,
+      });
+      if (!needsAttention(verdict)) continue;
+      flagged++;
+
+      const what = describeCert(
+        { name: r.name, common_name: r.common_name, is_authority: r.is_authority },
+        verdict
+      );
+      await alertService.dispatch('cert_expiry', `${r.device_name}: ${what}`, {
+        deviceId: r.device_id,
+        deviceName: r.device_name,
+        // Per certificate, not per device — two expiring certificates are two
+        // things to fix.
+        cooldownKey: `cert_expiry:${r.device_id}:${r.name}`,
+        details: r.invalid_after
+          ? `Expires ${new Date(r.invalid_after).toISOString().slice(0, 10)}`
+          : undefined,
+      }).catch(() => {});
+
+      // Logged as well as dispatched. AlertService records history only when a
+      // channel actually delivers, so on an install with no channels configured
+      // there is otherwise no trace that anything was found — which is the same
+      // silence this feature exists to break.
+      console.log(`[Certs] ${r.device_name}: ${what}`);
+    }
+
+    if (flagged > 0) {
+      console.log(`[Certs] ${flagged} certificate(s) need attention (warning at ${warnDays} days)`);
     }
   }
 
@@ -1095,13 +1666,21 @@ export class PollerService {
     const device = await this.getDevice(data.deviceId);
     if (!device) return;
 
+    const modules = resolveModules(await this.getAppSettings());
     const collector = new DeviceCollector(device);
+    collector.modules = modules;
+    let ok = false;
     try {
-      await collector.connect();
+      await collector.connectPooled('slow', persistentSessions(await this.getAppSettings()));
+      const collectStarted = Date.now();
       await collector.collectSlow();
-      await collector.collectNeighbors();
-      await collector.collectStp();
-      this.io?.emit('device:updated', { deviceId: device.id });
+      await this.checkHealth(collector, device);
+      // Neighbour discovery is a round trip per device per cycle and the only
+      // thing that feeds topology, so a fleet not using the map can switch it
+      // off entirely.
+      if (modules.neighbors) await collector.collectNeighbors();
+      // (STP is read inside collectSlow.)
+      void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
 
       // Fire device_discovered for any LLDP neighbors not matched to a managed device.
       // AlertService's per-cooldownKey cooldown prevents repeat alerts for the same neighbor.
@@ -1118,35 +1697,51 @@ export class PollerService {
           `Unmanaged device discovered: ${nb.neighbor_identity || nb.neighbor_address} (${nb.neighbor_address})`,
           {
             details: nb.neighbor_identity || undefined,
-            cooldownKey: `device_discovered:${nb.neighbor_address}`,
+            // Per site: the same address at two customers is two devices (P2-19).
+            cooldownKey: `device_discovered:${(device as { site_id?: number | null }).site_id ?? 0}:${nb.neighbor_address}`,
           }
         ).catch(() => {});
       }
+      ok = true;
+      this.notePhases(device.id, 'slow', collector.timings, Date.now() - collectStarted, collector.deviceTime());
     } catch (err) {
+      // A slow poll that ran out of time was cancelled, which says nothing
+      // about whether the device is up; the fast poll decides that. Marking it
+      // offline here would raise a false outage on every large, slow device.
+      if (pollJobAborted()) return;
       await this.handleDeviceFailure(device.id, (err as Error).message);
+      // Rethrown so the job is recorded as failed, not as a successful poll
+      // (outside review J1).
+      throw err;
     } finally {
-      collector.disconnect();
+      collector.release(ok);
     }
   }
 
   private async processLogsJob(data: PollJob): Promise<void> {
     const device = await this.getDevice(data.deviceId);
     if (!device) return;
+    // Skipped before connecting: with logs off there is nothing to fetch, so
+    // the session itself is the waste.
+    const appSettings = await this.getAppSettings();
+    if (!resolveModules(appSettings).logs) return;
 
     const collector = new DeviceCollector(device);
+    let ok = false;
     try {
-      await collector.connect();
-      await collector.collectLogs();
-      this.io?.emit('events:updated', { deviceId: device.id });
+      // Its own pooled session (#301): no new connection every minute.
+      await collector.connectPooled('logs', persistentSessions(appSettings));
+      const collectStarted = Date.now();
+      const stored = await collector.collectLogs();
+      ok = true;
+      this.notePhases(device.id, 'logs', collector.timings, Date.now() - collectStarted, collector.deviceTime());
+      void this.emitForDevice('events:updated', { deviceId: device.id }, device.id);
 
-      // Fire log_error / log_warning alerts if new entries appeared in the last 90s
-      const recent = await query<{ severity: string; message: string }>(
-        `SELECT severity, message FROM events
-         WHERE device_id = $1
-           AND event_time > NOW() - INTERVAL '90 seconds'
-         ORDER BY event_time DESC LIMIT 1`,
-        [device.id]
-      );
+      // Alert on the lines this poll actually stored, not on whatever looks
+      // recent by timestamp: a line dated a day ahead re-alerted every cycle,
+      // and one dated behind never alerted (P2-18). The newest error and the
+      // newest warning each raise one alert; the alert cooldown does the rest.
+      const recent = logAlertCandidates(stored);
       for (const ev of recent) {
         if (ev.severity === 'error') {
           alertService.dispatch('log_error', ev.message, {
@@ -1162,20 +1757,69 @@ export class PollerService {
       }
     } catch (err) {
       console.error(`[PollerService] Log collection failed for device ${device.id} (${device.name}):`, (err as Error).message);
+      throw err; // recorded as a failed log poll (J1)
     } finally {
-      collector.disconnect();
+      collector.release(ok);
     }
   }
 
+  /** Hardware health (#168); the logic lives in services/healthCheck.ts. */
+  private async checkHealth(collector: DeviceCollector, device: DeviceRow): Promise<void> {
+    const changed = await runHealthCheck(collector, device);
+    if (changed) void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
+  }
+
   private async handleDeviceFailure(deviceId: number, message: string): Promise<void> {
+    try {
+      await this.recordDeviceFailure(deviceId, message);
+    } catch (err) {
+      console.error(`[Poller] Failed to record device ${deviceId} as offline:`, (err as Error).message);
+    }
+  }
+
+  private async recordDeviceFailure(deviceId: number, message: string): Promise<void> {
     const device = await this.getDevice(deviceId);
     const prevStatus = device?.status;
     await query(`UPDATE devices SET status = 'offline', updated_at = NOW() WHERE id = $1`, [deviceId]);
-    if (prevStatus !== 'offline') {
+
+    // Normal devices alert when they go offline. Intermittent ones (#168) alert
+    // only once they have been gone longer than their limit.
+    const d = device as (DeviceRow & {
+      intermittent?: boolean; intermittent_alert_after_min?: number; intermittent_alerted_at?: string | null;
+    }) | null;
+    let offlineSince: Date | null = null;
+    if (d?.intermittent && prevStatus === 'offline') {
+      const [open] = await query<{ went_offline_at: string }>(
+        `SELECT went_offline_at FROM device_availability
+          WHERE device_id = $1 AND came_back_online_at IS NULL
+          ORDER BY went_offline_at DESC LIMIT 1`, [deviceId]
+      ).catch(() => []);
+      offlineSince = open ? new Date(open.went_offline_at) : null;
+    }
+    const action = offlineAction({
+      intermittent: !!d?.intermittent,
+      alertAfterMin: d?.intermittent_alert_after_min,
+      wasOffline: prevStatus === 'offline',
+      offlineSince,
+      alreadyAlerted: !!d?.intermittent_alerted_at,
+      now: new Date(),
+    });
+    if (action === 'alert') {
       alertService.dispatch('device_offline', `${device?.name ?? `Device #${deviceId}`} is offline: ${message}`, {
         deviceId,
         deviceName: device?.name,
       }).catch(() => {});
+    } else if (action === 'alert-long-offline' && offlineSince) {
+      const mins = (Date.now() - offlineSince.getTime()) / 60000;
+      alertService.dispatch('device_offline',
+        `${device?.name ?? `Device #${deviceId}`} has been offline for ${describeDuration(mins)}. ` +
+        'It is marked as expected to drop out, but not for this long.', {
+          deviceId,
+          deviceName: device?.name,
+        }).catch(() => {});
+      await query(`UPDATE devices SET intermittent_alerted_at = NOW() WHERE id = $1`, [deviceId]).catch(() => {});
+    }
+    if (prevStatus !== 'offline') {
       // Open a new availability outage row
       query(
         `INSERT INTO device_availability (device_id, went_offline_at) VALUES ($1, NOW())`,
@@ -1212,8 +1856,8 @@ export class PollerService {
       );
       await writeApi.flush().catch(() => {});
     }
-    this.io?.emit('device:status', { deviceId, status: 'offline', message });
-    this.io?.emit('clients:updated', { deviceId });
+    void this.emitForDevice('device:status', { deviceId, status: 'offline', message }, deviceId);
+    void this.emitForDevice('clients:updated', { deviceId }, deviceId);
   }
 
   private async checkAllDevicesFirmware(devices: DeviceRow[]): Promise<void> {
@@ -1232,8 +1876,9 @@ export class PollerService {
         const statusText = (updateInfo['status'] ?? '').toLowerCase();
 
         const hasUpdate = Boolean(
-          statusText.includes('available') ||
-          (latestVersion && installedVersion && latestVersion !== installedVersion)
+          updateAvailable({
+            installed: installedVersion, latest: latestVersion, status: statusText,
+          })
         );
 
         // Read current flag before updating so we can detect first-discovery
@@ -1253,7 +1898,7 @@ export class PollerService {
         );
 
         if (hasUpdate) {
-          this.io?.emit('device:updated', { deviceId: device.id });
+          void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
           // Alert only on first discovery (not on every daily check)
           if (!wasAvailable) {
             const msg = latestVersion
@@ -1268,7 +1913,7 @@ export class PollerService {
           }
         } else if (wasAvailable) {
           // Update was installed — clear the flag and notify the UI
-          this.io?.emit('device:updated', { deviceId: device.id });
+          void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
         }
 
         // RouterBOOT check — reuse the existing connection
@@ -1283,7 +1928,7 @@ export class PollerService {
           [rbInfo.upgradeAvailable, rbInfo.upgradeFirmware || null, device.id]
         );
         if (rbInfo.upgradeAvailable) {
-          this.io?.emit('device:updated', { deviceId: device.id });
+          void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
           if (!rbWasAvailable) {
             const rbMsg = rbInfo.upgradeFirmware
               ? `${device.name} has a RouterBOOT upgrade available: ${rbInfo.upgradeFirmware}`
@@ -1296,7 +1941,7 @@ export class PollerService {
             console.log(`[Poller] RouterBOOT upgrade detected for ${device.name}: ${rbInfo.currentFirmware} → ${rbInfo.upgradeFirmware}`);
           }
         } else if (rbWasAvailable) {
-          this.io?.emit('device:updated', { deviceId: device.id });
+          void this.emitForDevice('device:updated', { deviceId: device.id }, device.id);
         }
       } catch (err) {
         console.error(`[Poller] Firmware check failed for ${device.name}:`, (err as Error).message);

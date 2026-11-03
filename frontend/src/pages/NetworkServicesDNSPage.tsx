@@ -1,18 +1,30 @@
 import { useState, useEffect } from 'react';
+import ReviewChangesButton from '../components/common/ReviewChangesButton';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Globe, RefreshCw, AlertTriangle, Save, Trash2, Plus, Pencil, X, Check, Eraser,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { networkServicesApi, devicesApi } from '../services/api';
+import { liveRefetch, type LiveRow } from '../utils/liveFreshness';
 import { useCanWrite } from '../hooks/useCanWrite';
+import { apiErrorMessage } from '../utils/apiError';
+import ListInput from '../components/common/ListInput';
+import { splitList } from '../utils/ipPrefix';
+import { isValidIPv4, isValidIPv6 } from '../utils/deviceAddress';
+import DevicePicker from '../components/common/DevicePicker';
+import { shortList } from '../utils/deviceCards';
 
 type NS = Record<string, string>;
 
 // ─── DNS record types ─────────────────────────────────────────────────────────
 
-const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'PTR', 'TXT', 'SRV'] as const;
+// RouterOS's static record types (it has no PTR). Each keeps its target in
+// its own property (outside review C7): MX in mx-exchange, NS in ns, SRV in
+// srv-target, FWD in forward-to.
+const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'TXT', 'SRV', 'FWD'] as const;
 type RecordType = typeof RECORD_TYPES[number];
+const TARGET_PROP: Partial<Record<RecordType, string>> = { MX: 'mx-exchange', NS: 'ns', SRV: 'srv-target', FWD: 'forward-to' };
 
 // ─── Static record form modal ─────────────────────────────────────────────────
 
@@ -25,39 +37,56 @@ interface RecordFormProps {
 function RecordForm({ deviceId, existing, onClose }: RecordFormProps) {
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.['name'] || '');
-  const [type, setType] = useState<RecordType>((existing?.['type'] as RecordType) || 'A');
-  const [address, setAddress] = useState(existing?.['address'] || '');
+  const initialType = (existing?.['type'] as RecordType) || 'A';
+  const [address, setAddress] = useState(existing?.[TARGET_PROP[initialType] ?? 'address'] || '');
+  const [mxPreference, setMxPreference] = useState(existing?.['mx-preference'] || '10');
+  const [srvPort, setSrvPort] = useState(existing?.['srv-port'] || '');
+  const [srvPriority, setSrvPriority] = useState(existing?.['srv-priority'] || '0');
+  const [srvWeight, setSrvWeight] = useState(existing?.['srv-weight'] || '0');
   const [cname, setCname] = useState(existing?.['cname'] || '');
+  const [type, setType] = useState<RecordType>(initialType);
   const [text, setText] = useState(existing?.['text'] || '');
   const [ttl, setTtl] = useState(existing?.['ttl'] || '');
   const [disabled, setDisabled] = useState(existing?.['disabled'] === 'true');
 
-  const save = useMutation({
-    mutationFn: () => {
+  const saveRequest = () => {
       const body: NS = { name, type };
       if (type === 'A' || type === 'AAAA') body['address'] = address;
       else if (type === 'CNAME') body['cname'] = cname;
       else if (type === 'TXT') body['text'] = text;
-      else body['address'] = address; // MX, NS, PTR, SRV share address field
+      else body[TARGET_PROP[type] ?? 'address'] = address;
+      if (type === 'MX') body['mx-preference'] = mxPreference || '10';
+      if (type === 'SRV') {
+        body['srv-port'] = srvPort;
+        body['srv-priority'] = srvPriority || '0';
+        body['srv-weight'] = srvWeight || '0';
+      }
       if (ttl) body['ttl'] = ttl;
+      else if (existing) body['ttl'] = '';   // back to the default TTL on the device
       body['disabled'] = disabled ? 'yes' : 'no';
 
       return existing?.['.id']
         ? networkServicesApi.updateDnsStatic(deviceId, existing['.id'], body)
         : networkServicesApi.addDnsStatic(deviceId, body);
-    },
+    };
+  const save = useMutation({
+    meta: { inlineError: true },
+    mutationFn: saveRequest,
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['ns-dns', deviceId] }); onClose(); },
   });
 
-  const valueLabel = type === 'CNAME' ? 'CNAME Target' : type === 'TXT' ? 'Text' : 'Address / Target';
+  const valueLabel = type === 'CNAME' ? 'CNAME Target' : type === 'TXT' ? 'Text'
+    : type === 'MX' ? 'Mail server' : type === 'NS' ? 'Name server' : type === 'SRV' ? 'Target host'
+    : type === 'FWD' ? 'Forward to (DNS server)' : 'Address';
   const valuePlaceholder =
     type === 'A' ? '192.168.1.10' :
     type === 'AAAA' ? '2001:db8::1' :
     type === 'CNAME' ? 'alias.example.com' :
     type === 'TXT' ? '"v=spf1 include:example.com ~all"' :
-    type === 'MX' || type === 'NS' ? 'mail.example.com' :
-    type === 'PTR' ? 'hostname.example.com' :
-    '_sip._tcp.example.com';
+    type === 'MX' ? 'mail.example.com' :
+    type === 'NS' ? 'ns1.example.com' :
+    type === 'FWD' ? '10.0.0.53' :
+    'sip.example.com';
 
   const valueField = type === 'TXT'
     ? <textarea className="input w-full h-20 resize-y" value={text} onChange={e => setText(e.target.value)} placeholder={valuePlaceholder} />
@@ -91,6 +120,28 @@ function RecordForm({ deviceId, existing, onClose }: RecordFormProps) {
             <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">{valueLabel} *</label>
             {valueField}
           </div>
+          {type === 'MX' && (
+            <div>
+              <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">Preference</label>
+              <input className="input w-full" type="number" min={0} max={65535} value={mxPreference} onChange={e => setMxPreference(e.target.value)} />
+            </div>
+          )}
+          {type === 'SRV' && (
+            <div className="grid grid-cols-3 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">Port *</label>
+                <input className="input w-full" type="number" min={0} max={65535} value={srvPort} onChange={e => setSrvPort(e.target.value)} placeholder="5060" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">Priority</label>
+                <input className="input w-full" type="number" min={0} max={65535} value={srvPriority} onChange={e => setSrvPriority(e.target.value)} />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">Weight</label>
+                <input className="input w-full" type="number" min={0} max={65535} value={srvWeight} onChange={e => setSrvWeight(e.target.value)} />
+              </div>
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">TTL</label>
@@ -107,13 +158,14 @@ function RecordForm({ deviceId, existing, onClose }: RecordFormProps) {
           </div>
         </div>
         <div className="px-5 pb-4 flex items-center gap-3">
-          <button onClick={() => save.mutate()} disabled={!name || save.isPending}
+          <button onClick={() => save.mutate()} disabled={!name || (type === 'SRV' && !srvPort) || save.isPending}
             className="flex items-center gap-1.5 px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg disabled:opacity-50 transition-colors">
             <Check className="w-3.5 h-3.5" />
             {save.isPending ? 'Saving…' : 'Save'}
           </button>
+          <ReviewChangesButton request={saveRequest} onApply={() => save.mutate()} applyLabel="Save" disabled={!name || (type === 'SRV' && !srvPort) || save.isPending} />
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
-          {save.isError && <span className="text-xs text-red-500">{(save.error as Error).message}</span>}
+          {save.isError && <span className="text-xs text-red-500">{apiErrorMessage(save.error)}</span>}
         </div>
       </div>
     </div>
@@ -171,17 +223,20 @@ export default function NetworkServicesDNSPage() {
     queryKey: ['network-services-overview'],
     queryFn: () => networkServicesApi.overview().then(r => r.data as NS[]),
     staleTime: 60_000,
+    refetchInterval: (q) => liveRefetch(q.state.data as LiveRow[] | undefined),
   });
   const conflictDevices = overview.filter(d => {
     if (parseInt(d['id']) === deviceId) return false;
     return (d['dns'] as unknown as { allow_remote: boolean } | null)?.allow_remote;
   });
 
-  const saveSettings = useMutation({
-    mutationFn: () => networkServicesApi.setDns(deviceId, {
+  const saveSettingsRequest = () => networkServicesApi.setDns(deviceId, {
       servers: serversInput, allow_remote_requests: allowRemote,
       max_udp_packet_size: maxUdpSize, cache_size: cacheSize, cache_max_ttl: cacheMaxTtl,
-    }),
+    });
+  const saveSettings = useMutation({
+    meta: { inlineError: true },
+    mutationFn: saveSettingsRequest,
     onSuccess: () => { setSettingsDirty(false); qc.invalidateQueries({ queryKey: ['ns-dns', deviceId] }); qc.invalidateQueries({ queryKey: ['network-services-overview'] }); },
   });
 
@@ -228,11 +283,11 @@ export default function NetworkServicesDNSPage() {
       {/* Device selector */}
       <div className="card p-4">
         <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">Select Device</label>
-        <select className="input w-full max-w-xs" value={selectedDeviceId}
-          onChange={e => setSelectedDeviceId(e.target.value === '' ? '' : parseInt(e.target.value))}>
-          <option value="">— Choose a device —</option>
-          {devices.map(d => <option key={d.id} value={d.id}>{d.name} ({d.ip_address}){d.status !== 'online' ? ' — offline' : ''}</option>)}
-        </select>
+        <DevicePicker
+          className="max-w-xs" devices={devices} aria-label="Device"
+          value={selectedDeviceId === '' ? null : selectedDeviceId}
+          onChange={(id) => setSelectedDeviceId(id ?? '')}
+        />
         {selectedDevice?.status !== 'online' && deviceId > 0 && (
           <div className="mt-2 flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
             <AlertTriangle className="w-3.5 h-3.5" />This device is currently offline.
@@ -243,7 +298,7 @@ export default function NetworkServicesDNSPage() {
       {conflictDevices.length > 0 && deviceId > 0 && allowRemote && (
         <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-sm text-amber-700 dark:text-amber-300">
           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-          <span>DNS remote requests also enabled on: <strong>{conflictDevices.map(d => d['name']).join(', ')}</strong>. Multiple DNS servers may cause resolution issues.</span>
+          <span>DNS remote requests also enabled on: <strong>{shortList(conflictDevices.map(d => String(d['name'])))}</strong>. Multiple DNS servers may cause resolution issues.</span>
         </div>
       )}
 
@@ -279,9 +334,13 @@ export default function NetworkServicesDNSPage() {
             <div className="p-5 space-y-5">
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-1">Upstream DNS Servers</label>
-                <input type="text" className="input w-full max-w-sm" value={serversInput}
-                  onChange={e => { setServersInput(e.target.value); mark(); }} placeholder="8.8.8.8,1.1.1.1" disabled={!canWrite} />
-                <p className="mt-1 text-xs text-gray-400 dark:text-slate-500">Comma-separated upstream resolver addresses.</p>
+                {/* One entry at a time rather than a comma-separated box (#207). */}
+                <div className="max-w-sm">
+                  <ListInput value={splitList(serversInput)} onChange={(v) => { setServersInput(v.join(',')); mark(); }}
+                    ariaLabel="Upstream DNS servers" placeholder="8.8.8.8" disabled={!canWrite}
+                    validate={(e) => (isValidIPv4(e) || isValidIPv6(e) ? null : `${e} isn\u2019t an IP address`)} />
+                </div>
+                <p className="mt-1 text-xs text-gray-400 dark:text-slate-500">Upstream resolver addresses, in the order they&apos;re tried.</p>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -326,13 +385,14 @@ export default function NetworkServicesDNSPage() {
                     className="flex items-center gap-1.5 px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg disabled:opacity-50 transition-colors">
                     <Save className="w-3.5 h-3.5" />{saveSettings.isPending ? 'Saving…' : 'Save Changes'}
                   </button>
+                  <ReviewChangesButton request={saveSettingsRequest} onApply={() => saveSettings.mutate()} applyLabel="Save" disabled={saveSettings.isPending} />
                   <button onClick={() => {
                     const s = dns.settings;
                     setServersInput(s['servers'] || ''); setAllowRemote(s['allow-remote-requests'] === 'yes');
                     setMaxUdpSize(s['max-udp-packet-size'] || ''); setCacheSize(s['cache-size'] || '');
                     setCacheMaxTtl(s['cache-max-ttl'] || ''); setSettingsDirty(false);
                   }} className="text-sm text-gray-500 hover:text-gray-700">Discard</button>
-                  {saveSettings.isError && <span className="text-xs text-red-500">{(saveSettings.error as Error).message}</span>}
+                  {saveSettings.isError && <span className="text-xs text-red-500">{apiErrorMessage(saveSettings.error)}</span>}
                 </div>
               )}
               {canWrite && saveSettings.isSuccess && !settingsDirty && (
@@ -372,7 +432,7 @@ export default function NetworkServicesDNSPage() {
                   <tbody>
                     {statics.map((r, i) => {
                       const isDisabled = r['disabled'] === 'true';
-                      const value = r['address'] || r['cname'] || r['text'] || '—';
+                      const value = r['address'] || r['cname'] || r['text'] || r['mx-exchange'] || r['ns'] || r['srv-target'] || r['forward-to'] || '—';
                       return (
                         <tr key={r['.id'] || i} className={clsx('border-b border-gray-100 dark:border-slate-800 transition-colors hover:bg-blue-50 dark:hover:bg-slate-700/40', i % 2 === 0 ? 'bg-white dark:bg-transparent' : 'bg-gray-50 dark:bg-slate-800/40')}>
                           <td className="px-4 py-3 font-medium text-gray-900 dark:text-white">{r['name'] || '—'}</td>

@@ -49,14 +49,22 @@ const MAC = '[0-9A-Fa-f:]{17}';
 
 // Lazy SSID capture with a required suffix: correct even for an SSID containing
 // a bracket, because the match must still end at the literal that follows.
+//
+// The interface name is [^\\s(]+ rather than \\S+?: with both lazy, the engine
+// tried every split between interface and SSID, which is quadratic, and a
+// device's log line is attacker-controlled (outside review P2-17). Lines are
+// also cut to MAX_LINE before matching; a real one is well under 200
+// characters (an SSID is at most 32 bytes).
+const IFACE = '[^\\s(]+';
+const MAX_LINE = 512;
 const RE_ROAMED = new RegExp(
-  `^(${MAC})@(\\S+?)\\((.*?)\\) roamed to (${MAC})@(\\S+?)\\((.*?)\\), signal strength (-?\\d+)`
+  `^(${MAC})@(${IFACE})\\((.*?)\\) roamed to (${MAC})@(${IFACE})\\((.*?)\\), signal strength (-?\\d+)`
 );
 const RE_CONNECTED = new RegExp(
-  `^(${MAC})@(\\S+?)\\((.*?)\\) connected, signal strength (-?\\d+)`
+  `^(${MAC})@(${IFACE})\\((.*?)\\) connected, signal strength (-?\\d+)`
 );
 const RE_DISCONNECTED = new RegExp(
-  `^(${MAC})@(\\S+?)\\((.*?)\\) disconnected, (.+?), signal strength (-?\\d+)`
+  `^(${MAC})@(${IFACE})\\((.*?)\\) disconnected, (.+?), signal strength (-?\\d+)`
 );
 const RE_DHCP = new RegExp(
   `^(\\S+) (assigned|deassigned) (\\S+) for (${MAC})(?:\\s+(.*))?$`
@@ -85,6 +93,7 @@ export function parseRoamLine(
   at: string,
   deviceName: string | null = null
 ): RoamEvent | null {
+  if (message.length > MAX_LINE) return null;
   const roamed = RE_ROAMED.exec(message);
   if (roamed) {
     return {
@@ -197,6 +206,11 @@ export function buildSessions(events: RoamEvent[]): RoamSession[] {
   });
   const sessions: RoamSession[] = [];
   let current: RoamSession | null = null;
+  // Where the open session is now, by device and interface (outside review
+  // J7). Moving from AP1 to AP2, AP2 logs "connected" and AP1's "disconnected"
+  // can arrive after it; that late disconnect used to close the new session.
+  let where: string | null = null;
+  const at = (device: string | null, iface: string | null | undefined) => `${device ?? ''}|${iface ?? ''}`;
 
   const open = (e: RoamEvent, iface: string | null): RoamSession => ({
     startedAt: e.at, endedAt: null, durationSec: null,
@@ -220,6 +234,7 @@ export function buildSessions(events: RoamEvent[]): RoamSession[] {
       case 'connected':
         if (current) { current.endedAt = e.at; sessions.push(current); }
         current = open(e, e.interfaceName);
+        where = at(e.deviceName, e.interfaceName);
         note(current, e);
         break;
 
@@ -228,6 +243,7 @@ export function buildSessions(events: RoamEvent[]): RoamSession[] {
         note(current, e);
         const prev = current.path[current.path.length - 1] ?? e.interfaceName;
         if (e.toInterface) {
+          where = at(e.deviceName, e.toInterface);
           current.path.push(e.toInterface);
           current.hops.push({
             at: e.at, from: prev, to: e.toInterface,
@@ -239,12 +255,19 @@ export function buildSessions(events: RoamEvent[]): RoamSession[] {
       }
 
       case 'disconnected':
+        // From somewhere the client has already left: a late message from the
+        // previous AP, not the end of the session it is in now.
+        if (current && where !== null && where !== at(e.deviceName, e.interfaceName)) {
+          note(current, e);
+          break;
+        }
         if (!current) current = open(e, e.interfaceName);
         note(current, e);
         current.disconnectReason = e.reason;
         current.endedAt = e.at;
         sessions.push(current);
         current = null;
+        where = null;
         break;
 
       case 'dhcp-assigned':

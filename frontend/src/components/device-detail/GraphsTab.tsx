@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useRememberedRange } from '../../hooks/useRememberedRange';
 import { useQuery } from '@tanstack/react-query';
 import { metricsApi, devicesApi } from '../../services/api';
 import type { Interface, TrafficPoint, ResourcePoint } from '../../types';
@@ -12,6 +13,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from 'recharts';
+import { chartTooltip } from '../common/chartTooltip';
 
 interface Props {
   deviceId: number;
@@ -68,8 +70,8 @@ function RangeButtons({
 
 export default function GraphsTab({ deviceId }: Props) {
   const [trafficIface, setTrafficIface] = useState('');
-  const [trafficRange, setTrafficRange] = useState<string>('1h');
-  const [resourceRange, setResourceRange] = useState<string>('24h');
+  const [trafficRange, setTrafficRange] = useRememberedRange<string>('device-traffic', '1h');
+  const [resourceRange, setResourceRange] = useRememberedRange<string>('device-resources', '24h');
 
   const { data: interfaces = [] } = useQuery({
     queryKey: ['interfaces', deviceId],
@@ -152,7 +154,7 @@ export default function GraphsTab({ deviceId }: Props) {
               <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-gray-200 dark:text-slate-600" opacity={0.5} />
               <XAxis dataKey="time" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
               <YAxis tickFormatter={formatBps} tick={{ fontSize: 10 }} width={72} />
-              <Tooltip formatter={(v) => formatBps(v as number)} contentStyle={{ fontSize: 12 }} />
+              <Tooltip {...chartTooltip} formatter={(v) => formatBps(v as number)} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="rx" stroke="#3b82f6" name="RX (download)" dot={false} strokeWidth={2} />
               <Line type="monotone" dataKey="tx" stroke="#10b981" name="TX (upload)" dot={false} strokeWidth={2} />
@@ -178,7 +180,7 @@ export default function GraphsTab({ deviceId }: Props) {
               <CartesianGrid strokeDasharray="3 3" stroke="currentColor" className="text-gray-200 dark:text-slate-600" opacity={0.5} />
               <XAxis dataKey="time" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
               <YAxis domain={[0, 100]} tickFormatter={(v) => `${v}%`} tick={{ fontSize: 10 }} />
-              <Tooltip formatter={(v) => `${v}%`} contentStyle={{ fontSize: 12 }} />
+              <Tooltip {...chartTooltip} formatter={(v) => `${v}%`} />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="cpu" stroke="#f59e0b" name="CPU Load" dot={false} strokeWidth={2} />
               <Line type="monotone" dataKey="mem" stroke="#8b5cf6" name="Memory Used" dot={false} strokeWidth={2} />

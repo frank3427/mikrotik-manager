@@ -1,6 +1,7 @@
 import {
   classifyWifiRole, parseCapsmanStatus, parseCapStatus, isCapsmanManaged,
   normalizeRadios, matchRadiosToDevices, lookupDeviceForMac, macIndexKeys, buildMacIndex,
+  hasRadios, wirelessDeviceSql, radioDeviceSql, chooseWifiPackage,
 } from '../capsman';
 
 describe('classifyWifiRole', () => {
@@ -346,5 +347,98 @@ describe('matchRadiosToDevices — controller mirrors (#94 field report)', () =>
   it('leaves a CAP that is not in the fleet unattributed rather than on the controller', () => {
     const radios = normalizeRadios([{ 'radio-mac': '04:F4:1C:99:99:99', local: 'false' }]);
     expect(matchRadiosToDevices(radios, index, CONTROLLER)[0].deviceId).toBeNull();
+  });
+});
+
+// ── Legacy CAPsMAN (#250), from the reporter's CHR and RB951 on 7.24.5 ───────
+
+import { legacyManagerEnabled, legacyCapInterfaces, parseLegacyChannel, legacyRadios } from '../capsman';
+import { legacyFixture } from '../__fixtures__/legacyCapsman';
+
+
+describe('legacy CAPsMAN (#250)', () => {
+  it('recognises an enabled controller and a CAP', () => {
+    expect(legacyManagerEnabled(legacyFixture.manager)).toBe(true);
+    expect(legacyManagerEnabled([{ enabled: 'false' }])).toBe(false);
+    expect(legacyManagerEnabled(null)).toBe(false);
+    expect(legacyCapInterfaces(legacyFixture.cap)).toEqual(['wlan1']);
+    expect(legacyCapInterfaces([{ enabled: 'false', interfaces: 'wlan1' }])).toEqual([]);
+  });
+
+  it('splits the channel from the transmit power', () => {
+    expect(parseLegacyChannel('2412/20/gn(30dBm)')).toEqual({ channel: '2412/20/gn', txPower: 30 });
+    expect(parseLegacyChannel('5180/20-Ceee/ac')).toEqual({ channel: '5180/20-Ceee/ac', txPower: null });
+    expect(parseLegacyChannel('')).toEqual({ channel: null, txPower: null });
+  });
+
+  it("reads the reporter's controller: one radio on BonusRoom with three clients", () => {
+    const [r, ...rest] = legacyRadios(legacyFixture.interface, null, legacyFixture.remoteCap, null, legacyFixture.registrations);
+    expect(rest).toHaveLength(0);
+    expect(r).toMatchObject({
+      radioMac: 'D4:CA:6D:BB:0E:57', interfaceName: 'BonusRoom 2.4Ghz', state: 'running-ap',
+      channel: '2412/20/gn', txPower: 30, registeredPeers: 3, authorizedPeers: 3,
+      ssid: 'Laney Legacy', capIdentity: 'BonusRoom',
+    });
+  });
+
+  it('takes the SSID from the named configuration when it was read', () => {
+    const [r] = legacyRadios(legacyFixture.interface, null, null, [{ name: 'Laney Legacy 2.4Ghz', ssid: 'From Config' }], []);
+    expect(r.ssid).toBe('From Config');
+    expect(r.registeredPeers).toBe(0);
+  });
+
+  it('leaves the AP unnamed when two CAPs could own the radio', () => {
+    const twin = { ...legacyFixture.remoteCap[0], identity: 'Twin', 'base-mac': 'D4:CA:6D:BB:0E:50' };
+    const [r] = legacyRadios(legacyFixture.interface, null, [...legacyFixture.remoteCap, twin], null, null);
+    expect(r.capIdentity).toBeNull();
+    expect(r.registeredPeers).toBe(3); // from the interface when the table wasn't read
+  });
+
+  it('prefers /caps-man/radio for the AP, and counts clients on virtual APs toward their radio', () => {
+    const virtual = { name: 'BonusRoom Guest', 'radio-mac': '', 'master-interface': 'BonusRoom 2.4Ghz' };
+    const [r] = legacyRadios(
+      [...legacyFixture.interface, virtual],
+      [{ 'radio-mac': 'D4:CA:6D:BB:0E:57', 'remote-cap-identity': 'BonusRoom-radio' }],
+      null, null,
+      [...legacyFixture.registrations, { interface: 'BonusRoom Guest', 'mac-address': '00:11:22:33:44:55' }],
+    );
+    expect(r.capIdentity).toBe('BonusRoom-radio');
+    expect(r.registeredPeers).toBe(4);
+  });
+});
+
+describe('radios on any device type (hAP ac² added as a router)', () => {
+  it('counts a standalone router as having radios, and a controller as wireless only', () => {
+    expect(hasRadios({ device_type: 'router', wifi_role: 'standalone' })).toBe(true);
+    expect(hasRadios({ device_type: 'router', wifi_role: 'controller' })).toBe(false);
+    expect(hasRadios({ device_type: 'router', wifi_role: 'none' })).toBe(false);
+    expect(hasRadios({ device_type: 'wireless_ap', wifi_role: null })).toBe(true);
+    expect(wirelessDeviceSql('d')).toBe("(d.device_type = 'wireless_ap' OR d.wifi_role IN ('standalone','cap','controller_cap','controller'))");
+  });
+  it('an access point has radios: a pure controller is not one (#365)', () => {
+    expect(radioDeviceSql('d')).toBe("(d.device_type = 'wireless_ap' OR d.wifi_role IN ('standalone','cap','controller_cap'))");
+    expect(radioDeviceSql()).toBe("(device_type = 'wireless_ap' OR wifi_role IN ('standalone','cap','controller_cap'))");
+  });
+  it('calls a device standalone only when it lists radios', () => {
+    expect(classifyWifiRole(null, null, true)).toBe('standalone');
+    expect(classifyWifiRole(null, null, false)).toBe('none');
+  });
+});
+
+describe('chooseWifiPackage', () => {
+  it("finds a hAP ac2's legacy radios although the wifi menu answers (RouterOS 7.13+)", () => {
+    expect(chooseWifiPackage(0, 2)).toBe('wireless');
+  });
+  it('picks the wifi package when it has the radios', () => {
+    expect(chooseWifiPackage(7, null)).toBe('wifi');
+  });
+  it('keeps a radio-less device on the built-in wifi menu (CAPsMAN capable)', () => {
+    expect(chooseWifiPackage(0, null)).toBe('wifi');
+    expect(chooseWifiPackage(0, 0)).toBe('wifi');
+  });
+  it('handles RouterOS 6 (no wifi menu) and devices with neither', () => {
+    expect(chooseWifiPackage(null, 1)).toBe('wireless');
+    expect(chooseWifiPackage(null, 0)).toBe('wireless');
+    expect(chooseWifiPackage(null, null)).toBe('none');
   });
 });

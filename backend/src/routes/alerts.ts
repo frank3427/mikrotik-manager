@@ -1,12 +1,15 @@
 import { Router } from 'express';
 import { query } from '../config/database';
-import { requireAuth, requireWrite } from '../middleware/auth';
+import { requireAuth, requireWrite, fleetOnly } from '../middleware/auth';
 import { alertService } from '../services/AlertService';
+import { maskConfig, mergeConfig, sealConfig } from '../utils/alertChannelSecrets';
 
 const router = Router();
 
 // All alert routes require authentication
 router.use(requireAuth);
+// Alert rules, channels and history cover the whole fleet (P1-7).
+router.use(fleetOnly);
 
 // ── Default rules seed ─────────────────────────────────────────────────────
 
@@ -21,9 +24,43 @@ const DEFAULT_RULES = [
   { event_type: 'device_discovered',        enabled: false, threshold: null, cooldown_min: 60   },
   { event_type: 'firmware_update_available', enabled: true,  threshold: null, cooldown_min: 1440 },
   { event_type: 'config_drift',      enabled: false, threshold: null, cooldown_min: 15   },
+  // Hardware health (#168). On by default: a failed PSU or fan is exactly what
+  // someone wants to hear about, and it only fires on a change.
+  { event_type: 'device_degraded',         enabled: true, threshold: null, cooldown_min: 60 },
+  { event_type: 'device_health_restored',  enabled: true, threshold: null, cooldown_min: 60 },
+  // A changed certificate or host key could be someone posing as the device
+  // (outside review P1-4). On by default; it fires once per change.
+  { event_type: 'device_identity_changed', enabled: true, threshold: null, cooldown_min: 60 },
+  // A serious RouterOS CVE affecting a version the fleet runs (#224). Off by
+  // default; checked after the daily CVE feed refresh, once per CVE and version.
+  { event_type: 'cve_active', enabled: false, threshold: null, cooldown_min: 1440 },
+  // A WireGuard peer whose last handshake is older than the threshold, in
+  // minutes (#208). Off by default; one alert per peer, per cooldown.
+  { event_type: 'wireguard_stale', enabled: false, threshold: 15, cooldown_min: 60 },
+  // Bad frames on a port whose link is still up (#249): the threshold is
+  // errors a minute, averaged over 5 minutes. Off by default; per port.
+  { event_type: 'interface_errors', enabled: false, threshold: 10, cooldown_min: 60 },
+  // A port whose link went down this many times in an hour (#249). Off by
+  // default; per port.
+  { event_type: 'interface_flapping', enabled: false, threshold: 3, cooldown_min: 60 },
+  // An optic's light this many dB below its usual level (the past week's
+  // median), or the module at 70 °C or more. Off by default; per port.
+  { event_type: 'optic_degraded', enabled: false, threshold: 3, cooldown_min: 360 },
+  // A BGP session or OSPF adjacency that was up has been down for the
+  // threshold, in minutes (#279). Off by default; one alert per peer, per cooldown.
+  { event_type: 'routing_peer_down', enabled: false, threshold: 2, cooldown_min: 60 },
+  // A platform backup of MikroTik Manager itself that failed, or didn't reach
+  // a destination. On by default: an unnoticed failing backup is the worst kind.
+  { event_type: 'platform_backup_failed', enabled: true, threshold: null, cooldown_min: 60 },
+  { event_type: 'device_cert_renewal_failed', enabled: true, threshold: null, cooldown_min: 360 },
 ];
 
-async function ensureDefaultRules(): Promise<void> {
+/**
+ * Insert any default rule that is missing; never changes an existing one.
+ * Also run at startup: rules added in an upgrade (device_degraded) otherwise
+ * did not exist, and so never fired, until someone opened the Alerting page.
+ */
+export async function ensureDefaultRules(): Promise<void> {
   for (const rule of DEFAULT_RULES) {
     await query(
       `INSERT INTO alert_rules (event_type, enabled, threshold, cooldown_min)
@@ -56,6 +93,11 @@ router.put('/rules/:type', requireWrite, async (req, res) => {
     threshold:   threshold   !== undefined ? (Number(threshold) || null) : undefined,
     cooldown_min: cooldown_min !== undefined ? Number(cooldown_min)    : undefined,
   });
+  // Turning CVE alerts on checks straight away instead of at the next daily
+  // feed refresh (#224).
+  if (type === 'cve_active' && row?.enabled) {
+    void import('../services/cveAlerts').then(({ checkCveAlerts }) => checkCveAlerts()).catch(() => {});
+  }
   res.json(row);
 });
 
@@ -81,7 +123,7 @@ router.post('/channels', requireWrite, async (req, res) => {
   if (!name || !type) {
     return res.status(400).json({ error: 'name and type are required' });
   }
-  const validTypes = ['email', 'slack', 'discord', 'telegram', 'ntfy'];
+  const validTypes = ['email', 'slack', 'discord', 'telegram', 'ntfy', 'gotify'];
   if (!validTypes.includes(type)) {
     return res.status(400).json({ error: `type must be one of: ${validTypes.join(', ')}` });
   }
@@ -89,7 +131,8 @@ router.post('/channels', requireWrite, async (req, res) => {
   const rows = await query(
     `INSERT INTO alert_channels (name, type, enabled, config)
      VALUES ($1, $2, $3, $4) RETURNING *`,
-    [name, type, Boolean(enabled), JSON.stringify(config)]
+    // Secrets are stored encrypted (outside review S7).
+    [name, type, Boolean(enabled), JSON.stringify(sealConfig(type, config))]
   );
   const ch = rows[0] as Record<string, unknown>;
   res.status(201).json({
@@ -114,7 +157,9 @@ router.put('/channels/:id', requireWrite, async (req, res) => {
   const type           = existing[0].type;
 
   // Merge new config over existing, preserving existing passwords when placeholders sent
-  const mergedConfig = mergeConfig(type, existingConfig, config ?? {});
+  const merge = mergeConfig(type, existingConfig, config ?? {});
+  if ('error' in merge) return res.status(400).json({ error: merge.error });
+  const mergedConfig = merge.merged;
 
   const rows = await query(
     `UPDATE alert_channels
@@ -123,7 +168,7 @@ router.put('/channels/:id', requireWrite, async (req, res) => {
          config = $4,
          updated_at = NOW()
      WHERE id = $1 RETURNING *`,
-    [id, name ?? null, enabled !== undefined ? Boolean(enabled) : null, JSON.stringify(mergedConfig)]
+    [id, name ?? null, enabled !== undefined ? Boolean(enabled) : null, JSON.stringify(sealConfig(type, mergedConfig))]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Channel not found' });
 
@@ -163,39 +208,5 @@ router.get('/history', async (req, res) => {
   );
   res.json(rows);
 });
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-const SENSITIVE_KEYS: Record<string, string[]> = {
-  email:    ['smtp_pass'],
-  slack:    [],
-  discord:  [],
-  telegram: ['bot_token'],
-  // ntfy accepts either an access token or basic auth; both are secrets.
-  ntfy:     ['token', 'password'],
-};
-
-function maskConfig(type: string, config: Record<string, unknown>): Record<string, unknown> {
-  const masked = { ...config };
-  for (const key of SENSITIVE_KEYS[type] ?? []) {
-    if (masked[key]) masked[key] = '••••••••';
-  }
-  return masked;
-}
-
-/** When updating, if a sensitive field comes back as the mask placeholder, keep the original. */
-function mergeConfig(
-  type: string,
-  existing: Record<string, unknown>,
-  incoming: Record<string, unknown>
-): Record<string, unknown> {
-  const merged = { ...existing, ...incoming };
-  for (const key of SENSITIVE_KEYS[type] ?? []) {
-    if (incoming[key] === '••••••••') {
-      merged[key] = existing[key]; // restore original
-    }
-  }
-  return merged;
-}
 
 export default router;

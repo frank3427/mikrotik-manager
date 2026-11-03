@@ -1,11 +1,23 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { useRememberedRange } from '../../hooks/useRememberedRange';
+import ReviewChangesButton from '../common/ReviewChangesButton';
 import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { RefreshCw, X, Check, AlertCircle, Activity, Cpu, Link2, Trash2, Plus, Network, Users, Wifi, ShieldCheck, AlertTriangle } from 'lucide-react';
-import { devicesApi, metricsApi } from '../../services/api';
+import { RefreshCw, X, Check, AlertCircle, Activity, Link2, Trash2, Network, Users, Wifi, ShieldCheck, AlertTriangle, LayoutGrid, ExternalLink, Zap } from 'lucide-react';
+import { devicesApi, metricsApi, type PortErrorSummary, type OpticStatus } from '../../services/api';
+import { chartTooltip } from '../common/chartTooltip';
+import FloatingWindow from '../common/FloatingWindow';
 import { useCanWrite } from '../../hooks/useCanWrite';
 import ChangeGuardDialog, { guardOutcomeMessage, LockoutVerdictDialog, lockoutVerdictOf, type GuardResult, type LockoutVerdict } from '../ChangeGuardDialog';
 import type { SwitchPort, Vlan, TrafficPoint, PortMonitorData, PortClient } from '../../types';
+import { classifyPort, portBasis, portLabel, portSortKey } from '../../utils/portClass';
+import { parseVlanList, toggleVlan, formatVlanList } from '../../utils/vlanList';
+import { changeErrorText } from '../../utils/changeError';
+import {
+  staggerBlocks, chunkRows, resolveColumns,
+  DENSITY_OPTIONS, parseDensity, densityLabel, type Density, type StaggerBlock,
+} from '../../utils/faceplateLayout';
+import { lookupModelLayout, resolveEvenOnTop, arrangeSfp, stackCages, cageTiles } from '../../utils/faceplateModels';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Legend,
@@ -13,9 +25,16 @@ import {
 import { formatDistanceToNow } from 'date-fns';
 import clsx from 'clsx';
 
+/** Move-dialog targets that aren't bridge names (#258). */
+const NEW_BRIDGE = '\u0000new';
+const NO_BRIDGE = '\u0000none';
+
+
 interface Props {
   deviceId: number;
   deviceName?: string;
+  /** For remembering which row the odd ports are on, per model (#277). */
+  deviceModel?: string | null;
   autoOpenBridge?: string;
   onBridgeOpened?: () => void;
 }
@@ -59,15 +78,33 @@ function portState(port: SwitchPort): 'up' | 'down' | 'disabled' {
   return 'down';
 }
 
+/** One line for a port's tooltip: what its error counters did this hour (#249). */
+function portErrorLine(e: PortErrorSummary): string {
+  const parts = [
+    e.hour.fcs ? `FCS ${e.hour.fcs}` : '', e.hour.align ? `alignment ${e.hour.align}` : '',
+    e.hour.overflow ? `overflow ${e.hour.overflow}` : '', e.hour.other ? `other ${e.hour.other}` : '',
+  ].filter(Boolean);
+  const errs = parts.length ? `errors this hour: ${parts.join(', ')} (${e.rate_per_min}/min now)` : '';
+  const flaps = e.hour.link_downs ? `link down ${e.hour.link_downs}× this hour` : '';
+  return [errs, flaps].filter(Boolean).join('; ');
+}
+
 function PortTile({
-  port, selected, hovered, isMember, watts,
+  port, selected, hovered, isMember, watts, errors, optic,
   onClick, onMouseEnter, onMouseLeave, onDoubleClick,
 }: {
   port: SwitchPort; selected: boolean; hovered: boolean; isMember?: boolean; watts?: number;
+  errors?: PortErrorSummary; optic?: OpticStatus;
   onClick: (e: React.MouseEvent) => void;
   onMouseEnter: () => void; onMouseLeave: () => void; onDoubleClick: () => void;
 }) {
   const state = portState(port);
+  // Errors outrank the up/down colours: a port can be up and failing (#249).
+  // Optics losing light count the same way (red past the threshold, yellow halfway).
+  const errTone = errors?.state === 'alert' || optic?.state === 'alert' ? 'var(--bad)'
+    : errors?.state === 'errors' || optic?.state === 'watch' ? 'var(--warn)' : null;
+  const problems = [errors?.state ? portErrorLine(errors) : '', optic?.state && optic.reason ? `optic: ${optic.reason}` : '']
+    .filter(Boolean).join('; ');
   const bg = selected ? 'var(--accent)' : state === 'up' ? 'var(--port-up-bg)' : state === 'down' ? 'var(--port-down-bg)' : 'var(--surface-3)';
   const border = isMember && !selected ? 'var(--warn)' : selected ? 'var(--accent)' : state === 'up' ? 'var(--port-up-border)' : state === 'down' ? 'var(--port-down-border)' : 'var(--line)';
   const textColor = selected ? '#ffffff' : state === 'up' ? 'var(--good)' : state === 'down' ? 'var(--bad)' : 'var(--ink-4)';
@@ -78,10 +115,10 @@ function PortTile({
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       onDoubleClick={onDoubleClick}
-      title={`${port.name}${port.comment ? ` — ${port.comment}` : ''}${port.speed ? ` · ${port.speed}` : ''}${watts && watts > 0 ? ` · ${watts.toFixed(1)}W PoE` : ''}`}
+      title={`${port.name}${port.comment || port.bridgeInfo?.config_json?.comment ? ` — ${port.comment || port.bridgeInfo?.config_json?.comment}` : ''}${port.link_rate || port.speed ? ` · ${port.link_rate || port.speed}` : ''}${watts && watts > 0 ? ` · ${watts.toFixed(1)}W PoE` : ''}${problems ? ` · ${problems}` : ''}`}
       style={{
         width: 46, height: 46, borderRadius: 4, position: 'relative', flexShrink: 0,
-        background: bg, border: `1px solid ${border}`,
+        background: bg, border: errTone && !selected ? `2px solid ${errTone}` : `1px solid ${border}`,
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         cursor: 'pointer', color: textColor,
         fontFamily: 'Geist Mono, monospace', fontSize: 10, fontWeight: 600,
@@ -93,7 +130,13 @@ function PortTile({
         background: ledBg,
         boxShadow: state === 'up' && !selected ? '0 0 6px var(--accent)' : 'none',
       }} />
-      <span>{portLabel(port.name)}</span>
+      {errTone && (
+        <div aria-label="Port problem" style={{
+          position: 'absolute', top: 2, left: 3, fontSize: 9, fontWeight: 800, lineHeight: 1,
+          color: selected ? '#ffffff' : errTone,
+        }}>!</div>
+      )}
+      <span>{portLabel(portBasis(port))}</span>
       {watts && watts > 0 ? (
         <span style={{
           position: 'absolute', bottom: 2, left: 0, right: 0, textAlign: 'center',
@@ -107,44 +150,29 @@ function PortTile({
   );
 }
 
-function portLabel(name: string): string {
-  if (name.startsWith('sfp-sfpplus')) return `P${name.replace('sfp-sfpplus', '')}`;
-  if (name.startsWith('sfp')) return `S${name.replace('sfp', '')}`;
-  if (name.startsWith('combo')) return `C${name.replace('combo', '')}`;
-  if (name.startsWith('ether')) return name.replace('ether', '');
-  if (name.startsWith('bridge')) return name.replace('bridge', '') || 'BR';
-  const bondMatch = name.match(/^bond(\d*)$/i);
-  if (bondMatch) return `B${bondMatch[1]}`;
-  const lagMatch = name.match(/^lag(\d*)$/i);
-  if (lagMatch) return `L${lagMatch[1]}`;
-  if (/^qsfp/i.test(name) && !name.match(/-\d+-\d+$/)) {
-    return `Q${name.match(/-(\d+)$/)?.[1] ?? ''}`;
-  }
-  return name.slice(0, 4);
-}
 
 interface QsfpCage {
   key: string;
   label: string;
   /** Actual breakout lane ports (empty for single-mode cages). */
   lanes: SwitchPort[];
-  /** Set when the cage is a single non-broken-out QSFP port; renders 4 virtual lanes. */
+  /** Set when the cage is a single non-broken-out QSFP port; renders as one box. */
   singlePort?: SwitchPort;
 }
 
 /** Group QSFP ports into cage objects.
- *  - Breakout (qsfp28-1-1..4): real lanes with individual statuses, but if only 1 lane is
- *    running treat it as a single-cable connection and show all lanes green.
- *  - Single mode (qsfp28-1): synthetic cage with 4 virtual lanes all sharing the port status.
+ *  - Breakout (qsfp28-1-1..4): real lanes with individual statuses; a 40G/100G module
+ *    using the whole cage draws as its one running lane (cageTiles).
+ *  - Single mode (qsfp28-1): one cage holding the single real port.
  */
 function groupQsfpCages(ports: SwitchPort[]): { cages: QsfpCage[]; individual: SwitchPort[] } {
   const lanesByKey = new Map<string, SwitchPort[]>();
   for (const port of ports) {
-    const m = port.name.match(/^(qsfp[^-]*(?:-[^-\d][^-]*)*-\d+)-(\d+)$/i);
-    if (m) {
-      const key = m[1];
-      if (!lanesByKey.has(key)) lanesByKey.set(key, []);
-      lanesByKey.get(key)!.push(port);
+    // Keyed on the factory name, so a renamed lane stays in its cage (#146).
+    const id = classifyPort(port);
+    if (id.kind === 'qsfp-lane' && id.cageKey) {
+      if (!lanesByKey.has(id.cageKey)) lanesByKey.set(id.cageKey, []);
+      lanesByKey.get(id.cageKey)!.push(port);
     }
   }
 
@@ -153,8 +181,8 @@ function groupQsfpCages(ports: SwitchPort[]): { cages: QsfpCage[]; individual: S
   const cages: QsfpCage[] = [];
 
   for (const key of cageKeys) {
-    const lanes = lanesByKey.get(key)!.sort((a, b) =>
-      parseInt(a.name.split('-').pop() ?? '0') - parseInt(b.name.split('-').pop() ?? '0')
+    const lanes = lanesByKey.get(key)!.sort(
+      (a, b) => (classifyPort(a).lane ?? 0) - (classifyPort(b).lane ?? 0)
     );
     lanes.forEach(p => laneNames.add(p.name));
     const cageNum = key.match(/-(\d+)$/)?.[1] ?? '?';
@@ -164,16 +192,17 @@ function groupQsfpCages(ports: SwitchPort[]): { cages: QsfpCage[]; individual: S
   const remaining = ports.filter(p => !laneNames.has(p.name));
 
   // Single-mode QSFP ports (no lane suffix) → synthetic cage
-  for (const port of remaining.filter(p => /^qsfp/i.test(p.name))) {
-    const cageNum = port.name.match(/-(\d+)$/)?.[1] ?? '?';
-    cages.push({ key: port.name, label: `Q${cageNum}`, lanes: [], singlePort: port });
+  for (const port of remaining.filter(p => classifyPort(p).kind === 'qsfp')) {
+    const basis = portBasis(port);
+    const cageNum = basis.match(/-(\d+)$/)?.[1] ?? '?';
+    cages.push({ key: basis, label: `Q${cageNum}`, lanes: [], singlePort: port });
   }
 
   cages.sort((a, b) =>
     parseInt(a.key.match(/-(\d+)$/)?.[1] ?? '0') - parseInt(b.key.match(/-(\d+)$/)?.[1] ?? '0')
   );
 
-  return { cages, individual: remaining.filter(p => !/^qsfp/i.test(p.name)) };
+  return { cages, individual: remaining.filter(p => classifyPort(p).kind !== 'qsfp') };
 }
 
 const TRAFFIC_RANGES = ['1h', '3h', '6h', '12h', '24h'] as const;
@@ -261,7 +290,11 @@ function PortTrafficGraph({
           No traffic data for {portName} in this range
         </div>
       ) : (
-        <div className="flex-1 min-h-[160px]">
+        // Positioned absolutely so the chart fills the card without its own
+        // size feeding back into the row height: otherwise a taller neighbour
+        // stretched it, and it never shrank back.
+        <div className="flex-1 min-h-[160px] relative">
+          <div className="absolute inset-0">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={trafficData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" opacity={0.5} />
@@ -282,6 +315,7 @@ function PortTrafficGraph({
               <Line type="monotone" dataKey="tx" stroke="var(--violet)" name="TX" dot={false} strokeWidth={1.6} />
             </LineChart>
           </ResponsiveContainer>
+          </div>
         </div>
       )}
     </div>
@@ -335,7 +369,11 @@ function PortPacketGraph({
           No packet data yet for {portName} in the selected range
         </div>
       ) : (
-        <div className="flex-1 min-h-[200px]">
+        // Positioned absolutely so the chart fills the card without its own
+        // size feeding back into the row height: otherwise a taller neighbour
+        // stretched it, and it never shrank back.
+        <div className="flex-1 min-h-[200px] relative">
+          <div className="absolute inset-0">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={packetData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
@@ -355,28 +393,79 @@ function PortPacketGraph({
               <Line type="monotone" dataKey="tx" stroke="#f59e0b" name="TX packets" dot={false} strokeWidth={2} />
             </LineChart>
           </ResponsiveContainer>
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function PortTooltip({ port }: { port: SwitchPort }) {
-  return (
-    <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-52 bg-gray-900 dark:bg-slate-700 text-white text-xs rounded-lg px-3 py-2 z-10 shadow-lg pointer-events-none">
-      <div className="font-semibold mb-1">{port.name}</div>
-      <div>Status: {port.disabled ? 'Disabled' : port.running ? 'Up' : 'Down'}</div>
-      {port.speed && <div>Speed: {port.speed}</div>}
-      {port.mtu && <div>MTU: {port.mtu}{port.config_json?.['l2mtu'] ? ` (L2: ${port.config_json['l2mtu']})` : ''}</div>}
-      {port.mac_address && <div>MAC: {port.mac_address}</div>}
-      {port.bridgeInfo?.pvid && <div>PVID: {port.bridgeInfo.pvid}</div>}
-      {port.comment && <div>Note: {port.comment}</div>}
-      <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-gray-900 dark:border-t-slate-700" />
+
+/** Light levels now against the port's usual level, and the past week (optics only). */
+function OpticSection({ deviceId, portName, optic, dropDb, chartHeight = 110 }: {
+  deviceId: number; portName: string; optic: OpticStatus; dropDb: number; chartHeight?: number;
+}) {
+  const { data: history = [] } = useQuery({
+    queryKey: ['optic-history', deviceId, portName],
+    queryFn: () => devicesApi.getOpticHistory(deviceId, portName, 7).then((r) => r.data),
+    refetchInterval: 300_000,
+  });
+  const tone = optic.state === 'alert' ? 'var(--bad)' : optic.state === 'watch' ? 'var(--warn)' : 'var(--accent)';
+  const dbm = (v: number | null) => (v === null ? '—' : `${v.toFixed(2)} dBm`);
+  const row = (label: string, value: string, color?: string) => (
+    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 0', borderBottom: '1px solid var(--line-soft)' }}>
+      <span style={{ color: 'var(--ink-3)', fontSize: 12 }}>{label}</span>
+      <span className="mono" style={{ color: color ?? 'var(--ink-2)', fontSize: 12, textAlign: 'right' }}>{value}</span>
     </div>
+  );
+  // Either direction counts (#249): weaker or stronger than usual.
+  const dropColor = (d: number | null) => (d === null ? undefined : Math.abs(d) >= dropDb ? 'var(--bad)' : Math.abs(d) >= dropDb / 2 ? 'var(--warn)' : undefined);
+  const vsUsual = (d: number) => (d === 0 ? 'same' : `${Math.abs(d).toFixed(1)} dB ${d > 0 ? 'below' : 'above'}`);
+  const data = history.map((h) => ({
+    time: new Date(h.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+    rx: h.rx_dbm, tx: h.tx_dbm,
+  }));
+  return (
+    <>
+      <div style={{ marginBottom: 8 }}>
+        <span className="mono text-[10px] uppercase tracking-widest" style={{ color: tone }}>Light level</span>
+      </div>
+      {row('RX now', optic.rx_lanes.length > 1 ? `${dbm(optic.rx_dbm)} (weakest of ${optic.rx_lanes.length})` : dbm(optic.rx_dbm))}
+      {row('RX usually', optic.usual_rx_dbm === null ? 'learning (first 3 h)' : dbm(optic.usual_rx_dbm))}
+      {optic.rx_drop_db !== null && row('RX vs usual', vsUsual(optic.rx_drop_db), dropColor(optic.rx_drop_db))}
+      {row('TX now', dbm(optic.tx_dbm))}
+      {optic.tx_drop_db !== null && row('TX vs usual', vsUsual(optic.tx_drop_db), dropColor(optic.tx_drop_db))}
+      {optic.rx_lanes.length > 1 && row('RX lanes', optic.rx_lanes.map((l) => l.toFixed(1)).join(' / '))}
+      {optic.reason && (
+        <p className="text-[11px] mt-2" style={{ color: tone }}>{optic.reason[0].toUpperCase() + optic.reason.slice(1)}.</p>
+      )}
+      {data.length > 1 && (
+        <div style={{ height: chartHeight, marginTop: 8 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--line-soft)" />
+              <XAxis dataKey="time" hide />
+              <YAxis tick={{ fontSize: 10, fill: 'var(--ink-3)' }} domain={['auto', 'auto']} width={36}
+                tickFormatter={(v: number) => v.toFixed(1)} />
+              <Tooltip {...chartTooltip} formatter={(v) => (typeof v === 'number' ? `${v.toFixed(2)} dBm` : String(v))} />
+              <Line type="monotone" dataKey="rx" name="RX" stroke="var(--accent)" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+              <Line type="monotone" dataKey="tx" name="TX" stroke="var(--ink-3)" dot={false} strokeWidth={1} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+          <div className="mono text-[10px] text-center" style={{ color: 'var(--ink-4)' }}>past 7 days · RX (blue), TX (grey)</div>
+        </div>
+      )}
+    </>
   );
 }
 
-function PortInfoCard({ deviceId, portName }: { deviceId: number; portName: string }) {
+function PortInfoCard({ deviceId, portName, errors, errorsPerMin = 10, flapsPerHour = 3, optic, dropDb = 3 }: {
+  deviceId: number; portName: string; errors?: PortErrorSummary; errorsPerMin?: number; flapsPerHour?: number;
+  optic?: OpticStatus; dropDb?: number;
+}) {
+  // The module's details and light levels open in a window of their own, so
+  // this card stays the height of the graphs beside it.
+  const [moduleWindow, setModuleWindow] = useState(false);
   const { data: monitor, isLoading } = useQuery({
     queryKey: ['port-monitor', deviceId, portName],
     queryFn: () => devicesApi.getPortMonitor(deviceId, portName).then((r) => r.data),
@@ -400,7 +489,10 @@ function PortInfoCard({ deviceId, portName }: { deviceId: number; portName: stri
     );
   }
 
-  const isSfp = d['sfp-module-present'] === 'true';
+  // Diagnostics under either name: `sfp-rx-power` (MikroTik's manual) or plain
+  // `rx-power` (a CRS520's QSFP28 optic on 7.24.5, #249).
+  const ddm = (field: string): string | undefined => d[`sfp-${field}`] ?? d[field];
+  const isSfp = d['sfp-module-present'] === 'true' || ddm('rx-power') !== undefined;
 
   const infoRow = (label: string, value: string | undefined, valueColor?: string) => {
     if (!value || value === '' || value === 'none' || value === '0') return null;
@@ -428,10 +520,66 @@ function PortInfoCard({ deviceId, portName }: { deviceId: number; portName: stri
         {infoRow('FEC Mode', d['fec-mode'])}
       </div>
 
-      {isSfp && (
+      {errors && (errors.state || errors.hour.link_downs > 0) && (
         <>
           <div style={{ marginTop: 12, marginBottom: 8, paddingTop: 8, borderTop: '1px solid var(--line)' }}>
-            <span className="mono text-[10px] uppercase tracking-widest" style={{ color: 'var(--accent)' }}>SFP Optic</span>
+            <span className="mono text-[10px] uppercase tracking-widest"
+              style={{ color: errors.state === 'alert' ? 'var(--bad)' : 'var(--warn)' }}>Errors, last hour</span>
+          </div>
+          <div>
+            {infoRow('FCS', errors.hour.fcs ? String(errors.hour.fcs) : undefined)}
+            {infoRow('Alignment', errors.hour.align ? String(errors.hour.align) : undefined)}
+            {infoRow('Overflow', errors.hour.overflow ? String(errors.hour.overflow) : undefined)}
+            {infoRow('Other', errors.hour.other ? String(errors.hour.other) : undefined)}
+            {infoRow('Rate now', `${errors.rate_per_min}/min`, errors.rate_per_min >= errorsPerMin ? 'var(--bad)' : undefined)}
+            {infoRow('Link drops', errors.hour.link_downs ? String(errors.hour.link_downs) : undefined, errors.flapping ? 'var(--bad)' : undefined)}
+          </div>
+          <p className="text-[11px] mt-2" style={{ color: 'var(--ink-3)' }}>
+            Bad frames on a link that stays up usually mean a failing optic, a dirty or damaged
+            cable, or a problem at the far end. Red above {errorsPerMin}/min or {flapsPerHour} link drops an hour.
+          </p>
+        </>
+      )}
+
+      {(optic || isSfp) && (
+        <div className="flex items-center justify-between gap-2"
+          style={{ marginTop: 12, paddingTop: 8, borderTop: '1px solid var(--line)' }}>
+          <span className="mono text-[10px] uppercase tracking-widest flex-shrink-0"
+            style={{ color: optic?.state === 'alert' ? 'var(--bad)' : optic?.state === 'watch' ? 'var(--warn)' : 'var(--accent)' }}>
+            SFP module
+          </span>
+          <span className="flex items-center gap-2 min-w-0 text-[11px]" style={{ color: 'var(--ink-3)' }}>
+            <span className="mono truncate">
+              {[d['sfp-vendor-part-number'],
+                (optic?.rx_dbm ?? (ddm('rx-power') ? parseFloat(ddm('rx-power')!) : null)) != null
+                  ? `RX ${(optic?.rx_dbm ?? parseFloat(ddm('rx-power')!)).toFixed(1)} dBm` : null,
+              ].filter(Boolean).join(' · ')}
+            </span>
+            {optic?.state && (
+              <span title={optic.reason ?? undefined} className="w-2 h-2 rounded-full flex-shrink-0"
+                style={{ background: optic.state === 'alert' ? 'var(--bad)' : 'var(--warn)' }} />
+            )}
+            <button type="button" onClick={() => setModuleWindow(true)}
+              className="inline-flex items-center gap-1 flex-shrink-0 hover:underline" style={{ color: 'var(--accent)' }}>
+              Details <ExternalLink className="w-3 h-3" />
+            </button>
+          </span>
+        </div>
+      )}
+
+      {moduleWindow && (
+        <FloatingWindow
+          title={`${portName} · SFP module${d['sfp-vendor-part-number'] ? ` · ${d['sfp-vendor-part-number']}` : ''}`}
+          icon={<Activity className="w-4 h-4 flex-shrink-0" style={{ color: 'var(--accent)' }} />}
+          onClose={() => setModuleWindow(false)}
+          height={optic ? 680 : 520}
+        >
+      {optic && <OpticSection deviceId={deviceId} portName={portName} optic={optic} dropDb={dropDb} chartHeight={220} />}
+
+      {isSfp && (
+        <>
+          <div style={{ marginTop: optic ? 16 : 0, marginBottom: 8 }}>
+            <span className="mono text-[10px] uppercase tracking-widest" style={{ color: 'var(--accent)' }}>Module details</span>
           </div>
           <div className="space-y-0">
             {infoRow('Type', d['sfp-type'])}
@@ -442,16 +590,18 @@ function PortInfoCard({ deviceId, portName }: { deviceId: number; portName: stri
             {infoRow('Serial #', d['sfp-vendor-serial'])}
             {infoRow('Rev.', d['sfp-vendor-revision'])}
             {infoRow('Mfg. Date', d['sfp-manufacturing-date'])}
-            {infoRow('Temperature', d['sfp-temperature'] ? `${d['sfp-temperature']} °C` : undefined)}
-            {infoRow('Supply Volt.', d['sfp-supply-voltage'] ? `${d['sfp-supply-voltage']} V` : undefined)}
-            {infoRow('TX Bias', d['sfp-tx-bias-current'] ? `${d['sfp-tx-bias-current']} mA` : undefined)}
-            {infoRow('TX Power', d['sfp-tx-power'] ? `${d['sfp-tx-power']} dBm` : undefined)}
-            {infoRow('RX Power', d['sfp-rx-power'] ? `${d['sfp-rx-power']} dBm` : undefined)}
+            {infoRow('Temperature', ddm('temperature') ? `${parseFloat(ddm('temperature')!)} °C` : undefined)}
+            {infoRow('Supply Volt.', ddm('supply-voltage') ? `${parseFloat(ddm('supply-voltage')!)} V` : undefined)}
+            {infoRow('TX Bias', ddm('tx-bias-current') ? `${parseFloat(ddm('tx-bias-current')!)} mA` : undefined)}
+            {infoRow('TX Power', ddm('tx-power') ? `${ddm('tx-power')!.replace(/dBm/g, '')} dBm` : undefined)}
+            {infoRow('RX Power', ddm('rx-power') ? `${ddm('rx-power')!.replace(/dBm/g, '')} dBm` : undefined)}
             {infoRow('Cable (Cu)', d['sfp-link-length-copper'] ? `${d['sfp-link-length-copper']} m` : undefined)}
             {infoRow('Cable (MM)', d['sfp-link-length-multimode'] ? `${d['sfp-link-length-multimode']} m` : undefined)}
             {infoRow('Cable (SM)', d['sfp-link-length-singlemode'] ? `${d['sfp-link-length-singlemode']} km` : undefined)}
           </div>
         </>
+      )}
+        </FloatingWindow>
       )}
     </div>
   );
@@ -587,19 +737,45 @@ function PortClientsCard({ deviceId, portName }: { deviceId: number; portName: s
   );
 }
 
-export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge, onBridgeOpened }: Props) {
+export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, autoOpenBridge, onBridgeOpened }: Props) {
   const queryClient = useQueryClient();
   const canWrite = useCanWrite();
+  // PoE power-cycle (#291): which port is cycling, and how it went.
+  const [poeBusy, setPoeBusy] = useState<string | null>(null);
+  const [poeNote, setPoeNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const powerCycle = async (name: string) => {
+    if (!confirm(`Power-cycle PoE on ${name}? The device it powers loses power for 5 seconds and restarts.`)) return;
+    setPoeBusy(name); setPoeNote(null);
+    const run = async (confirmManagement: boolean): Promise<void> => {
+      try {
+        const r = await devicesApi.poePowerCycle(deviceId, name, 5, confirmManagement);
+        setPoeNote({ ok: true, text: r.data.message });
+      } catch (e) {
+        const d = (e as { response?: { status?: number; data?: { error?: string; needs_confirmation?: boolean } } }).response;
+        if (d?.status === 409 && d.data?.needs_confirmation && confirm(`${d.data.error}\n\nPower-cycle it anyway?`)) return run(true);
+        setPoeNote({ ok: false, text: d?.data?.error || 'Power-cycle failed' });
+      }
+    };
+    await run(false);
+    setPoeBusy(null);
+  };
   const [selectedPorts, setSelectedPorts] = useState<Set<string>>(new Set());
   const [hoveredPort, setHoveredPort] = useState<string | null>(null);
   const [editingPort, setEditingPort] = useState<SwitchPort | null>(null);
   const [editingBridge, setEditingBridge] = useState<SwitchPort | null>(null);
   const [bridgeError, setBridgeError] = useState('');
-  const [trafficRange, setTrafficRange] = useState('1h');
+  const [trafficRange, setTrafficRange] = useRememberedRange<string>('port-traffic', '1h');
   const [showCreateTrunkModal, setShowCreateTrunkModal] = useState(false);
   const [editingBond, setEditingBond] = useState<SwitchPort | null>(null);
   const [confirmDestroyBond, setConfirmDestroyBond] = useState<string | null>(null);
   const [guardNotice, setGuardNotice] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null);
+  // Moving ports between bridges (#258). The target is a bridge name, NEW_BRIDGE or NO_BRIDGE.
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [moveTarget, setMoveTarget] = useState('');
+  const [newBridgeName, setNewBridgeName] = useState('');
+  const [moveError, setMoveError] = useState('');
+  const [addressWarning, setAddressWarning] = useState<string[] | null>(null);
+  const [confirmDeleteBridge, setConfirmDeleteBridge] = useState<string | null>(null);
   // Predicted lockout (409 + verdict) and the retry that re-sends with confirm_lockout.
   const [lockout, setLockout] = useState<{ verdict: LockoutVerdict; retry: () => void } | null>(null);
   const [editForm, setEditForm] = useState<PortEditForm>({
@@ -617,6 +793,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
     tagged_vlans: '',
   });
   const [saveError, setSaveError] = useState('');
+  const [saveNotice, setSaveNotice] = useState('');
   const [bondError, setBondError] = useState('');
   const [createTrunkForm, setCreateTrunkForm] = useState<CreateTrunkForm>({
     name: '',
@@ -647,9 +824,38 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
     refetchInterval: 30_000,
   });
 
+  // Frame errors and link drops in the last hour (#249).
+  const { data: portErrors } = useQuery({
+    queryKey: ['interface-errors', deviceId],
+    queryFn: () => devicesApi.getInterfaceErrors(deviceId).then((r) => r.data),
+    refetchInterval: 30_000,
+  });
+  const portErrMap: Record<string, PortErrorSummary> = Object.fromEntries(
+    (portErrors?.ports ?? []).map((p) => [p.interface, p])
+  );
+
+  // Optic light levels against each port's usual level.
+  const { data: optics } = useQuery({
+    queryKey: ['optics', deviceId],
+    queryFn: () => devicesApi.getOptics(deviceId).then((r) => r.data),
+    refetchInterval: 60_000,
+  });
+  const opticMap: Record<string, OpticStatus> = Object.fromEntries(
+    (optics?.ports ?? []).map((o) => [o.interface, o])
+  );
+
   const poeWattsMap = Object.fromEntries(
     (poeMetrics?.ports ?? []).map(p => [p.port, p.watts])
   );
+  // Where PoE can be power-cycled (#291): the device's own list of PoE ports,
+  // not just the ones with power readings (an idle port has none).
+  const { data: poePortList } = useQuery({
+    queryKey: ['poe-ports', deviceId],
+    queryFn: () => devicesApi.getPoePorts(deviceId).then((r) => r.data.ports),
+    staleTime: 300_000,
+    retry: false,
+  });
+  const poeCapable = new Set<string>([...(poePortList ?? []).map((p) => p.name), ...Object.keys(poeWattsMap)]);
 
   // Auto-open bridge config panel when navigated from the VLANs tab warning
   useEffect(() => {
@@ -664,21 +870,32 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
     }
   }, [autoOpenBridge, data?.ports]);
 
+  // Link changes run under Change Guard now (outside review P2-8). A predicted
+  // lockout reruns the whole save with the warning confirmed, so the VLAN step
+  // that follows still happens.
   const updateInterfaceMutation = useMutation({
+    meta: { inlineError: true },
     mutationFn: ({ name, updates }: { name: string; updates: Record<string, unknown> }) =>
       devicesApi.updateInterface(deviceId, name, updates),
-    onSuccess: () => {
+    onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['ports', deviceId] });
       queryClient.invalidateQueries({ queryKey: ['interfaces', deviceId] });
+      const notice = guardOutcomeMessage((res?.data as { guard?: GuardResult } | undefined)?.guard);
+      if (notice?.tone === 'warn') setSaveNotice(notice.text);
     },
     onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setSaveError(msg || 'Failed to update interface');
+      const verdict = lockoutVerdictOf(err);
+      if (verdict) {
+        setLockout({ verdict, retry: () => { setLockout(null); void handleSave(true); } });
+        return;
+      }
+      setSaveError(changeErrorText(err, 'Failed to update interface'));
     },
   });
 
   const updateVlanMutation = useMutation({
-    mutationFn: ({ name, data, confirm }: { name: string; data: { pvid?: number; tagged_vlans?: number[]; untagged_vlans?: number[] }; confirm?: boolean }) =>
+    meta: { inlineError: true },
+    mutationFn: ({ name, data, confirm }: { name: string; data: { pvid?: number; tagged_vlans?: number[]; untagged_vlans?: number[]; mode?: 'access' | 'trunk'; replace_tagged?: boolean }; confirm?: boolean }) =>
       devicesApi.configurePortVlan(deviceId, name, confirm ? { ...data, confirm_lockout: true } : data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['ports', deviceId] });
@@ -690,8 +907,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
         setLockout({ verdict, retry: () => updateVlanMutation.mutate({ ...vars, confirm: true }) });
         return;
       }
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setSaveError(msg || 'Failed to apply VLAN config');
+      setSaveError(changeErrorText(err, 'Failed to apply VLAN config'));
     },
   });
 
@@ -711,13 +927,12 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
         setLockout({ verdict, retry: () => createBondMutation.mutate({ ...vars, confirm_lockout: true }) });
         return;
       }
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setBondError(msg || 'Failed to create bond');
+      setBondError(changeErrorText(err, 'Failed to create bond'));
     },
   });
 
   const updateBondMutation = useMutation({
-    mutationFn: ({ name, d }: { name: string; d: { mode: string; slaves: string[]; lacp_rate?: string; transmit_hash_policy?: string; mtu?: number; min_links?: number } }) =>
+    mutationFn: ({ name, d }: { name: string; d: { mode: string; slaves: string[]; lacp_rate?: string; transmit_hash_policy?: string; mtu?: number; min_links?: number; confirm_lockout?: boolean } }) =>
       devicesApi.updateBond(deviceId, name, d),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['ports', deviceId] });
@@ -725,9 +940,13 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
       setBondError('');
       setLockout(null);
     },
-    onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setBondError(msg || 'Failed to update bond');
+    onError: (err: unknown, vars) => {
+      const verdict = lockoutVerdictOf(err);
+      if (verdict) {
+        setLockout({ verdict, retry: () => updateBondMutation.mutate({ name: vars.name, d: { ...vars.d, confirm_lockout: true } }) });
+        return;
+      }
+      setBondError(changeErrorText(err, 'Failed to update bond'));
     },
   });
 
@@ -753,8 +972,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
         setLockout({ verdict, retry: () => deleteBondMutation.mutate({ name: vars.name, confirm: true }) });
         return;
       }
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setBondError(msg || 'Failed to delete bond');
+      setBondError(changeErrorText(err, 'Failed to delete bond'));
     },
   });
 
@@ -780,27 +998,107 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
         });
         return;
       }
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setBridgeError(msg || 'Failed to update VLAN filtering');
+      setBridgeError(changeErrorText(err, 'Failed to update VLAN filtering'));
+    },
+  });
+
+  // After a change whose outcome is unknown: show what the device has now.
+  const refreshPortsSoon = () => {
+    queryClient.invalidateQueries({ queryKey: ['ports', deviceId] });
+    setTimeout(() => queryClient.invalidateQueries({ queryKey: ['ports', deviceId] }), 15_000);
+  };
+
+  const showGuardNotice = (text: string, guard: GuardResult | undefined, warn = false) => {
+    const g = guardOutcomeMessage(guard);
+    const tone = warn || g?.tone === 'warn' ? 'warn' : 'ok';
+    setGuardNotice({ tone, text: g?.tone === 'warn' ? `${text} ${g.text}` : text });
+    if (tone === 'ok') setTimeout(() => setGuardNotice(null), 6000);
+  };
+
+  const moveBridgeMutation = useMutation({
+    meta: { inlineError: true },
+    mutationFn: (d: Parameters<typeof devicesApi.moveBridgePorts>[1]) => devicesApi.moveBridgePorts(deviceId, d),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['ports', deviceId] });
+      queryClient.invalidateQueries({ queryKey: ['vlans', deviceId] });
+      setMoveOpen(false);
+      setSelectedPorts(new Set());
+      setLockout(null);
+      setAddressWarning(null);
+      const r = res.data;
+      // Read back from the device: the prediction in the dialog is only that.
+      const cpu = Object.entries(r.offload ?? {}).filter(([, hw]) => !hw).map(([p]) => p);
+      const one = cpu.length === 1;
+      // On a slow switch where offload is expected, the flag can appear long
+      // after the move; don't state "CPU" as a fact then (#258).
+      const text = `${r.message}.` + (!cpu.length ? ''
+        : r.offloadPending
+          ? ` ${cpu.join(', ')} ${one ? 'isn’t' : 'aren’t'} reported as hardware switched yet. On a slow switch that can take a minute: check the Bridge column shortly.`
+          : ` ${cpu.join(', ')} ${one ? 'is' : 'are'} switched by the CPU, not the switch chip.`);
+      showGuardNotice(text, r.guard as GuardResult | undefined, cpu.length > 0);
+    },
+    onError: (err: unknown, vars) => {
+      const verdict = lockoutVerdictOf(err);
+      if (verdict) {
+        setLockout({ verdict, retry: () => moveBridgeMutation.mutate({ ...vars, confirm_lockout: true }) });
+        return;
+      }
+      const d = (err as { response?: { data?: { error?: string; code?: string; details?: string[] } } })?.response?.data;
+      if (d?.code === 'ports_have_addresses') { setAddressWarning(d.details?.length ? d.details : [d.error ?? '']); return; }
+      setMoveError(changeErrorText(err, 'Failed to move the ports'));
+      refreshPortsSoon();
+    },
+  });
+
+  const deleteBridgeMutation = useMutation({
+    meta: { inlineError: true },
+    mutationFn: ({ name, confirm = false }: { name: string; confirm?: boolean }) => devicesApi.deleteBridge(deviceId, name, confirm),
+    onSuccess: (res, vars) => {
+      queryClient.invalidateQueries({ queryKey: ['ports', deviceId] });
+      setEditingBridge(null);
+      setConfirmDeleteBridge(null);
+      setLockout(null);
+      showGuardNotice(`Bridge ${vars.name} deleted.`, (res?.data as { guard?: GuardResult } | undefined)?.guard);
+    },
+    onError: (err: unknown, vars) => {
+      setConfirmDeleteBridge(null);
+      const verdict = lockoutVerdictOf(err);
+      if (verdict) {
+        setLockout({ verdict, retry: () => deleteBridgeMutation.mutate({ ...vars, confirm: true }) });
+        return;
+      }
+      setBridgeError(changeErrorText(err, 'Failed to delete the bridge'));
+      refreshPortsSoon();
     },
   });
 
   const ports: SwitchPort[] = data?.ports ?? [];
   const vlans: Vlan[] = data?.vlans ?? [];
 
+  // Bridge membership as RouterOS printed it (#258).
+  const bridgeOf = (p: SwitchPort): string | null => p.bridgeInfo?.bridge || null;
+  const hwOffloaded = (p: SwitchPort): boolean => p.bridgeInfo?.config_json?.['hw-offload'] === 'true';
+  const dynamicBridgePort = (p: SwitchPort): boolean => p.bridgeInfo?.config_json?.['dynamic'] === 'true';
+
   const isBridge = (p: SwitchPort) => p.type === 'bridge';
 
-  const typeOrder = (p: SwitchPort) =>
-    p.name.startsWith('ether') ? 0 : isBridge(p) ? 2 : 1;
-
+  // Ordered by what the port *is* and where it sits on the chassis, via the
+  // factory name. The numeric half of this previously read `p.name`, so a
+  // renamed port sorted by whatever digits its new name happened to contain --
+  // reported as "1, 8, 2, 7, 3, 4, 5, 6" (#146). portSortKey already existed and
+  // was already tested; it simply was never wired in here.
   const sortedPorts = [...ports].sort((a, b) => {
-    const aNum = parseInt(a.name.replace(/\D/g, '') || '0', 10);
-    const bNum = parseInt(b.name.replace(/\D/g, '') || '0', 10);
-    const aType = typeOrder(a);
-    const bType = typeOrder(b);
-    if (aType !== bType) return aType - bType;
-    return aNum - bNum;
+    const ka = portSortKey(a);
+    const kb = portSortKey(b);
+    // Bridges and bonds are not physical ports and belong after them.
+    const rank = (p: SwitchPort, k: number) => (isBridge(p) ? 3 : k);
+    const ra = rank(a, ka[0]);
+    const rb = rank(b, kb[0]);
+    if (ra !== rb) return ra - rb;
+    if (ka[1] !== kb[1]) return ka[1] - kb[1];
+    return ka[2].localeCompare(kb[2], undefined, { numeric: true });
   });
+  const anyComment = ports.some((p) => p.comment || p.bridgeInfo?.config_json?.comment);
 
   const isBond = (p: SwitchPort) => p.type === 'bond';
   const physicalPorts = sortedPorts.filter((p) => !isBridge(p) && !isBond(p));
@@ -814,8 +1112,11 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
     slaves.forEach((s: string) => bondMemberMap.set(s, b.name));
   });
 
-  const etherPorts = physicalPorts.filter((p) => p.name.startsWith('ether'));
-  const sfpPorts   = physicalPorts.filter((p) => !p.name.startsWith('ether'));
+  // By what the port *is*, not what it has been renamed to. The old rule was
+  // `startsWith('ether')` with everything else counted as SFP, so a port renamed
+  // to "starlink1" moved into the SFP group (#146).
+  const etherPorts = physicalPorts.filter((p) => classifyPort(p).kind === 'copper');
+  const sfpPorts   = physicalPorts.filter((p) => classifyPort(p).kind !== 'copper');
   const { cages: qsfpCages, individual: individualSfpPorts } = groupQsfpCages(sfpPorts);
 
   const togglePort = (name: string, e: React.MouseEvent) => {
@@ -855,6 +1156,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
       return;
     }
     setSaveError('');
+    setSaveNotice('');
     const bridgePvid = port.bridgeInfo?.pvid ?? 1;
     const bridgeTagged = port.bridgeInfo?.tagged ?? false;
     setEditingPort(port);
@@ -872,14 +1174,12 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
       pvid: bridgePvid,
       // Prefill from the port's actual tagged membership so opening the dialog and
       // saving does not silently strip the trunk's VLANs.
-      tagged_vlans: (port.bridgeInfo?.tagged_vlan_ids ?? []).join(','),
+      tagged_vlans: formatVlanList((port.bridgeInfo?.tagged_vlan_ids ?? []).map(Number).filter((n) => n > 0)),
     });
   };
 
-  const handleSave = async () => {
-    if (!editingPort) return;
-    setSaveError('');
-
+  /** What a save sends: the link settings, then the port's VLAN role when set. */
+  const portSavePlan = (confirmLockout = false) => {
     const ifaceUpdates: Record<string, unknown> = {
       disabled: editForm.disabled,
       comment: editForm.comment,
@@ -887,10 +1187,10 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
     };
     if (editForm.poe_out) ifaceUpdates.poe_out = editForm.poe_out;
     if (editForm.fec_mode) ifaceUpdates.fec_mode = editForm.fec_mode;
-    if (editForm.tx_flow_control || editForm.rx_flow_control) {
-      ifaceUpdates.tx_flow_control = editForm.tx_flow_control || 'off';
-      ifaceUpdates.rx_flow_control = editForm.rx_flow_control || 'off';
-    }
+    // Each direction only when chosen. Filling the other with 'off' turned off
+    // a direction the operator never touched.
+    if (editForm.tx_flow_control) ifaceUpdates.tx_flow_control = editForm.tx_flow_control;
+    if (editForm.rx_flow_control) ifaceUpdates.rx_flow_control = editForm.rx_flow_control;
     if (editForm.auto_negotiation !== null) {
       ifaceUpdates.auto_negotiation = editForm.auto_negotiation;
       if (!editForm.auto_negotiation && editForm.speed) {
@@ -898,19 +1198,48 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
       }
     }
 
-    await updateInterfaceMutation.mutateAsync({ name: editingPort.name, updates: ifaceUpdates });
+    if (confirmLockout) ifaceUpdates.confirm_lockout = true;
 
+    let vlanData: { pvid?: number; tagged_vlans?: number[]; untagged_vlans?: number[]; mode?: 'access' | 'trunk'; replace_tagged?: boolean } | null = null;
     if (editForm.vlan_mode !== 'none') {
-      const taggedList = editForm.tagged_vlans
-        .split(',')
-        .map((s) => parseInt(s.trim(), 10))
-        .filter((n) => n > 0 && n <= 4094);
+      // parseVlanList understands ranges. The previous split-and-parseInt read
+      // "10-12" as 10 and saved the wrong VLANs without complaint. The native
+      // VLAN is untagged by definition, so it is never also sent as tagged.
+      const taggedList = parseVlanList(editForm.tagged_vlans).filter((n) => n !== editForm.pvid);
 
-      const vlanData = editForm.vlan_mode === 'access'
-        ? { pvid: editForm.pvid, untagged_vlans: [editForm.pvid], tagged_vlans: [] }
-        : { pvid: editForm.pvid, tagged_vlans: taggedList, untagged_vlans: [] };
+      // mode is sent explicitly so the server sets frame-types and
+      // ingress-filtering to match, rather than only the PVID (#151).
+      vlanData = editForm.vlan_mode === 'access'
+        ? { pvid: editForm.pvid, untagged_vlans: [editForm.pvid], tagged_vlans: [], mode: 'access' as const }
+        // replace_tagged: the list is the port's whole tagged set, so an
+        // unticked VLAN is removed rather than quietly left in place (#165).
+        : { pvid: editForm.pvid, tagged_vlans: taggedList, untagged_vlans: [], mode: 'trunk' as const, replace_tagged: true };
+    }
+    return { ifaceUpdates, vlanData };
+  };
 
-      await updateVlanMutation.mutateAsync({ name: editingPort.name, data: vlanData });
+  const handleSave = async (confirmLockout = false) => {
+    if (!editingPort) return;
+    setSaveError('');
+    setSaveNotice('');
+    const { ifaceUpdates, vlanData } = portSavePlan(confirmLockout);
+    try {
+      await updateInterfaceMutation.mutateAsync({ name: editingPort.name, updates: ifaceUpdates });
+    } catch {
+      return; // onError has shown the problem, or opened the lockout dialog
+    }
+
+    if (vlanData) {
+      const res = await updateVlanMutation.mutateAsync({ name: editingPort.name, data: vlanData });
+      const notRemoved = (res?.data as { not_removed?: number[] } | undefined)?.not_removed ?? [];
+      if (notRemoved.length) {
+        // Saved, but not entirely as asked. Keep the editor open so this is seen.
+        setSaveNotice(
+          `Saved, but VLAN${notRemoved.length > 1 ? 's' : ''} ${formatVlanList(notRemoved)} ${notRemoved.length > 1 ? 'are' : 'is'} still tagged on this port. ` +
+          'They share a bridge VLAN entry (a range) with VLANs the port keeps. Split or edit that entry on the VLANs tab to remove them.'
+        );
+        return;
+      }
     }
 
     if (!updateInterfaceMutation.isError && !updateVlanMutation.isError) {
@@ -920,60 +1249,61 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
 
   const isPending = updateInterfaceMutation.isPending || updateVlanMutation.isPending;
 
-  const PORT_W = 32;
-  const PORT_H = 36;
-  const GAP = 4;
-  const PAD = 12;
-  const ROW_GAP = 6;
-  // Use two staggered rows only for larger switches (>8 ports); single row otherwise
-  const doubleRow = etherPorts.length > 8;
-  const topRowPorts = doubleRow ? etherPorts.filter((_, i) => i % 2 === 0) : etherPorts;
-  const bottomRowPorts = doubleRow ? etherPorts.filter((_, i) => i % 2 === 1) : [];
+  // Faceplate density. Every group wraps to the available width now; before,
+  // only ETH wrapped and only ever to two rows, so a device with many ports and
+  // bonds ran off the side behind a scrollbar (#146).
+  //
+  // The geometry lives in utils/faceplateLayout.ts. What used to be here was a
+  // coordinate system for an absolute-positioned faceplate that no longer
+  // exists -- every constant fed only the next one and none reached the render.
+  const [density, setDensity] = useState<Density>(() => {
+    try { return parseDensity(localStorage.getItem('faceplate.density')); }
+    catch { return 'auto'; }
+  });
+  const chooseDensity = (d: Density) => {
+    setDensity(d);
+    try { localStorage.setItem('faceplate.density', String(d)); } catch { /* private mode */ }
+  };
 
-  // Ether section width (including left pad, excluding right pad — right pad shared with SFP divider)
-  const etherCols = topRowPorts.length;
-  const etherSectionW = PAD + etherCols * (PORT_W + GAP);
+  // Measured rather than assumed, so "fit to width" actually fits.
+  const rackRef = useRef<HTMLDivElement | null>(null);
+  const [rackWidth, setRackWidth] = useState(1200);
+  useEffect(() => {
+    const el = rackRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(([entry]) => {
+      const w = entry?.contentRect?.width;
+      if (w) setRackWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  // SFP section: individual (non-breakout) SFP ports
-  const sfpDivider = individualSfpPorts.length > 0 ? 20 : 0;
-  const sfpSectionW = individualSfpPorts.length > 0 ? individualSfpPorts.length * (PORT_W + GAP) + PAD : 0;
+  const columns = resolveColumns(density, rackWidth);
+  // Odd ports on the top row, or even (2 4 6 8 over 1 3 5 7) for models wired
+  // that way (#277). Remembered per model in this browser: every unit of a
+  // model is the same.
+  const modelLayout = lookupModelLayout(deviceModel);
+  const evenTopKey = `faceplate.evenTop.${(deviceModel || 'unknown').toLowerCase()}`;
+  const [evenOnTop, setEvenOnTop] = useState<boolean>(() => {
+    try { return resolveEvenOnTop(localStorage.getItem(evenTopKey), modelLayout); } catch { return resolveEvenOnTop(null, modelLayout); }
+  });
+  const chooseEvenOnTop = (v: boolean) => {
+    setEvenOnTop(v);
+    try { localStorage.setItem(evenTopKey, v ? '1' : '0'); } catch { /* private mode */ }
+  };
+  const etherBanks = staggerBlocks(etherPorts, columns, evenOnTop);
+  // Only offered when the ports actually sit in two rows: a control that moves
+  // nothing reads as broken.
+  const staggered = etherBanks.some((b) => b.bottom.length > 0);
+  const sfpArrangement = arrangeSfp(individualSfpPorts, modelLayout, columns);
+  const cageGroups: StaggerBlock<QsfpCage>[] | null = modelLayout?.qsfpStacked ? stackCages(qsfpCages) : null;
+  const cageRows = cageGroups
+    ? [qsfpCages]
+    : chunkRows(qsfpCages, Math.max(1, Math.floor(columns / 4)));
+  const bridgeRows = chunkRows(bridgePorts, columns);
+  const bondRows = chunkRows(bondPorts, columns);
 
-  // QSFP cage section — each cage renders as a grouped block
-  const CAGE_LABEL_H = 11; // height of cage name label inside cage rect
-  const LANE_W = 20;
-  const LANE_GAP = 3;
-  const CAGE_PAD_X = 3;
-  const CAGE_LANE_H = PORT_H - CAGE_LABEL_H - 2; // lane rect height inside cage
-  const getCageW = (n: number) => n * (LANE_W + LANE_GAP) - LANE_GAP + 2 * CAGE_PAD_X;
-  const qsfpDivider = qsfpCages.length > 0 ? 20 : 0;
-  const qsfpSectionW = qsfpCages.length > 0
-    ? PAD + qsfpCages.reduce((acc, c) => acc + getCageW(c.singlePort ? 4 : c.lanes.length) + GAP, -GAP)
-    : 0;
-
-  // Bridge section: divider gap + ports + right pad
-  const bridgeDivider = bridgePorts.length > 0 ? 20 : 0;
-  const bridgeSectionW = bridgePorts.length > 0 ? bridgePorts.length * (PORT_W + GAP) + PAD : 0;
-
-  // Bond section: divider gap + bond virtual ports + right pad
-  const bondDivider = bondPorts.length > 0 ? 20 : 0;
-  const bondSectionW = bondPorts.length > 0 ? bondPorts.length * (PORT_W + GAP) + PAD : 0;
-
-  const chassisW = Math.max(
-    etherSectionW + sfpDivider + sfpSectionW + qsfpDivider + qsfpSectionW + bridgeDivider + bridgeSectionW + bondDivider + bondSectionW,
-    200,
-  );
-  const chassisH = (doubleRow ? PORT_H * 2 + ROW_GAP : PORT_H) + PAD * 2 + 20;
-
-  const sfpStartX = etherSectionW + sfpDivider;
-  const qsfpStartX = etherSectionW + sfpDivider + sfpSectionW + qsfpDivider;
-  const bridgeStartX = qsfpStartX + qsfpSectionW + bridgeDivider;
-  const bondStartX = bridgeStartX + bridgeSectionW + bondDivider;
-  const topRowY = 20;
-  const bottomRowY = 20 + PORT_H + ROW_GAP;
-  // SFP, QSFP and bridge: center within the ether port area height
-  const etherAreaH = doubleRow ? PORT_H * 2 + ROW_GAP : PORT_H;
-  const sfpY = topRowY + Math.round((etherAreaH - PORT_H) / 2);
-  const bridgeY = sfpY;
 
   if (isLoading) {
     return <div className="flex items-center justify-center h-48 text-gray-400">Loading ports...</div>;
@@ -991,15 +1321,22 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
 
   return (
     <div className="space-y-4">
-      {/* Selection bar */}
+      {/* Selection bar. It overlays the top of the card below instead of
+          taking space in the flow: appearing on the first click of a
+          double-click used to push the faceplate down so the second click
+          missed the tile, and reserving its height left an empty band. */}
+      <div style={{ position: 'relative', height: 0, zIndex: 20 }}>
       {selectedPorts.size > 0 && (() => {
         const singlePort = selectedPorts.size === 1 ? ports.find(p => p.name === Array.from(selectedPorts)[0]) : null;
         const selArr = Array.from(selectedPorts).map(n => ports.find(p => p.name === n)).filter((p): p is SwitchPort => !!p);
         const allEligible = selArr.every(p => !isBridge(p) && !isBond(p) && !bondMemberMap.has(p.name));
+        // Bonds move as one; their members, bridges and ports a service bridged don't (#258).
+        const moveEligible = selArr.length > 0 && selArr.every(p => !isBridge(p) && !bondMemberMap.has(p.name) && !dynamicBridgePort(p));
         return (
           <div style={{
-            background: 'var(--accent-soft)', border: '1px solid var(--accent)',
-            borderRadius: 8, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10,
+            background: 'linear-gradient(var(--accent-soft), var(--accent-soft)), var(--bg)', border: '1px solid var(--accent)',
+            borderRadius: 8, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10, minHeight: 56, boxSizing: 'border-box',
+            position: 'absolute', top: 0, left: 0, right: 0, boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
           }}>
             <span style={{ width: 7, height: 7, borderRadius: 999, background: 'var(--accent)', flexShrink: 0, boxShadow: '0 0 0 2px var(--accent)33, 0 0 8px var(--accent)88' }} />
             <span className="mono text-[12px]" style={{ color: 'var(--accent)' }}>
@@ -1007,7 +1344,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
             </span>
             {singlePort && (
               <span className="text-[12px]" style={{ color: 'var(--ink-2)' }}>
-                selected{singlePort.speed ? ` · ${singlePort.speed}` : ''}{singlePort.mtu ? ` · ${singlePort.mtu} MTU` : ''}{singlePort.running ? ' · link-ok' : ' · link-down'}
+                selected{singlePort.speed ? ` · ${singlePort.speed}` : ''}{singlePort.mtu ? ` · ${singlePort.mtu} MTU` : ''}{singlePort.disabled ? ' · disabled' : singlePort.running ? ' · link-ok' : ' · link-down'}
               </span>
             )}
             <div style={{ flex: 1 }} />
@@ -1023,6 +1360,17 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                 onClick={() => openEditPanel(singlePort)}
               >Configure</button>
             )}
+            {canWrite && singlePort && poeCapable.has(singlePort.name) && (
+              <button
+                className="btn-secondary text-[11px] flex items-center gap-[6px]"
+                style={{ padding: '5px 10px' }}
+                disabled={poeBusy !== null}
+                onClick={() => void powerCycle(singlePort.name)}
+                title="Turn PoE off for 5 seconds, then back on"
+              >
+                <Zap className="w-3 h-3" /> {poeBusy === singlePort.name ? 'Power-cycling…' : 'Power-cycle PoE'}
+              </button>
+            )}
             {canWrite && selectedPorts.size >= 2 && allEligible && (
               <button
                 className="btn-secondary text-[11px] flex items-center gap-[6px]"
@@ -1037,9 +1385,36 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                 <Link2 className="w-3 h-3" /> Create Trunk
               </button>
             )}
+            {canWrite && moveEligible && (
+              <button
+                className="btn-secondary text-[11px] flex items-center gap-[6px]"
+                style={{ padding: '5px 10px' }}
+                onClick={() => {
+                  const current = [...new Set(selArr.map(bridgeOf))];
+                  const firstOther = bridgePorts.map((b) => b.name).find((b) => !current.includes(b));
+                  setMoveTarget(firstOther ?? NEW_BRIDGE);
+                  setNewBridgeName('');
+                  setMoveError('');
+                  setAddressWarning(null);
+                  setLockout(null);
+                  setMoveOpen(true);
+                }}
+              >
+                <Network className="w-3 h-3" /> Move to bridge
+              </button>
+            )}
           </div>
         );
       })()}
+      </div>
+
+      {poeNote && (
+        <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-[12px]"
+          style={{ background: poeNote.ok ? 'var(--good-bg)' : 'var(--bad-bg, #fee2e2)', color: poeNote.ok ? 'var(--good)' : 'var(--bad)' }}>
+          <Zap className="w-3.5 h-3.5" /><span className="flex-1">{poeNote.text}</span>
+          <button type="button" onClick={() => setPoeNote(null)} style={{ opacity: 0.7 }}><X className="w-3.5 h-3.5" /></button>
+        </div>
+      )}
 
       {/* Faceplate card */}
       <div className="card" style={{ padding: '22px 26px', position: 'relative', overflow: 'hidden' }}>
@@ -1049,53 +1424,86 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 18 }}>
             <div>
               <div className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>
-                Switch faceplate · {ports.length} ports
+                Switch faceplate · {physicalPorts.length} physical{bridgePorts.length + bondPorts.length > 0 ? ` · ${bridgePorts.length + bondPorts.length} virtual` : ''}
               </div>
               <div className="mono text-[11px] mt-[2px]" style={{ color: 'var(--ink-3)' }}>
                 click to select · shift for multi · double-click to configure
               </div>
             </div>
-            <div style={{ display: 'flex', gap: 14 }}>
+            <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
               {([['up', 'var(--accent)', ports.filter(p => !p.disabled && p.running).length], ['down', 'var(--bad)', ports.filter(p => !p.disabled && !p.running).length], ['disabled', 'var(--ink-4)', ports.filter(p => p.disabled).length], ['selected', 'var(--accent)', selectedPorts.size]] as [string,string,number][]).map(([l, c, n]) => (
                 <span key={l} className="mono text-[11px]" style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--ink-3)' }}>
                   <span style={{ width: 9, height: 9, borderRadius: 2, background: c, opacity: l === 'disabled' ? 0.4 : 1, flexShrink: 0 }} />
                   {l} <span className="num-tab" style={{ color: 'var(--ink-2)' }}>{n}</span>
                 </span>
               ))}
+              {/* Requested alongside wrapping: "maybe put them in multiple rows,
+                  or make it user customizable". Fit-to-width is the default and
+                  answers the complaint on its own; the fixed densities are for
+                  comparing devices at the same scale. Remembered across
+                  devices, since it is a preference and not a per-device fact. */}
+              <label className="mono text-[11px]" style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--ink-3)' }}>
+                <LayoutGrid className="w-3 h-3" />
+                <select
+                  value={String(density)}
+                  onChange={(e) => chooseDensity(parseDensity(e.target.value))}
+                  className="mono text-[11px] bg-transparent outline-none cursor-pointer"
+                  style={{ color: 'var(--ink-2)' }}
+                  title="How many ports per row"
+                >
+                  {/* The effective count is shown so that "fit to width" is not
+                      mysterious, and so a group that already fits on one row
+                      reads as "nothing needed to change" rather than broken. */}
+                  <option value="auto">{densityLabel('auto', columns)}</option>
+                  {DENSITY_OPTIONS.map((d) => (
+                    <option key={d} value={d}>{densityLabel(d, d)}</option>
+                  ))}
+                </select>
+              </label>
+              {staggered && <label className="mono text-[11px]" style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--ink-3)' }}
+                title="Which ports are on the top row, as on this model's front panel">
+                <select
+                  value={evenOnTop ? 'even' : 'odd'}
+                  onChange={(e) => chooseEvenOnTop(e.target.value === 'even')}
+                  className="mono text-[11px] bg-transparent outline-none cursor-pointer"
+                  style={{ color: 'var(--ink-2)' }}
+                >
+                  <option value="odd">top row 1 3 5</option>
+                  <option value="even">top row 2 4 6</option>
+                </select>
+              </label>}
             </div>
           </div>
 
           {/* Rack unit */}
-          <div style={{
+          <div ref={rackRef} style={{
             background: 'linear-gradient(180deg, var(--faceplate-from), var(--faceplate-to))',
             border: '1px solid var(--faceplate-border)', borderRadius: 8, padding: '22px 26px',
-            display: 'flex', gap: 30, alignItems: 'center', overflowX: 'auto',
+            display: 'flex', gap: 30, alignItems: 'flex-start', flexWrap: 'wrap', rowGap: 22,
             boxShadow: 'inset 0 0 0 2px var(--faceplate-inset), inset 0 1px 0 rgba(255,255,255,0.02)',
           }}>
-            {/* ETH group */}
+            {/* ETH group — staggered banks, odd above even (or the reverse, #277), wrapping by density */}
             {etherPorts.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
                 <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em' }}>ETH</div>
-                {doubleRow ? (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <div style={{ display: 'flex', gap: 4 }}>
-                      {topRowPorts.map(port => (
-                        <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} isMember={bondMemberMap.has(port.name)} watts={poeWattsMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
-                      ))}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {etherBanks.map((bank, bi) => (
+                    <div key={bi} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        {bank.top.map(port => (
+                          <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} isMember={bondMemberMap.has(port.name)} watts={poeWattsMap[port.name]} errors={portErrMap[port.name]} optic={opticMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
+                        ))}
+                      </div>
+                      {bank.bottom.length > 0 && (
+                        <div style={{ display: 'flex', gap: 4 }}>
+                          {bank.bottom.map(port => (
+                            <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} isMember={bondMemberMap.has(port.name)} watts={poeWattsMap[port.name]} errors={portErrMap[port.name]} optic={opticMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <div style={{ display: 'flex', gap: 4 }}>
-                      {bottomRowPorts.map(port => (
-                        <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} isMember={bondMemberMap.has(port.name)} watts={poeWattsMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
-                      ))}
-                    </div>
-                  </div>
-                ) : (
-                  <div style={{ display: 'flex', gap: 4 }}>
-                    {topRowPorts.map(port => (
-                      <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} isMember={bondMemberMap.has(port.name)} watts={poeWattsMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
-                    ))}
-                  </div>
-                )}
+                  ))}
+                </div>
               </div>
             )}
 
@@ -1105,61 +1513,116 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                 <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em', marginBottom: 6 }}>
                   SFP · 1–{individualSfpPorts.length}
                 </div>
-                <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', maxWidth: individualSfpPorts.length * 52 }}>
-                  {individualSfpPorts.map(port => (
-                    <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
-                  ))}
-                </div>
+                {/* Explicit rows. The previous attempt set flexWrap with a
+                    maxWidth of 52px per port against a real 50px per port, so
+                    the wrap could never trigger — it missed by 2px each. */}
+                {sfpArrangement.kind === 'rows' ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {sfpArrangement.rows.map((row, ri) => (
+                      <div key={ri} style={{ display: 'flex', gap: 4 }}>
+                        {row.map(port => (
+                          <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} errors={portErrMap[port.name]} optic={opticMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  /* Model-specific: banks of four, even ports above odd. */
+                  <div style={{ display: 'flex', gap: 10 }}>
+                    {sfpArrangement.banks.map((bank, bi) => (
+                      <div key={bi} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        <div style={{ display: 'flex', gap: 4 }}>
+                          {bank.top.map(port => (
+                            <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} errors={portErrMap[port.name]} optic={opticMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
+                          ))}
+                        </div>
+                        {bank.bottom.length > 0 && (
+                          <div style={{ display: 'flex', gap: 4 }}>
+                            {bank.bottom.map(port => (
+                              <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} errors={portErrMap[port.name]} optic={opticMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
-            {/* QSFP cages */}
-            {qsfpCages.map(cage => {
-              const isSingleMode = !!cage.singlePort;
-              const laneCount = isSingleMode ? 4 : cage.lanes.length;
-              const runningLanes = cage.lanes.filter(p => p.running && !p.disabled).length;
-              const isSingleCable = !isSingleMode && runningLanes === 1;
-              const refPort = cage.singlePort ?? cage.lanes[0];
+            {/* QSFP cages — grouped into rows so a chassis full of cages folds
+                rather than running off the side. Models with stacked cages put
+                the even cage above its odd neighbour. A single-mode cage is one
+                real port, so it draws one box; breakout cages draw their lanes. */}
+            {cageRows.map((cageRow, cri) => (
+            <div key={`cagerow-${cri}`} style={{ display: 'flex', gap: 30, alignItems: 'flex-start' }}>
+            {(cageGroups ?? cageRow.map(c => ({ top: [c], bottom: [] as QsfpCage[] }))).map((group, gi) => (
+              <div key={gi} style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {[...group.top, ...group.bottom].map(cage => {
+              const tiles = cageTiles(cage);
               return (
                 <div key={cage.key}>
                   <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em', marginBottom: 6 }}>{cage.label}</div>
                   <div style={{ display: 'flex', gap: 4 }}>
-                    {Array.from({ length: laneCount }, (_, li) => {
-                      const lane = isSingleMode ? cage.singlePort! : cage.lanes[li];
-                      const visualPort: SwitchPort = (isSingleMode || isSingleCable) ? { ...refPort, running: refPort.running, disabled: refPort.disabled } : lane;
+                    {tiles.map((lane) => {
                       return (
-                        <PortTile key={li} port={visualPort} selected={selectedPorts.has(lane.name)} hovered={hoveredPort === lane.name} watts={poeWattsMap[lane.name]} onClick={e => togglePort(lane.name, e)} onMouseEnter={() => setHoveredPort(lane.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(lane)} />
+                        <PortTile key={lane.name} port={lane} selected={selectedPorts.has(lane.name)} hovered={hoveredPort === lane.name} watts={poeWattsMap[lane.name]} errors={portErrMap[lane.name]} optic={opticMap[lane.name]} onClick={e => togglePort(lane.name, e)} onMouseEnter={() => setHoveredPort(lane.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(lane)} />
                       );
                     })}
                   </div>
                 </div>
               );
-            })}
-
-            {/* Bridge group */}
-            {bridgePorts.length > 0 && (
-              <div style={{ marginLeft: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-                <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em' }}>BRIDGE</div>
-                <div style={{ display: 'flex', gap: 4 }}>
-                  {bridgePorts.map(port => (
-                    <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
-                  ))}
-                </div>
+              })}
               </div>
-            )}
-
-            {/* Bond group */}
-            {bondPorts.length > 0 && (
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-                <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em' }}>BOND</div>
-                <div style={{ display: 'flex', gap: 4 }}>
-                  {bondPorts.map(port => (
-                    <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
-                  ))}
-                </div>
-              </div>
-            )}
+            ))}
+            </div>
+            ))}
           </div>
+
+          {/* Virtual interfaces (bridges, bonds) are not on the front panel, so
+              they get their own strip beneath it instead of flowing in beside
+              the physical ports. */}
+          {(bridgePorts.length > 0 || bondPorts.length > 0) && (
+            <div style={{
+              marginTop: 10, padding: '14px 26px', display: 'flex', gap: 30, alignItems: 'flex-start', flexWrap: 'wrap', rowGap: 18,
+              border: '1px dashed var(--faceplate-border)', borderRadius: 8,
+            }}>
+              <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em', alignSelf: 'center' }}>VIRTUAL</div>
+              {/* Bridge group. marginLeft:auto was removed here — it shoved the
+                  group to the far edge of the row, which once the groups started
+                  wrapping guaranteed a gap the width of the container. */}
+              {bridgePorts.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                  <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em' }}>BRIDGE</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {bridgeRows.map((row, ri) => (
+                      <div key={ri} style={{ display: 'flex', gap: 4 }}>
+                        {row.map(port => (
+                          <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} errors={portErrMap[port.name]} optic={opticMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Bond group */}
+              {bondPorts.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                  <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em' }}>BOND</div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {bondRows.map((row, ri) => (
+                      <div key={ri} style={{ display: 'flex', gap: 4 }}>
+                        {row.map(port => (
+                          <PortTile key={port.name} port={port} selected={selectedPorts.has(port.name)} hovered={hoveredPort === port.name} watts={poeWattsMap[port.name]} errors={portErrMap[port.name]} optic={opticMap[port.name]} onClick={e => togglePort(port.name, e)} onMouseEnter={() => setHoveredPort(port.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(port)} />
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
       </div>
@@ -1186,7 +1649,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                 />
               </div>
               <div className="md:col-span-1">
-                <PortInfoCard deviceId={deviceId} portName={portName} />
+                <PortInfoCard deviceId={deviceId} portName={portName} errors={portErrMap[portName]} errorsPerMin={portErrors?.errors_per_min} flapsPerHour={portErrors?.flaps_per_hour} optic={opticMap[portName]} dropDb={optics?.drop_db} />
               </div>
             </div>
             <PortClientsCard deviceId={deviceId} portName={portName} />
@@ -1194,13 +1657,13 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
         );
       })()}
 
-      {/* Port table */}
+      {/* Port table. The Comment column only shows when some port has one (#290). */}
       <div className="card overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr style={{ borderBottom: '1px solid var(--line)' }}>
-                {['PORT', 'STATUS', 'SPEED', 'MTU', 'PVID', 'MAC', 'COMMENT', ''].map((h, i) => (
+                {['PORT', 'STATUS', 'SPEED', 'MTU', 'PVID', 'BRIDGE', 'MAC', ...(anyComment ? ['COMMENT'] : []), ''].map((h, i) => (
                   <th key={i} className="table-header px-4 py-[10px] text-left">{h}</th>
                 ))}
               </tr>
@@ -1225,6 +1688,14 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                     <td className="px-4 py-[10px]">
                       <div className="flex items-center gap-[6px]">
                         <span className="mono text-[12px] font-medium" style={{ color: 'var(--ink)' }}>{port.name}</span>
+                        {/* Only shown when renamed. Printing it always would be
+                            noise on the overwhelming majority of ports. */}
+                        {port.default_name && port.default_name !== port.name && (
+                          <span className="mono text-[10px]" style={{ color: 'var(--ink-4)' }}
+                                title="Factory name — used for grouping, ordering and labelling">
+                            {port.default_name}
+                          </span>
+                        )}
                         {bondMemberMap.has(port.name) && (
                           <span className="mono text-[9.5px] px-[5px] py-[2px] rounded" style={{ background: 'var(--warn-bg)', color: 'var(--warn)' }}>
                             {bondMemberMap.get(port.name)}
@@ -1241,12 +1712,61 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                         {port.disabled ? 'Disabled' : port.running ? 'Up' : 'Down'}
                       </span>
                     </td>
-                    <td className="px-4 py-[10px]"><span className="mono text-[11.5px]" style={{ color: 'var(--ink-3)' }}>{port.speed || '—'}</span></td>
+                    {/* link_rate is the negotiated speed from monitor. The old
+                        `speed` field was read from /interface/print, which does
+                        not carry one, so this column was always empty (#146). */}
+                    <td className="px-4 py-[10px]">
+                      <span className="mono text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
+                        {port.link_rate || port.speed || '—'}
+                      </span>
+                      {port.sfp_present && (port.sfp_type || port.sfp_vendor) && (
+                        <div className="mono text-[10px]" style={{ color: 'var(--ink-4)' }}
+                             title={[port.sfp_type, port.sfp_connector, port.sfp_vendor].filter(Boolean).join(' · ')}>
+                          {port.sfp_vendor || port.sfp_type}
+                        </div>
+                      )}
+                      {port.sfp_present === false && (
+                        <div className="mono text-[10px]" style={{ color: 'var(--ink-4)' }}>empty cage</div>
+                      )}
+                    </td>
                     <td className="px-4 py-[10px]"><span className="mono num-tab text-[11.5px]" style={{ color: 'var(--ink-3)' }}>{port.mtu || '—'}</span></td>
                     <td className="px-4 py-[10px]"><span className="mono num-tab text-[11.5px]" style={{ color: 'var(--ink-3)' }}>{port.bridgeInfo?.pvid ?? '—'}</span></td>
-                    <td className="px-4 py-[10px]"><span className="mono text-[11px]" style={{ color: 'var(--ink-4)' }}>{port.mac_address || '—'}</span></td>
-                    <td className="px-4 py-[10px]"><span className="text-[12px]" style={{ color: 'var(--ink-3)' }}>{port.comment || '—'}</span></td>
                     <td className="px-4 py-[10px]">
+                      {bridgeOf(port) ? (
+                        <span className="inline-flex items-center gap-[6px]">
+                          <span className="mono text-[11.5px]" style={{ color: 'var(--ink-3)' }}>{bridgeOf(port)}</span>
+                          {hwOffloaded(port)
+                            ? <span className="mono text-[9.5px] px-[5px] py-[1px] rounded" style={{ background: 'var(--good-bg)', color: 'var(--good)' }}
+                                title="Hardware offloaded: switched by the switch chip">HW</span>
+                            : <span className="mono text-[9.5px] px-[5px] py-[1px] rounded" style={{ background: 'var(--surface-2)', color: 'var(--ink-4)' }}
+                                title="Not hardware offloaded: traffic between this port and the rest of the bridge goes through the CPU">CPU</span>}
+                        </span>
+                      ) : <span className="mono text-[11.5px]" style={{ color: 'var(--ink-4)' }}>—</span>}
+                    </td>
+                    <td className="px-4 py-[10px]"><span className="mono text-[11px]" style={{ color: 'var(--ink-4)' }}>{port.mac_address || '—'}</span></td>
+                    {/* The interface's own comment, or else the bridge port's (Bridge → Ports in
+                        WinBox), which is where many people put them (#290). */}
+                    {anyComment && <td className="px-4 py-[10px]">
+                      {port.comment
+                        ? <span className="text-[12px]" style={{ color: 'var(--ink-3)' }}>{port.comment}</span>
+                        : port.bridgeInfo?.config_json?.comment
+                          ? <span className="text-[12px]" style={{ color: 'var(--ink-3)' }} title="Comment on the bridge port (Bridge → Ports)">{port.bridgeInfo.config_json.comment}</span>
+                          : <span className="text-[12px]" style={{ color: 'var(--ink-3)' }}>—</span>}
+                    </td>}
+                    <td className="px-4 py-[10px] whitespace-nowrap">
+                      {canWrite && poeCapable.has(port.name) && (
+                        <button
+                          className="p-1 rounded transition-colors disabled:opacity-40"
+                          style={{ color: poeBusy === port.name ? 'var(--warn)' : 'var(--ink-4)' }}
+                          onMouseEnter={e => (e.currentTarget.style.color = 'var(--warn)')}
+                          onMouseLeave={e => (e.currentTarget.style.color = poeBusy === port.name ? 'var(--warn)' : 'var(--ink-4)')}
+                          disabled={poeBusy !== null}
+                          onClick={(e) => { e.stopPropagation(); void powerCycle(port.name); }}
+                          title="Power-cycle PoE: off for 5 seconds, then back on"
+                        >
+                          <Zap className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                       {canWrite && (
                         <button
                           className="p-1 rounded transition-colors"
@@ -1312,6 +1832,12 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                       onChange={(e) => setEditForm((f) => ({ ...f, comment: e.target.value }))}
                       placeholder="Port description..."
                     />
+                    {/* This edits the interface's comment; say so when the bridge port has its own (#290). */}
+                    {editingPort?.bridgeInfo?.config_json?.comment && (
+                      <p className="text-[11px] mt-1" style={{ color: 'var(--ink-4)' }}>
+                        The bridge port also has a comment: <span className="mono">{editingPort.bridgeInfo.config_json.comment}</span>. This field is the interface&apos;s own comment.
+                      </p>
+                    )}
                   </div>
 
                   <div>
@@ -1507,7 +2033,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                             }
                           >
                             <option value={1}>1 (default)</option>
-                            {vlans.map((v) => (
+                            {vlans.filter((v) => v.vlan_id !== 1).map((v) => (
                               <option key={v.vlan_id} value={v.vlan_id}>
                                 {v.vlan_id} — {v.name || `VLAN ${v.vlan_id}`}
                               </option>
@@ -1515,17 +2041,53 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                           </select>
                         </div>
                         <div>
-                          <label className="label">Tagged VLANs (comma-separated IDs)</label>
+                          <label className="label">Tagged VLANs</label>
+                          {/* Checkboxes for the VLANs this device knows (#165). The
+                              native VLAN is greyed out: it is carried untagged, so
+                              tagging it too would be a misconfiguration. */}
+                          <div className="flex flex-wrap gap-1.5 mb-2">
+                            {[...vlans].sort((a, b) => a.vlan_id - b.vlan_id).map((v) => {
+                              const native = v.vlan_id === editForm.pvid;
+                              // RouterOS-generated names ("VLAN 100") only repeat the number.
+                              const label = v.name && v.name.trim() !== `VLAN ${v.vlan_id}` ? v.name : '';
+                              const on = !native && parseVlanList(editForm.tagged_vlans).includes(v.vlan_id);
+                              return (
+                                <label
+                                  key={v.vlan_id}
+                                  title={native ? 'Native VLAN (PVID), carried untagged' : v.name || `VLAN ${v.vlan_id}`}
+                                  className={clsx(
+                                    'flex items-center gap-1.5 px-2 py-1 rounded border text-xs select-none',
+                                    native ? 'opacity-40 cursor-not-allowed border-gray-200 dark:border-slate-700'
+                                      : on ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/30 cursor-pointer'
+                                      : 'border-gray-200 dark:border-slate-700 cursor-pointer'
+                                  )}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    className="w-3.5 h-3.5"
+                                    checked={on}
+                                    disabled={native}
+                                    onChange={() =>
+                                      setEditForm((f) => ({ ...f, tagged_vlans: toggleVlan(f.tagged_vlans, v.vlan_id) }))
+                                    }
+                                  />
+                                  <span className="mono">{v.vlan_id}</span>
+                                  {label && <span className="text-gray-500 dark:text-slate-400">{label}</span>}
+                                </label>
+                              );
+                            })}
+                          </div>
                           <input
                             className="input font-mono"
                             value={editForm.tagged_vlans}
                             onChange={(e) =>
                               setEditForm((f) => ({ ...f, tagged_vlans: e.target.value }))
                             }
-                            placeholder="e.g. 10, 20, 30"
+                            placeholder="e.g. 10,20,100-110"
                           />
                           <div className="text-xs text-gray-400 mt-1">
-                            Available VLANs: {vlans.map((v) => v.vlan_id).join(', ')}
+                            The same list as text, for copying between switches. Ranges like 100-110
+                            are accepted. VLANs not listed above are created on the bridge when saved.
                           </div>
                         </div>
                       </>
@@ -1533,6 +2095,13 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                   </div>
                 )}
               </div>
+
+              {saveNotice && (
+                <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg">
+                  <AlertCircle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                  <p className="text-sm text-amber-700 dark:text-amber-300">{saveNotice}</p>
+                </div>
+              )}
 
               {saveError && (
                 <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
@@ -1543,8 +2112,20 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
 
               <div className="flex items-center justify-end gap-3 pt-2">
                 <button onClick={() => setEditingPort(null)} className="btn-secondary">Cancel</button>
+                <ReviewChangesButton
+                  deviceName={deviceName} disabled={isPending} applyLabel="Apply"
+                  onApply={() => { void handleSave(); }}
+                  requests={() => {
+                    const name = editingPort.name;
+                    const { ifaceUpdates, vlanData } = portSavePlan();
+                    return [
+                      () => devicesApi.updateInterface(deviceId, name, ifaceUpdates),
+                      ...(vlanData ? [() => devicesApi.configurePortVlan(deviceId, name, vlanData)] : []),
+                    ];
+                  }}
+                />
                 <button
-                  onClick={handleSave}
+                  onClick={() => { void handleSave(); }}
                   disabled={isPending}
                   className="btn-primary flex items-center gap-2"
                 >
@@ -1878,6 +2459,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
           editingBridge.config_json?.['vlan-filtering'] === 'true' ||
           editingBridge.config_json?.['vlan-filtering'] === 'yes';
         const isPending = setBridgeVlanFilteringMutation.isPending;
+        const members = ports.filter((p) => bridgeOf(p) === editingBridge.name);
 
         return (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
@@ -1933,6 +2515,24 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                   </div>
                 </div>
 
+                <div>
+                  <h4 className="text-xs font-semibold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-2">
+                    Ports
+                  </h4>
+                  {members.length ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {members.map((p) => (
+                        <span key={p.name} className="mono text-[11px] px-2 py-[3px] rounded border border-gray-200 dark:border-slate-700 text-gray-700 dark:text-slate-200"
+                          title={hwOffloaded(p) ? 'Hardware offloaded' : 'Switched by the CPU'}>
+                          {p.name}{hwOffloaded(p) ? '' : ' · CPU'}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-gray-500 dark:text-slate-400">No ports. Select ports on the faceplate and use Move to bridge.</p>
+                  )}
+                </div>
+
                 {bridgeError && (
                   <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
                     <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
@@ -1940,7 +2540,17 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
                   </div>
                 )}
 
-                <div className="flex justify-end pt-1">
+                <div className="flex items-center justify-between pt-1">
+                  {canWrite ? (
+                    <button
+                      onClick={() => { setBridgeError(''); setConfirmDeleteBridge(editingBridge.name); }}
+                      disabled={members.length > 0 || deleteBridgeMutation.isPending}
+                      title={members.length > 0 ? 'Move its ports out first' : undefined}
+                      className="btn-secondary text-red-600 dark:text-red-400 flex items-center gap-1.5 disabled:opacity-50"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Delete bridge
+                    </button>
+                  ) : <span />}
                   <button onClick={() => setEditingBridge(null)} className="btn-secondary">
                     Close
                   </button>
@@ -1951,8 +2561,136 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
         );
       })()}
 
+      {/* Move ports to a bridge (#258) */}
+      {moveOpen && (() => {
+        const moving = Array.from(selectedPorts).map((n) => ports.find((p) => p.name === n)).filter((p): p is SwitchPort => !!p);
+        const creating = moveTarget === NEW_BRIDGE;
+        const target = moveTarget === NO_BRIDGE ? null : creating ? newBridgeName.trim() : moveTarget;
+        // A prediction from what RouterOS reports now; the result is read back after.
+        const offloadedElsewhere = [...new Set(ports.filter((p) => hwOffloaded(p) && bridgeOf(p) && bridgeOf(p) !== target).map((p) => bridgeOf(p)!))];
+        const targetOffloaded = !creating && !!target && ports.some((p) => bridgeOf(p) === target && hwOffloaded(p));
+        // Switch chips hardware-switch one bridge. MikroTik documents CRS1xx/2xx
+        // as able to do several, but a CRS112 on 7.24.5 didn't (#258).
+        const hwWarn = !!target && !targetOffloaded && offloadedElsewhere.length > 0;
+        const payload = {
+          ports: moving.map((p) => p.name),
+          bridge: target,
+          ...(creating ? { create_bridge: true } : {}),
+        };
+        const canSubmit = moving.length > 0 && moveTarget !== '' && (!creating || target !== '');
+        const pending = moveBridgeMutation.isPending;
+        const submit = (confirmAddresses = false) => {
+          setMoveError('');
+          moveBridgeMutation.mutate({ ...payload, ...(confirmAddresses ? { confirm_addresses: true } : {}) });
+        };
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+            <div className="card w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
+              <div className="flex items-center justify-between p-5 border-b border-gray-200 dark:border-slate-700">
+                <h3 className="font-semibold text-gray-900 dark:text-white flex items-center gap-2">
+                  <Network className="w-4 h-4 text-blue-500" />
+                  Move to bridge
+                </h3>
+                <button onClick={() => setMoveOpen(false)} className="text-gray-400 hover:text-gray-600">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="p-5 space-y-4">
+                <div>
+                  <div className="text-xs font-semibold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-2">Ports</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {moving.map((p) => (
+                      <span key={p.name} className="mono text-[11px] px-2 py-[3px] rounded border border-gray-200 dark:border-slate-700 text-gray-700 dark:text-slate-200">
+                        {p.name}<span className="text-gray-400 dark:text-slate-500"> · {bridgeOf(p) ?? 'no bridge'}</span>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="label">Move to</label>
+                  <select className="input" value={moveTarget} onChange={(e) => { setMoveTarget(e.target.value); setAddressWarning(null); setMoveError(''); }}>
+                    {bridgePorts.map((b) => <option key={b.name} value={b.name}>{b.name}</option>)}
+                    <option value={NEW_BRIDGE}>New bridge…</option>
+                    <option value={NO_BRIDGE}>No bridge (take them out)</option>
+                  </select>
+                </div>
+                {creating && (
+                  <div>
+                    <label className="label">New bridge name</label>
+                    <input className="input" value={newBridgeName} maxLength={32} placeholder="bridge-iot"
+                      onChange={(e) => setNewBridgeName(e.target.value)} />
+                    <p className="text-[11px] text-gray-500 dark:text-slate-400 mt-1">Created with RSTP and VLAN filtering off.</p>
+                  </div>
+                )}
+                {moveTarget === NO_BRIDGE && (
+                  <p className="text-xs text-gray-600 dark:text-slate-300">
+                    Out of every bridge, a port stops switching with the others. That’s what you want for a routed port with an address of its own, such as a WAN port.
+                  </p>
+                )}
+                {hwWarn && (
+                  <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-300 dark:border-amber-700">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                    <p className="text-xs text-amber-800 dark:text-amber-300">
+                      The switch chip on this device hardware-switches one bridge, and that’s {offloadedElsewhere.join(', ')}.
+                      Ports in {target || 'the new bridge'} will most likely be switched by the CPU: slower, with CPU load rising with traffic.
+                      To keep networks apart on one switch chip, VLANs on a single bridge keep hardware switching.
+                    </p>
+                  </div>
+                )}
+                {addressWarning && (
+                  <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 space-y-2">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+                      <div className="text-xs text-red-700 dark:text-red-300">
+                        {addressWarning.map((w) => <div key={w}>{w}.</div>)}
+                        <div className="mt-1">An address on a port stops working once the port is in a bridge. On a router this is how a WAN port ends up cut off.</div>
+                      </div>
+                    </div>
+                    <div className="flex justify-end">
+                      <button className="btn-danger text-xs" disabled={pending} onClick={() => submit(true)}>Move anyway</button>
+                    </div>
+                  </div>
+                )}
+                {moveError && (
+                  <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                    <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+                    <p className="text-sm text-red-600 dark:text-red-400">{moveError}</p>
+                  </div>
+                )}
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button onClick={() => setMoveOpen(false)} className="btn-secondary">Cancel</button>
+                  <ReviewChangesButton
+                    deviceName={deviceName} disabled={pending || !canSubmit} applyLabel="Move"
+                    onApply={() => submit()}
+                    request={() => devicesApi.moveBridgePorts(deviceId, { ...payload, confirm_addresses: true })}
+                  />
+                  <button className="btn-primary flex items-center gap-2" disabled={pending || !canSubmit || !!addressWarning} onClick={() => submit()}>
+                    {pending ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                    Move
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {confirmDeleteBridge && (
+        <ChangeGuardDialog
+          deviceId={deviceId}
+          title="Delete bridge?"
+          description={`Bridge "${confirmDeleteBridge}" will be removed. It has no ports, addresses, VLAN interfaces or DHCP server.`}
+          reason="Only an empty bridge can be deleted here, so nothing that forwards traffic goes with it."
+          confirmLabel="Delete bridge"
+          pending={deleteBridgeMutation.isPending}
+          onConfirm={() => deleteBridgeMutation.mutate({ name: confirmDeleteBridge })}
+          onCancel={() => setConfirmDeleteBridge(null)}
+        />
+      )}
+
       {confirmDestroyBond && (
         <ChangeGuardDialog
+          deviceId={deviceId}
           title="Destroy bond?"
           description={`Bond "${confirmDestroyBond}" will be removed and its member ports released as individual interfaces.`}
           reason={
@@ -1968,11 +2706,13 @@ export default function SwitchPortDiagram({ deviceId, deviceName, autoOpenBridge
 
       {lockout && (
         <LockoutVerdictDialog
+          deviceId={deviceId}
           verdict={lockout.verdict}
           confirmPhrase={deviceName || 'confirm'}
           pending={
             updateVlanMutation.isPending || createBondMutation.isPending
             || deleteBondMutation.isPending || setBridgeVlanFilteringMutation.isPending
+            || moveBridgeMutation.isPending || deleteBridgeMutation.isPending
           }
           onConfirm={lockout.retry}
           onCancel={() => setLockout(null)}

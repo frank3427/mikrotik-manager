@@ -10,8 +10,9 @@ The platform models the controller relationship instead.
 
 ## Device roles
 
-Every device is classified each poll from `/interface/wifi/capsman` and
-`/interface/wifi/cap`:
+Every device is classified from `/interface/wifi/capsman` and `/interface/wifi/cap`, and
+for legacy CAPsMAN from `/caps-man/manager` and `/interface/wireless/cap`
+(see [Legacy CAPsMAN](#legacy-capsman)):
 
 | Role | Meaning |
 |---|---|
@@ -25,6 +26,17 @@ The role is detected, not inferred from `device_type`. That matters because a de
 controller is usually classified as a router, and `device_type` is a label a human typed
 rather than a fact about the hardware. The Radios tab and the wireless section follow the
 detected role.
+
+A device found to have no wireless role (`none`) is checked again about once a day, and on a
+manual **Sync**, so a router where CAPsMAN is switched on after it was added becomes a
+controller (#365). A check where the device didn't answer, or answered with an error other than
+"no such command", isn't recorded.
+
+A recorded role only changes when two checks in a row agree. Until then the device keeps its role,
+and a controller keeps its list of CAPs and radios. One bad read after a restart turned working
+controllers into `none` and moved their clients back onto them (#365). A controller where CAPsMAN
+really is switched off shows as `none` after the next slow poll (about 5 minutes), or a second
+**Sync**.
 
 ## How CAPs are matched to devices
 
@@ -63,6 +75,25 @@ know them:
   radio by following `master-interface`, since clients register on the virtual AP carrying
   the SSID rather than on the physical radio.
 
+**Clients are shown on the access point they're connected to**, even when the controller
+is the one listing them (#365). With traffic processed on the controller, its
+registration table names each CAP radio by the controller's copy of it (`WAP-5Ghz`). The
+client list, client detail, the AP density chart and the topology map put the client on
+the CAP that radio lives on, on the CAP's own interface for it (`wifi2_5Ghz`), with the
+CAP's way up as its connection path. A client on a virtual AP, such as a guest SSID,
+moves to the CAP too and keeps the controller's interface name. If the CAP isn't a
+managed device, the client stays on the controller.
+
+A controller with radios of its own (`controller_cap`) is listed with its own clients. Its copies
+of its CAPs' interfaces hold the CAPs' clients, and those are counted on the CAPs.
+
+**A controller with no radios of its own isn't an access point.** It has its own section
+on the Wireless page, and isn't counted in **Total APs** or listed in the **Access
+Points** table. In **Channel Usage**, the controller's copy of a CAP radio is left out
+when the CAP is a managed device, since the CAP's own entry shows that radio. If the CAP
+isn't managed, the copy is the only view of that radio, so it stays, grouped under its
+controller.
+
 ## Write protection
 
 A provisioned radio is owned by the controller, so a local write to it is either rejected
@@ -80,8 +111,34 @@ simultaneously — the fleet-wide version of the failure [Change Guard](change-g
 exists to prevent. Those operations are held back until they carry the same
 prediction-and-revert protection that per-device changes do.
 
-Legacy `/caps-man` — the pre-RouterOS 7 controller — is a separate API tree and is not
-covered. The RouterOS 7 `wifi` stack is supported.
+## Legacy CAPsMAN
+
+The original CAPsMAN (`/caps-man`, from the `wireless` package) is supported too (#250).
+Older 802.11n and 802.11ac wave 1 access points (RB951, hAP ac lite, cAP ac and similar)
+can only be CAPs of this one, often managed from a CHR.
+
+- **Controller:** a device with `/caps-man manager` enabled is a controller, even when it
+  also has the newer `wifi` menu, as every RouterOS 7.24 device does. A controller can run
+  both CAPsMANs at once (newer APs on one, legacy APs on the other); both are read, and
+  their radios and clients are listed together.
+- **Radios and APs:** read from `/caps-man interface` and matched to access points by MAC,
+  the same way as the newer CAPsMAN. The Wireless page and the CAPsMAN panel show them
+  without any difference.
+- **Clients:** under legacy CAPsMAN only the controller lists the clients
+  (`/caps-man registration-table`); the access point's own table stays empty. They're
+  read from the controller with their signal, traffic and last known address, named by
+  the comment given to them there when DHCP doesn't name them. A client on one of a
+  managed access point's radios is shown on that access point. One on a virtual
+  interface, or on an access point that isn't managed, is shown on the controller.
+- **The CAP:** an access point whose `/interface wireless cap` is enabled is a CAP. The
+  interfaces it hands to the controller are marked as managed by CAPsMAN and show the SSID
+  from the controller rather than the AP's own, unused settings.
+
+Devices classified before this was added are checked once more, so an existing legacy
+controller is found after upgrading.
+
+Developed against the #250 reporter's CHR and RB951Ui-2HnD output (RouterOS 7.24.5). It
+hasn't been run against RouterOS 6.
 
 ## Roaming history
 

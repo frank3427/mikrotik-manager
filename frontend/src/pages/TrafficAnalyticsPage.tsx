@@ -1,11 +1,14 @@
 import { useState } from 'react';
+import { useRememberedRange } from '../hooks/useRememberedRange';
 import { Link } from 'react-router-dom';
+import LoadError from '../components/common/LoadError';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend,
 } from 'recharts';
+import { chartTooltip, pieTooltip } from '../components/common/chartTooltip';
 import { Activity, ArrowDown, ArrowUp, BarChart3, Router as RouterIcon, Settings2, AlertTriangle } from 'lucide-react';
 import { format, parseISO, formatDistanceToNow } from 'date-fns';
 import clsx from 'clsx';
@@ -53,22 +56,29 @@ function clientLabel(c: { mac: string; custom_name: string | null; hostname: str
 }
 
 export default function TrafficAnalyticsPage() {
-  const [range, setRange] = useState<Range>('24h');
+  const [range, setRange] = useRememberedRange<Range>('traffic-analytics', '24h', RANGES);
+  // Top Talkers was a fixed list of ten with no way to look anything up, which
+  // is unusable on a network of any size — you could see the loudest ten and
+  // nothing else. Filtering happens client-side because the rows are already
+  // here; asking the server again per keystroke would be slower and no more
+  // accurate.
+  const [clientQuery, setClientQuery] = useState('');
+  const [topLimit, setTopLimit] = useState(10);
   const navigate = useNavigate();
 
-  const { data: series = [], isLoading: seriesLoading } = useQuery({
+  const { data: series = [], isLoading: seriesLoading, isError: seriesError, error: seriesErr } = useQuery({
     queryKey: ['traffic-timeseries', range],
     queryFn: () => trafficApi.timeseries(range).then(r => r.data),
     refetchInterval: 60_000,
   });
 
-  const { data: topClients = [], isLoading: clientsLoading } = useQuery({
-    queryKey: ['traffic-top-clients', range],
-    queryFn: () => trafficApi.topClients(range, 10).then(r => r.data),
+  const { data: topClients = [], isLoading: clientsLoading, isError: clientsError } = useQuery({
+    queryKey: ['traffic-top-clients', range, topLimit],
+    queryFn: () => trafficApi.topClients(range, topLimit).then(r => r.data),
     refetchInterval: 60_000,
   });
 
-  const { data: apps = [], isLoading: appsLoading } = useQuery({
+  const { data: apps = [], isLoading: appsLoading, isError: appsError } = useQuery({
     queryKey: ['traffic-apps', range],
     queryFn: () => trafficApi.apps(range).then(r => r.data),
     refetchInterval: 60_000,
@@ -87,6 +97,17 @@ export default function TrafficAnalyticsPage() {
   const totalDownload = series.reduce((s, p) => s + p.download, 0);
   const totalAppBytes = apps.reduce((s, a) => s + a.bytes, 0);
   const maxClientBytes = topClients[0]?.total_bytes || 1;
+
+  // Match on anything the row actually shows — name, IP, MAC or vendor — so a
+  // search for "192.168.1." or "apple" both behave the way people expect.
+  const visibleClients = (() => {
+    const q = clientQuery.trim().toLowerCase();
+    if (!q) return topClients;
+    return topClients.filter((c) =>
+      [clientLabel(c), c.ip_address, c.mac, c.vendor]
+        .some((v) => v && String(v).toLowerCase().includes(q))
+    );
+  })();
 
   // Collector data-health: how much of the received traffic we could attribute
   const exporters = [...(status?.exporters || [])].sort((a, b) => b.flows - a.flows);
@@ -129,7 +150,12 @@ export default function TrafficAnalyticsPage() {
       </div>
 
       {/* Empty state */}
-      {!isLoading && !hasData && (
+      {/* A failed read is an error, not "set up NetFlow" (outside review J3). */}
+      {(seriesError || clientsError || appsError) && (
+        <div className="card"><LoadError what="traffic data" error={seriesErr} /></div>
+      )}
+
+      {!isLoading && !hasData && !(seriesError || clientsError || appsError) && (
         <div className="card p-12 text-center space-y-3">
           <Activity className="w-10 h-10 mx-auto text-gray-300 dark:text-slate-600" />
           <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">No traffic data yet</h2>
@@ -189,6 +215,7 @@ export default function TrafficAnalyticsPage() {
                 <Tooltip
                   labelFormatter={t => { try { return format(parseISO(String(t)), 'MMM d, HH:mm'); } catch { return String(t); } }}
                   formatter={(value: number, name: string) => [formatBytes(value), name === 'download' ? 'Download' : 'Upload']}
+                  {...chartTooltip}
                 />
                 <Legend formatter={(v: string) => (v === 'download' ? 'Download' : 'Upload')} />
                 <Area type="monotone" dataKey="download" stroke="#3b82f6" fill="url(#dl)" strokeWidth={2} />
@@ -214,6 +241,7 @@ export default function TrafficAnalyticsPage() {
                 <Tooltip
                   labelFormatter={t => { try { return format(parseISO(String(t)), 'MMM d, HH:mm'); } catch { return String(t); } }}
                   formatter={(value: number) => [`${formatCount(value)} pkts`, 'Inbound']}
+                  {...chartTooltip}
                 />
                 <Area type="monotone" dataKey="downloadPackets" stroke="#10b981" fill="url(#pktIn)" strokeWidth={2} />
               </AreaChart>
@@ -223,15 +251,42 @@ export default function TrafficAnalyticsPage() {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
             {/* Top talkers */}
             <div className="card overflow-hidden">
-              <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2">
-                <BarChart3 className="w-4 h-4 text-blue-500" />
-                <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Top Talkers</h2>
+              <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 space-y-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <BarChart3 className="w-4 h-4 text-blue-500" />
+                  <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Top Talkers</h2>
+                  <span className="text-xs text-gray-400 dark:text-slate-500 ml-auto">
+                    {clientQuery.trim()
+                      ? `${visibleClients.length} of ${topClients.length}`
+                      : `top ${topClients.length}`}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    value={clientQuery}
+                    onChange={(e) => setClientQuery(e.target.value)}
+                    placeholder="Filter by IP, name, MAC or vendor…"
+                    className="input text-xs py-1 flex-1 min-w-0"
+                  />
+                  <select
+                    value={topLimit}
+                    onChange={(e) => setTopLimit(Number(e.target.value))}
+                    className="input text-xs py-1 w-auto"
+                    title="How many clients to rank"
+                  >
+                    {[10, 25, 50].map((n) => <option key={n} value={n}>Top {n}</option>)}
+                  </select>
+                </div>
               </div>
               {topClients.length === 0
                 ? <div className="p-6 text-center text-sm text-gray-400 dark:text-slate-500">No client traffic recorded.</div>
+                : visibleClients.length === 0
+                ? <div className="p-6 text-center text-sm text-gray-400 dark:text-slate-500">
+                    No client in the top {topClients.length} matches “{clientQuery.trim()}”.
+                  </div>
                 : (
                   <div className="divide-y divide-gray-100 dark:divide-slate-800">
-                    {topClients.map(c => {
+                    {visibleClients.map(c => {
                       const isReal = c.mac !== 'unknown' && c.mac !== 'other';
                       return (
                         <div key={c.mac}
@@ -286,6 +341,7 @@ export default function TrafficAnalyticsPage() {
                               `${formatBytes(value)}${totalAppBytes > 0 ? ` · ${((value / totalAppBytes) * 100).toFixed(1)}%` : ''}`,
                               name,
                             ]}
+                            {...pieTooltip}
                           />
                         </PieChart>
                       </ResponsiveContainer>
@@ -328,18 +384,25 @@ export default function TrafficAnalyticsPage() {
               </span>
             </div>
             <div className="p-5 space-y-4">
+              {/* The charts and the sources below follow the site selector; the
+                  collector's own counters cover everything it receives (#236). */}
+              {status?.site_filtered && (
+                <p className="text-xs text-gray-400 dark:text-slate-500">
+                  Showing this site&apos;s flow sources. Packet and attribution counts cover the whole collector.
+                </p>
+              )}
               {/* Health summary */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                 <div>
-                  <div className="text-xs text-gray-400 dark:text-slate-500">Packets received</div>
+                  <div className="text-xs text-gray-400 dark:text-slate-500">Packets received{status?.site_filtered ? ' (all sites)' : ''}</div>
                   <div className="text-base font-bold text-gray-900 dark:text-white">{formatCount(pktReceived)}</div>
                 </div>
                 <div>
-                  <div className="text-xs text-gray-400 dark:text-slate-500">Flows attributed</div>
+                  <div className="text-xs text-gray-400 dark:text-slate-500">Flows attributed{status?.site_filtered ? ' (all sites)' : ''}</div>
                   <div className="text-base font-bold text-gray-900 dark:text-white">{formatCount(status?.flowsAttributed || 0)}</div>
                 </div>
                 <div>
-                  <div className="text-xs text-gray-400 dark:text-slate-500">Attribution rate</div>
+                  <div className="text-xs text-gray-400 dark:text-slate-500">Attribution rate{status?.site_filtered ? ' (all sites)' : ''}</div>
                   <div className={clsx('text-base font-bold',
                     attributionRate >= 90 ? 'text-emerald-600 dark:text-emerald-400'
                       : attributionRate >= 60 ? 'text-amber-600 dark:text-amber-400'
@@ -348,7 +411,7 @@ export default function TrafficAnalyticsPage() {
                   </div>
                 </div>
                 <div>
-                  <div className="text-xs text-gray-400 dark:text-slate-500">Exporting devices</div>
+                  <div className="text-xs text-gray-400 dark:text-slate-500">{status?.site_filtered ? 'Exporting devices here' : 'Exporting devices'}</div>
                   <div className="text-base font-bold text-gray-900 dark:text-white">{exporters.length}</div>
                 </div>
               </div>
@@ -366,7 +429,7 @@ export default function TrafficAnalyticsPage() {
 
               {/* Per-exporter rows */}
               {exporters.length === 0
-                ? <div className="text-sm text-gray-400 dark:text-slate-500">No routers have exported flows yet. <Link to="/network-services/netflow" className="text-blue-600 dark:text-blue-400 hover:underline">Configure NetFlow export →</Link></div>
+                ? <div className="text-sm text-gray-400 dark:text-slate-500">{status?.site_filtered ? 'No routers in this site have exported flows yet.' : 'No routers have exported flows yet.'} <Link to="/network-services/netflow" className="text-blue-600 dark:text-blue-400 hover:underline">Configure NetFlow export →</Link></div>
                 : (
                   <div className="divide-y divide-gray-100 dark:divide-slate-800 -mb-1">
                     {exporters.map(e => (

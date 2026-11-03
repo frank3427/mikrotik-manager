@@ -1,12 +1,19 @@
 import { useState } from 'react';
+import ReviewChangesButton from '../components/common/ReviewChangesButton';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Server, RefreshCw, AlertTriangle, Power, Plus, Pencil, Trash2,
-  ChevronDown, ChevronRight, X, Check,
+  X, Check,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { networkServicesApi, devicesApi } from '../services/api';
+import { liveRefetch, type LiveRow } from '../utils/liveFreshness';
 import { useCanWrite } from '../hooks/useCanWrite';
+import { apiErrorMessage } from '../utils/apiError';
+import { Link } from 'react-router-dom';
+import { DhcpPoolUsage } from '../components/wireless/RfHealth';
+import DevicePicker from '../components/common/DevicePicker';
+import { shortList } from '../utils/deviceCards';
 
 type NS = Record<string, string>;
 
@@ -68,15 +75,17 @@ function ServerForm({ protocol, existing, pools, interfaces, deviceId, onClose, 
     return i['comment'] ? `${base}  —  ${i['comment']}` : base;
   }
 
-  const save = useMutation({
-    mutationFn: () => {
+  const saveRequest = () => {
       const body: NS & { protocol: 'ipv4' | 'ipv6' } = {
         protocol, name, interface: iface, 'address-pool': pool, 'lease-time': leaseTime,
       };
       return existing?.['.id']
         ? networkServicesApi.updateDhcpServer(deviceId, existing['.id'], body)
         : networkServicesApi.addDhcpServer(deviceId, body);
-    },
+    };
+  const save = useMutation({
+    meta: { inlineError: true },
+    mutationFn: saveRequest,
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['ns-dhcp', deviceId] }); onClose(); },
   });
 
@@ -151,7 +160,7 @@ function ServerForm({ protocol, existing, pools, interfaces, deviceId, onClose, 
           <div className="px-5 pb-3">
             <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-xs text-amber-700 dark:text-amber-300">
               <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
-              <span>Active {protocol.toUpperCase()} DHCP server(s) already running on: <strong>{conflictDevices.map(d => d.name).join(', ')}</strong>. Multiple DHCP servers on the same network may cause IP address conflicts.</span>
+              <span>Active {protocol.toUpperCase()} DHCP server(s) already running on: <strong>{shortList(conflictDevices.map(d => String(d.name)))}</strong>. Multiple DHCP servers on the same network may cause IP address conflicts.</span>
             </div>
           </div>
         )}
@@ -164,8 +173,9 @@ function ServerForm({ protocol, existing, pools, interfaces, deviceId, onClose, 
             <Check className="w-3.5 h-3.5" />
             {save.isPending ? 'Saving…' : 'Save'}
           </button>
+          <ReviewChangesButton request={saveRequest} onApply={() => save.mutate()} applyLabel="Save" disabled={!name || !iface || save.isPending} />
           <button onClick={onClose} className="text-sm text-gray-500 dark:text-slate-400 hover:text-gray-700">Cancel</button>
-          {save.isError && <span className="text-xs text-red-500">{(save.error as Error).message}</span>}
+          {save.isError && <span className="text-xs text-red-500">{apiErrorMessage(save.error)}</span>}
         </div>
       </div>
     </div>
@@ -186,13 +196,15 @@ function PoolForm({ protocol, deviceId, onClose }: PoolFormProps) {
   const [ranges, setRanges] = useState('');
   const [prefix, setPrefix] = useState('');
 
-  const save = useMutation({
-    mutationFn: () => {
+  const saveRequest = () => {
       const params: NS & { protocol: 'ipv4' | 'ipv6' } = { protocol, name };
       if (protocol === 'ipv4') params['ranges'] = ranges;
       else params['prefix'] = prefix;
       return networkServicesApi.addDhcpPool(deviceId, params);
-    },
+    };
+  const save = useMutation({
+    meta: { inlineError: true },
+    mutationFn: saveRequest,
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['ns-dhcp', deviceId] }); onClose(); },
   });
 
@@ -231,8 +243,9 @@ function PoolForm({ protocol, deviceId, onClose }: PoolFormProps) {
             <Check className="w-3.5 h-3.5" />
             {save.isPending ? 'Adding…' : 'Add Pool'}
           </button>
+          <ReviewChangesButton request={saveRequest} onApply={() => save.mutate()} applyLabel="Save" disabled={!name || save.isPending} />
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
-          {save.isError && <span className="text-xs text-red-500">{(save.error as Error).message}</span>}
+          {save.isError && <span className="text-xs text-red-500">{apiErrorMessage(save.error)}</span>}
         </div>
       </div>
     </div>
@@ -255,14 +268,17 @@ function StaticLeaseForm({ protocol, servers, deviceId, onClose }: StaticLeaseFo
   const [server, setServer] = useState(servers[0]?.['name'] || '');
   const [comment, setComment] = useState('');
 
-  const save = useMutation({
-    mutationFn: () => {
+  const saveRequest = () => {
       const body: NS & { protocol: 'ipv4' | 'ipv6' } = {
-        protocol, 'mac-address': mac, address, comment,
-        ...(protocol === 'ipv4' ? { server } : { server }),
+        // An IPv6 binding is keyed by the client's DUID; RouterOS has no
+        // mac-address on it (outside review C7).
+        protocol, [protocol === 'ipv4' ? 'mac-address' : 'duid']: mac, address, comment, server,
       };
       return networkServicesApi.addStaticLease(deviceId, body);
-    },
+    };
+  const save = useMutation({
+    meta: { inlineError: true },
+    mutationFn: saveRequest,
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['ns-leases', deviceId, protocol] }); onClose(); },
   });
 
@@ -275,12 +291,12 @@ function StaticLeaseForm({ protocol, servers, deviceId, onClose }: StaticLeaseFo
         </div>
         <div className="p-5 space-y-4">
           <div>
-            <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">MAC Address *</label>
-            <input className="input w-full font-mono" value={mac} onChange={e => setMac(e.target.value)} placeholder="AA:BB:CC:DD:EE:FF" />
+            <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">{protocol === 'ipv4' ? 'MAC Address' : 'Client DUID'} *</label>
+            <input className="input w-full font-mono" value={mac} onChange={e => setMac(e.target.value)} placeholder={protocol === 'ipv4' ? 'AA:BB:CC:DD:EE:FF' : '0x000100012a3b4c5d001122334455'} />
           </div>
           <div>
-            <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">IP Address *</label>
-            <input className="input w-full font-mono" value={address} onChange={e => setAddress(e.target.value)} placeholder={protocol === 'ipv4' ? '192.168.1.50' : '2001:db8::50'} />
+            <label className="block text-xs font-medium text-gray-600 dark:text-slate-300 mb-1">{protocol === 'ipv4' ? 'IP Address' : 'Prefix'} *</label>
+            <input className="input w-full font-mono" value={address} onChange={e => setAddress(e.target.value)} placeholder={protocol === 'ipv4' ? '192.168.1.50' : '2001:db8:1::/64'} />
           </div>
           {servers.length > 0 && (
             <div>
@@ -304,8 +320,9 @@ function StaticLeaseForm({ protocol, servers, deviceId, onClose }: StaticLeaseFo
             <Check className="w-3.5 h-3.5" />
             {save.isPending ? 'Adding…' : 'Add Lease'}
           </button>
+          <ReviewChangesButton request={saveRequest} onApply={() => save.mutate()} applyLabel="Save" disabled={!mac || !address || save.isPending} />
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-700">Cancel</button>
-          {save.isError && <span className="text-xs text-red-500">{(save.error as Error).message}</span>}
+          {save.isError && <span className="text-xs text-red-500">{apiErrorMessage(save.error)}</span>}
         </div>
       </div>
     </div>
@@ -318,28 +335,24 @@ interface SectionProps {
   color: string;
   title: string;
   count: number;
-  open: boolean;
-  onToggle: () => void;
   action?: React.ReactNode;
   children: React.ReactNode;
 }
 
-function Section({ color, title, count, open, onToggle, action, children }: SectionProps) {
+// A plain card: the sections used to collapse, hiding most of the page behind
+// clicks (#211).
+function Section({ color, title, count, action, children }: SectionProps) {
   return (
     <div className="card overflow-hidden">
       <div className="flex items-center border-b border-gray-200 dark:border-slate-700">
-        <button
-          onClick={onToggle}
-          className="flex items-center gap-2 flex-1 px-5 py-3 hover:bg-gray-50 dark:hover:bg-slate-800/40 transition-colors text-left"
-        >
-          {open ? <ChevronDown className="w-4 h-4 text-gray-400" /> : <ChevronRight className="w-4 h-4 text-gray-400" />}
+        <div className="flex items-center gap-2 flex-1 px-5 py-3">
           <Server className={clsx('w-4 h-4', color)} />
           <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">{title}</h2>
           <span className="ml-2 text-xs text-gray-400 dark:text-slate-500">{count}</span>
-        </button>
+        </div>
         {action && <div className="px-3">{action}</div>}
       </div>
-      {open && children}
+      {children}
     </div>
   );
 }
@@ -390,7 +403,7 @@ function ServerTable({ servers, protocol, canWrite, conflictDevices, onToggle, o
                     <div className="flex items-center justify-end gap-1">
                       <button onClick={() => {
                         if (disabled && conflictDevices.length > 0) {
-                          const names = conflictDevices.map(d => d.name as string).join(', ');
+                          const names = shortList(conflictDevices.map(d => String(d.name)));
                           if (!confirm(`Active ${protocol.toUpperCase()} DHCP server(s) already running on: ${names}.\n\nEnabling another DHCP server on the same network may cause IP address conflicts. Continue?`)) return;
                         }
                         onToggle(s['.id'], disabled);
@@ -468,8 +481,14 @@ interface LeaseTableProps {
   onDelete: (id: string) => void;
 }
 
+const LEASE_PREVIEW = 100;
+
 function LeaseTable({ leases, canWrite, onDelete }: LeaseTableProps) {
+  // A busy server can hold thousands of leases: the first 100 show, the rest on
+  // request, now that the card is always open (#211).
+  const [showAll, setShowAll] = useState(false);
   if (leases.length === 0) return <div className="px-5 py-6 text-sm text-gray-400 dark:text-slate-500 text-center">No leases.</div>;
+  const shown = showAll ? leases : leases.slice(0, LEASE_PREVIEW);
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
@@ -483,7 +502,7 @@ function LeaseTable({ leases, canWrite, onDelete }: LeaseTableProps) {
           </tr>
         </thead>
         <tbody>
-          {leases.map((l, i) => {
+          {shown.map((l, i) => {
             const isStatic = l['dynamic'] !== 'true';
             return (
               <tr key={l['.id'] || i} className={clsx('border-b border-gray-100 dark:border-slate-800 transition-colors hover:bg-blue-50 dark:hover:bg-slate-700/40', i % 2 === 0 ? 'bg-white dark:bg-transparent' : 'bg-gray-50 dark:bg-slate-800/40')}>
@@ -510,6 +529,13 @@ function LeaseTable({ leases, canWrite, onDelete }: LeaseTableProps) {
           })}
         </tbody>
       </table>
+      {leases.length > LEASE_PREVIEW && (
+        <div className="px-5 py-2.5 border-t border-gray-100 dark:border-slate-800 text-xs">
+          <button onClick={() => setShowAll((v) => !v)} className="text-blue-600 dark:text-blue-400 hover:underline">
+            {showAll ? `Show the first ${LEASE_PREVIEW}` : `Show all ${leases.length} leases`}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -520,12 +546,6 @@ export default function NetworkServicesDHCPPage() {
   const canWrite = useCanWrite();
   const qc = useQueryClient();
   const [selectedDeviceId, setSelectedDeviceId] = useState<number | ''>('');
-  const [v4Open, setV4Open] = useState(true);
-  const [v6Open, setV6Open] = useState(true);
-  const [poolsV4Open, setPoolsV4Open] = useState(false);
-  const [poolsV6Open, setPoolsV6Open] = useState(false);
-  const [leasesOpen, setLeasesOpen] = useState(false);
-  const [leasesV6Open, setLeasesV6Open] = useState(false);
 
   // Modals
   const [serverForm, setServerForm] = useState<{ protocol: 'ipv4' | 'ipv6'; existing?: NS } | null>(null);
@@ -550,13 +570,14 @@ export default function NetworkServicesDHCPPage() {
   const { data: leasesV4 = [] } = useQuery({
     queryKey: ['ns-leases', deviceId, 'ipv4'],
     queryFn: () => networkServicesApi.getLeases(deviceId, 'ipv4').then(r => r.data),
-    enabled: deviceId > 0 && leasesOpen,
+    enabled: deviceId > 0,
   });
+  const staticV4 = leasesV4.filter((l) => l['dynamic'] !== 'true');
 
   const { data: leasesV6 = [] } = useQuery({
     queryKey: ['ns-leases', deviceId, 'ipv6'],
     queryFn: () => networkServicesApi.getLeases(deviceId, 'ipv6').then(r => r.data),
-    enabled: deviceId > 0 && leasesV6Open,
+    enabled: deviceId > 0,
   });
 
   const deleteServer = useMutation({
@@ -588,6 +609,7 @@ export default function NetworkServicesDHCPPage() {
     queryKey: ['network-services-overview'],
     queryFn: () => networkServicesApi.overview().then(r => r.data as Record<string, unknown>[]),
     staleTime: 60_000,
+    refetchInterval: (q) => liveRefetch(q.state.data as LiveRow[] | undefined),
   });
   const conflictDevicesV4 = overview.filter(d => {
     if ((d.id as number) === deviceId) return false;
@@ -631,7 +653,8 @@ export default function NetworkServicesDHCPPage() {
           <p className="text-sm text-gray-500 dark:text-slate-400">Manage DHCP servers, address pools, and leases</p>
         </div>
         {deviceId > 0 && (
-          <button onClick={() => refetch()} disabled={isFetching}
+          // Servers and both lease tables, not just the servers.
+          <button onClick={() => { void refetch(); void qc.invalidateQueries({ queryKey: ['ns-leases', deviceId] }); }} disabled={isFetching}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-300 dark:border-slate-600 text-sm text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 disabled:opacity-50 transition-colors">
             <RefreshCw className={clsx('w-3.5 h-3.5', isFetching && 'animate-spin')} />
             Refresh
@@ -639,16 +662,17 @@ export default function NetworkServicesDHCPPage() {
         )}
       </div>
 
+      {/* How full every pool is, across the fleet (#156) */}
+      <DhcpPoolUsage />
+
       {/* Device selector */}
       <div className="card p-4">
         <label className="block text-sm font-medium text-gray-700 dark:text-slate-200 mb-2">Select Device</label>
-        <select className="input w-full max-w-xs" value={selectedDeviceId}
-          onChange={e => setSelectedDeviceId(e.target.value === '' ? '' : parseInt(e.target.value))}>
-          <option value="">— Choose a device —</option>
-          {devices.map(d => (
-            <option key={d.id} value={d.id}>{d.name} ({d.ip_address}){d.status !== 'online' ? ' — offline' : ''}</option>
-          ))}
-        </select>
+        <DevicePicker
+          className="max-w-xs" devices={devices} aria-label="Device"
+          value={selectedDeviceId === '' ? null : selectedDeviceId}
+          onChange={(id) => setSelectedDeviceId(id ?? '')}
+        />
         {selectedDevice && selectedDevice.status !== 'online' && (
           <div className="mt-2 flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
             <AlertTriangle className="w-3.5 h-3.5" />This device is currently offline. Connection may fail.
@@ -660,13 +684,13 @@ export default function NetworkServicesDHCPPage() {
       {conflictDevicesV4.length > 0 && deviceId > 0 && (
         <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-sm text-amber-700 dark:text-amber-300">
           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-          <span>Active IPv4 DHCP server(s) already running on: <strong>{conflictDevicesV4.map(d => d.name as string).join(', ')}</strong>. Adding another DHCP server on the same network may cause IP address conflicts.</span>
+          <span>Active IPv4 DHCP server(s) already running on: <strong>{shortList(conflictDevicesV4.map(d => String(d.name)))}</strong>. Adding another DHCP server on the same network may cause IP address conflicts.</span>
         </div>
       )}
       {conflictDevicesV6.length > 0 && deviceId > 0 && (
         <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-sm text-amber-700 dark:text-amber-300">
           <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-          <span>Active IPv6 DHCP server(s) already running on: <strong>{conflictDevicesV6.map(d => d.name as string).join(', ')}</strong>. Adding another DHCP server on the same network may cause IP address conflicts.</span>
+          <span>Active IPv6 DHCP server(s) already running on: <strong>{shortList(conflictDevicesV6.map(d => String(d.name)))}</strong>. Adding another DHCP server on the same network may cause IP address conflicts.</span>
         </div>
       )}
 
@@ -682,7 +706,6 @@ export default function NetworkServicesDHCPPage() {
         <>
           {/* IPv4 Servers */}
           <Section color="text-blue-500" title="IPv4 DHCP Servers" count={dhcp.ipv4.length}
-            open={v4Open} onToggle={() => setV4Open(o => !o)}
             action={canWrite ? <button onClick={() => setServerForm({ protocol: 'ipv4' })} className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <ServerTable servers={dhcp.ipv4} protocol="ipv4" canWrite={canWrite}
               conflictDevices={conflictDevicesV4 as { name: unknown }[]}
@@ -693,23 +716,24 @@ export default function NetworkServicesDHCPPage() {
 
           {/* IPv4 Pools */}
           <Section color="text-cyan-500" title="IPv4 Address Pools" count={dhcp.pools_v4.length}
-            open={poolsV4Open} onToggle={() => setPoolsV4Open(o => !o)}
             action={canWrite ? <button onClick={() => setPoolForm('ipv4')} className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <PoolTable pools={dhcp.pools_v4} protocol="ipv4" canWrite={canWrite}
               onDelete={(id) => deletePool.mutate({ id, protocol: 'ipv4' })} />
           </Section>
 
-          {/* IPv4 Leases */}
-          <Section color="text-sky-500" title="IPv4 Leases" count={leasesV4.length}
-            open={leasesOpen} onToggle={() => setLeasesOpen(o => !o)}
+          {/* IPv4 static leases only: dynamic ones are on Clients, with far more
+              about each client (#229). Reservations are still managed here. */}
+          <Section color="text-sky-500" title="IPv4 Static Leases" count={staticV4.length}
             action={canWrite ? <button onClick={() => setLeaseForm('ipv4')} className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Static</button> : undefined}>
-            <LeaseTable leases={leasesV4} canWrite={canWrite}
+            <LeaseTable leases={staticV4} canWrite={canWrite}
               onDelete={(id) => deleteLease.mutate({ id, protocol: 'ipv4' })} />
+            <div className="px-5 py-2.5 border-t border-gray-100 dark:border-slate-800 text-xs text-gray-500 dark:text-slate-400">
+              Dynamic leases ({leasesV4.length - staticV4.length}) are on <Link to="/clients" className="text-blue-600 dark:text-blue-400 hover:underline">Clients</Link>.
+            </div>
           </Section>
 
           {/* IPv6 Servers */}
           <Section color="text-indigo-500" title="IPv6 DHCP Servers" count={dhcp.ipv6.length}
-            open={v6Open} onToggle={() => setV6Open(o => !o)}
             action={canWrite ? <button onClick={() => setServerForm({ protocol: 'ipv6' })} className="flex items-center gap-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <ServerTable servers={dhcp.ipv6} protocol="ipv6" canWrite={canWrite}
               conflictDevices={conflictDevicesV6 as { name: unknown }[]}
@@ -720,7 +744,6 @@ export default function NetworkServicesDHCPPage() {
 
           {/* IPv6 Pools */}
           <Section color="text-violet-500" title="IPv6 Address Pools" count={dhcp.pools_v6.length}
-            open={poolsV6Open} onToggle={() => setPoolsV6Open(o => !o)}
             action={canWrite ? <button onClick={() => setPoolForm('ipv6')} className="flex items-center gap-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <PoolTable pools={dhcp.pools_v6} protocol="ipv6" canWrite={canWrite}
               onDelete={(id) => deletePool.mutate({ id, protocol: 'ipv6' })} />
@@ -728,7 +751,6 @@ export default function NetworkServicesDHCPPage() {
 
           {/* IPv6 Leases */}
           <Section color="text-purple-500" title="IPv6 Bindings" count={leasesV6.length}
-            open={leasesV6Open} onToggle={() => setLeasesV6Open(o => !o)}
             action={canWrite ? <button onClick={() => setLeaseForm('ipv6')} className="flex items-center gap-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Static</button> : undefined}>
             <LeaseTable leases={leasesV6} canWrite={canWrite}
               onDelete={(id) => deleteLease.mutate({ id, protocol: 'ipv6' })} />

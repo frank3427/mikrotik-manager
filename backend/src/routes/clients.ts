@@ -1,11 +1,21 @@
 import { Router, Request, Response } from 'express';
+import { decodedPath } from '../utils/requestPath';
 import * as dgram from 'dgram';
-import { query } from '../config/database';
+import { query, queryOne } from '../config/database';
+import { DeviceCollector, type DeviceRow } from '../services/mikrotik/DeviceCollector';
+import { normalizeMac } from '../utils/fit';
+import { logSafe } from '../utils/logSafe';
 import { requireAuth, requireAdmin, requireWrite } from '../middleware/auth';
+import { siteList, siteScopeByDevice, siteScopeByNullableDevice } from '../utils/siteScope';
+import { fluxDeviceFilter } from '../utils/siteAccess';
+import { activeSite, writableScope } from '../middleware/site';
 import { PollerService } from '../services/PollerService';
 import { getQueryApi, bucket } from '../config/influxdb';
 import { fingerprintClient, DEVICE_CATEGORIES, DeviceCategory } from '../utils/clientFingerprint';
 import { parseRoamLine, buildSessions, flappingSessions } from '../utils/roaming';
+import { fluxString } from '@influxdata/influxdb-client';
+import { counterDeltas } from '../utils/counterDeltas';
+import { INFRA_PORTS_CTE, CLIENT_SIGHTINGS, CLIENT_SIGHTING_ORDER, CLIENT_MAC_COLUMNS, UPSTREAM_LINK_ORDER, UPSTREAM_CANDIDATE, UPSTREAM_IS_TOP, withMacColumns } from '../utils/clientPorts';
 
 // Effective category: the user's override wins; otherwise the fingerprint.
 function withCategory<T extends Record<string, unknown>>(row: T): T & { device_category: string; auto_category: string } {
@@ -20,6 +30,21 @@ function withCategory<T extends Record<string, unknown>>(row: T): T & { device_c
 
 const router = Router();
 router.use(requireAuth);
+
+// A site-scoped account reaches a client only if it has been seen on one of
+// its devices (P1-7). The per-client queries below are site-filtered as well.
+router.use(async (req: Request, res: Response, next) => {
+  const scoped = req.user?.siteRoles;
+  // Decoded, as the handler's :mac is (GHSA-6xq3-q9m5-7hxp); undecodable is refused.
+  const path = decodedPath(req);
+  if (scoped && path === null) return res.status(400).json({ error: 'Malformed request path' });
+  const m = /^\/([0-9A-Fa-f:.-]{12,17})(?:\/|$)/.exec(path ?? '');
+  if (!scoped || !m) return next();
+  const seen = siteScopeByDevice(Object.keys(scoped).map(Number), 'device_id');
+  const rows = await query(`SELECT 1 FROM clients WHERE LOWER(mac_address) = LOWER($1) AND ${seen} LIMIT 1`, [m[1]]).catch(() => []);
+  if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+  return next();
+});
 
 let pollerService: PollerService | null = null;
 export function setPollerService(p: PollerService): void { pollerService = p; }
@@ -47,6 +72,7 @@ router.get('/:mac/roaming', async (req: Request, res: Response) => {
      LEFT JOIN devices d ON d.id = e.device_id
      WHERE e.event_time > NOW() - ($2 || ' hours')::interval
        AND (e.message ILIKE $1 || '@%' OR e.message ILIKE '%for ' || $1 || '%')
+       ${siteScopeByNullableDevice(activeSite(req), 'e.device_id') ? `AND ${siteScopeByNullableDevice(activeSite(req), 'e.device_id')}` : ''}
      ORDER BY e.event_time ASC
      LIMIT 5000`,
     [mac, String(hours)]
@@ -95,7 +121,14 @@ router.get('/', async (req: Request, res: Response) => {
     vlan_id: `deduped.vlan_id`,
     device_name: `LOWER(COALESCE(deduped.device_name, ''))`,
     traffic_today_bytes: `traffic_today_bytes`,
-    last_seen: `deduped.last_seen`,
+    last_seen: `deduped.mac_last_seen`,
+    // Asked for by Stanley (discussion #85). Wired clients have no SSID or
+    // signal; NULLIF keeps a blank SSID NULL so NULLS LAST puts them at the end
+    // in both directions. Signal is dBm, so descending is strongest first.
+    ssid: `LOWER(NULLIF(deduped.ssid, ''))`,
+    signal_strength: `deduped.signal_strength`,
+    // #252: link rate, from the access point's side (tx = towards the client).
+    tx_rate_bps: `deduped.tx_rate_bps`,
   };
   const sortExpr = SORT_EXPR[String(sort)] ?? SORT_EXPR.last_seen;
   const sortDir = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
@@ -109,10 +142,12 @@ router.get('/', async (req: Request, res: Response) => {
   // DISTINCT ON below reduces them to the single row the table displays. Which
   // side a filter belongs on therefore depends on what it means:
   //
-  //   * Filters that choose which *sightings* to consider (device, active) run
-  //     before, so they shape what deduplication has to pick from.
-  //   * Filters on values the table *shows* (type, VLAN, signal) run after, or
-  //     the filter and the column disagree.
+  //   * Filters that choose which *sightings* to consider (device, site,
+  //     search) run before, so they shape what deduplication has to pick from.
+  //   * Filters on values the table *shows* (online, type, VLAN, signal) run
+  //     after, or the filter and the column disagree. Online is whether any
+  //     sighting is live (#363): the row shown is the one that says where the
+  //     client is, which overnight can be a switch that has gone quiet on it.
   //
   // Both halves matter here. A wireless client's MAC is also learned by the
   // switch its AP uplinks to, so it holds both a wireless and a wired row — on
@@ -131,16 +166,24 @@ router.get('/', async (req: Request, res: Response) => {
     filters.push(`c.device_id = $${idx++}`);
     filterParams.push(deviceId);
   }
-  if (active === 'true') {
-    filters.push(`c.active = TRUE`);
-  }
+  // Site scoping belongs on the sighting side: a MAC seen by a device in
+  // another site is that site's client, not this one's. Expressed as a
+  // subquery on device_id rather than d.site_id because the count query below
+  // does not join devices (issue #130).
+  const siteFilter = siteScopeByDevice(activeSite(req), 'c.device_id');
+  if (siteFilter) filters.push(siteFilter);
   if (search) {
     filters.push(`(c.mac_address ILIKE $${idx} OR c.custom_name ILIKE $${idx} OR c.hostname ILIKE $${idx} OR c.ip_address ILIKE $${idx} OR c.vendor ILIKE $${idx})`);
     filterParams.push(`%${search}%`);
     idx++;
   }
 
+  // The sighting filters alone, for the VLAN choices below.
+  const preParams = [...filterParams];
+
   // ── After deduplication: must match the row on screen ──
+  const onlineFilter = active === 'true' ? `deduped.mac_active` : null;
+  if (onlineFilter) outerFilters.push(onlineFilter);
   if (client_type) {
     outerFilters.push(`deduped.client_type = $${idx++}`);
     filterParams.push(client_type);
@@ -167,27 +210,39 @@ router.get('/', async (req: Request, res: Response) => {
   // at the cost of going stale whenever the rules change.
 
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  // Integers from the site scope, safe to inline.
+  const trafficSites = siteList(activeSite(req))?.filter((n) => Number.isSafeInteger(n)) ?? null;
   const outerWhere = outerFilters.length ? `WHERE ${outerFilters.join(' AND ')}` : '';
 
-  // Deduplicate by MAC address across devices: prefer active rows, then most recently seen.
+  // Deduplicate by MAC address across devices: the sighting that says where
+  // each client is (CLIENT_SIGHTING_ORDER), with online and last seen from all
+  // of its sightings (CLIENT_MAC_COLUMNS).
   // The inner DISTINCT ON picks the best row per MAC; the outer query applies final sort + pagination.
   const sql = `
+    WITH ${INFRA_PORTS_CTE}
     SELECT deduped.*,
            -- float8 so node-pg returns a number (bigint would arrive as a string)
-           (COALESCE(ctd.upload_bytes, 0) + COALESCE(ctd.download_bytes, 0))::float8 AS traffic_today_bytes
+           COALESCE(ctd.bytes, 0)::float8 AS traffic_today_bytes
     FROM (
       SELECT DISTINCT ON (c.mac_address)
         c.*, d.name as device_name,
-        wi.ssid as ssid
-      FROM clients c
+        COALESCE(c.capsman_ssid, wi.ssid) as ssid,
+        ${CLIENT_MAC_COLUMNS}
+      FROM ${CLIENT_SIGHTINGS} c
       JOIN devices d ON d.id = c.device_id
       LEFT JOIN wireless_interfaces wi
         ON wi.device_id = c.device_id AND wi.name = c.interface_name
       ${where}
-      ORDER BY c.mac_address, (c.client_type = 'wireless') DESC, c.active DESC, c.last_seen DESC NULLS LAST
+      WINDOW mac AS (PARTITION BY c.mac_address)
+      ORDER BY c.mac_address, ${CLIENT_SIGHTING_ORDER}
     ) deduped
-    LEFT JOIN client_traffic_daily ctd
-      ON ctd.mac_address = LOWER(deduped.mac_address) AND ctd.day = CURRENT_DATE
+    -- Today's traffic is kept per site (J4): add up the sites in view.
+    LEFT JOIN (
+      SELECT mac_address, SUM(upload_bytes + download_bytes) AS bytes
+        FROM client_traffic_daily
+       WHERE day = CURRENT_DATE ${trafficSites ? `AND site_id = ANY(ARRAY[${trafficSites.join(',')}]::int[])` : ''}
+       GROUP BY mac_address
+    ) ctd ON ctd.mac_address = LOWER(deduped.mac_address)
     ${outerWhere}
     ${orderBy}
     LIMIT $${idx++} OFFSET $${idx}
@@ -195,19 +250,39 @@ router.get('/', async (req: Request, res: Response) => {
   const clients = await query(sql, [...filterParams, parseInt(String(limit), 10), parseInt(String(offset), 10)]);
 
   const countResult = await query<{ total: string }>(
-    `SELECT COUNT(*) as total FROM (
-       SELECT DISTINCT ON (c.mac_address) c.client_type, c.vlan_id, c.signal_strength
-       FROM clients c
+    `WITH ${INFRA_PORTS_CTE}
+     SELECT COUNT(*) as total FROM (
+       SELECT DISTINCT ON (c.mac_address) c.client_type, c.vlan_id, c.signal_strength, ${CLIENT_MAC_COLUMNS}
+       FROM ${CLIENT_SIGHTINGS} c
        ${where}
-       ORDER BY c.mac_address, (c.client_type = 'wireless') DESC, c.active DESC, c.last_seen DESC NULLS LAST
+       WINDOW mac AS (PARTITION BY c.mac_address)
+       ORDER BY c.mac_address, ${CLIENT_SIGHTING_ORDER}
      ) deduped
      ${outerWhere}`,
     filterParams
   );
 
+  // Every VLAN among the clients in view, not just this page's, so the filter
+  // offers all of them (outside review U14). The VLAN filter itself isn't
+  // applied, or choosing one would hide the others.
+  const vlanRows = await query<{ vlan_id: number }>(
+    `WITH ${INFRA_PORTS_CTE}
+     SELECT DISTINCT deduped.vlan_id FROM (
+       SELECT DISTINCT ON (c.mac_address) c.vlan_id, ${CLIENT_MAC_COLUMNS}
+       FROM ${CLIENT_SIGHTINGS} c
+       ${where}
+       WINDOW mac AS (PARTITION BY c.mac_address)
+       ORDER BY c.mac_address, ${CLIENT_SIGHTING_ORDER}
+     ) deduped
+     WHERE deduped.vlan_id IS NOT NULL${onlineFilter ? ` AND ${onlineFilter}` : ''}
+     ORDER BY 1`,
+    preParams
+  ).catch(() => []);
+
   res.json({
-    clients: (clients as Record<string, unknown>[]).map(withCategory),
+    clients: (clients as Record<string, unknown>[]).map((r) => withCategory(withMacColumns(r))),
     total: parseInt(countResult[0]?.total || '0', 10),
+    vlans: vlanRows.map((v) => v.vlan_id),
   });
 });
 
@@ -215,42 +290,62 @@ router.get('/', async (req: Request, res: Response) => {
 router.get('/:mac', async (req: Request, res: Response) => {
   const mac = req.params.mac.toLowerCase();
 
-  // Order: wireless records before wired (AP knows the client best), then active,
-  // then most recently seen. Use LATERAL for topology so we never multiply rows.
+  // The sighting that says where the client is (CLIENT_SIGHTING_ORDER, #363);
+  // online and last seen come from all its sightings. Use LATERAL for topology
+  // so we never multiply rows.
   const rows = await query<Record<string, unknown>>(
-    `SELECT c.*, d.name as device_name, d.device_type,
-            wi.ssid as ssid,
+    `WITH ${INFRA_PORTS_CTE}
+     SELECT c.*, d.name as device_name, d.device_type,
+            ${CLIENT_MAC_COLUMNS},
+            COALESCE(c.capsman_ssid, wi.ssid) as ssid,
             v.name as vlan_name,
             topo.upstream_device_id,
             topo.upstream_interface,
             topo.upstream_device_name,
             topo.upstream_device_type,
-            topo.upstream_device_ip
-     FROM clients c
+            topo.upstream_device_ip,
+            topo.upstream_managed
+     FROM ${CLIENT_SIGHTINGS} c
      JOIN devices d ON d.id = c.device_id
      LEFT JOIN wireless_interfaces wi
        ON wi.device_id = c.device_id AND wi.name = c.interface_name
-     LEFT JOIN vlans v
-       ON v.device_id = c.device_id AND v.vlan_id = c.vlan_id
+     -- The VLAN's name where the client is, or else on the device that
+     -- reported it (a CAPsMAN controller, #365).
      LEFT JOIN LATERAL (
-       SELECT tl.to_device_id   AS upstream_device_id,
-              tl.to_interface   AS upstream_interface,
-              ud.name           AS upstream_device_name,
-              ud.device_type    AS upstream_device_type,
-              ud.ip_address     AS upstream_device_ip
-       FROM topology_links tl
-       JOIN devices ud ON ud.id = tl.to_device_id
-       WHERE tl.from_device_id = c.device_id
-       LIMIT 1
+       SELECT vv.name FROM vlans vv
+        WHERE vv.device_id IN (c.device_id, c.reported_by_device_id) AND vv.vlan_id = c.vlan_id
+        ORDER BY (vv.device_id = c.device_id) DESC
+        LIMIT 1
+     ) v ON TRUE
+     -- The device's way up (J7, #363): see UPSTREAM_LINK_ORDER. None when it
+     -- leads down from the top of the site (UPSTREAM_IS_TOP, #365). A neighbour
+     -- the manager doesn't manage is named as discovery heard it.
+     LEFT JOIN LATERAL (
+       SELECT up.* FROM (
+         SELECT tl.to_device_id   AS upstream_device_id,
+                tl.to_interface   AS upstream_interface,
+                COALESCE(ud.name, NULLIF(TRIM(tl.neighbor_identity), ''), tl.neighbor_address) AS upstream_device_name,
+                ud.device_type    AS upstream_device_type,
+                COALESCE(ud.ip_address, tl.neighbor_address) AS upstream_device_ip,
+                (tl.to_device_id IS NOT NULL) AS upstream_managed,
+                ${UPSTREAM_IS_TOP} AS is_top
+         FROM topology_links tl
+         LEFT JOIN devices ud ON ud.id = tl.to_device_id
+         WHERE tl.from_device_id = c.device_id AND ${UPSTREAM_CANDIDATE}
+         ORDER BY ${UPSTREAM_LINK_ORDER}
+         LIMIT 1
+       ) up WHERE NOT up.is_top
      ) topo ON TRUE
      WHERE LOWER(c.mac_address) = $1
-     ORDER BY (c.client_type = 'wireless') DESC, c.active DESC, c.last_seen DESC NULLS LAST
+       ${siteScopeByDevice(activeSite(req), 'c.device_id') ? `AND ${siteScopeByDevice(activeSite(req), 'c.device_id')}` : ''}
+     WINDOW mac AS (PARTITION BY c.mac_address)
+     ORDER BY ${CLIENT_SIGHTING_ORDER}
      LIMIT 1`,
     [mac]
   );
 
   if (!rows.length) return res.status(404).json({ error: 'Client not found' });
-  return res.json(withCategory(rows[0]));
+  return res.json(withCategory(withMacColumns(rows[0])));
 });
 
 // GET /api/clients/:mac/presence?range=2h|24h|7d — connectivity timeline from InfluxDB
@@ -264,6 +359,7 @@ router.get('/:mac/presence', async (req: Request, res: Response) => {
   const window = range === '7d' ? '30m' : '5m';
 
   const queryApi = getQueryApi();
+  const deviceFlux = await fluxDeviceFilter(activeSite(req));
   // Group by mac_address only (drop device_id) so that all devices reporting the
   // same client are merged into one series. fn:max means online=1 if any device
   // saw the client in that window; createEmpty+fill gives offline=0 for gaps.
@@ -272,7 +368,8 @@ router.get('/:mac/presence', async (req: Request, res: Response) => {
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_presence")
       |> filter(fn: (r) => r._field == "online")
-      |> filter(fn: (r) => r.mac_address == "${mac}")
+      |> filter(fn: (r) => r.mac_address == ${fluxString(String(mac))})
+      ${deviceFlux}
       |> group(columns: ["_measurement", "_field", "mac_address"])
       |> aggregateWindow(every: ${window}, fn: max, createEmpty: true)
       |> fill(value: 0)
@@ -303,6 +400,7 @@ router.get('/:mac/traffic', async (req: Request, res: Response) => {
   const window = range === '7d' ? '30m' : '5m';
 
   const queryApi = getQueryApi();
+  const deviceFlux = await fluxDeviceFilter(activeSite(req));
   // Simple query: get the last cumulative byte counter value per time window.
   // Non-negative differences are computed in TypeScript below — avoids the
   // fragile non_negative_difference+pivot combination in Flux.
@@ -311,39 +409,34 @@ router.get('/:mac/traffic', async (req: Request, res: Response) => {
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_presence")
       |> filter(fn: (r) => r._field == "tx_bytes" or r._field == "rx_bytes")
-      |> filter(fn: (r) => r.mac_address == "${mac}")
-      |> group(columns: ["_measurement", "_field", "mac_address"])
+      |> filter(fn: (r) => r.mac_address == ${fluxString(String(mac))})
+      ${deviceFlux}
+      |> group(columns: ["_measurement", "_field", "mac_address", "device_id"])
       |> aggregateWindow(every: ${window}, fn: last, createEmpty: false)
       |> yield(name: "traffic_raw")
   `;
 
-  const raw: { time: string; field: string; value: number }[] = [];
+  // Each device keeps its own byte counter for a client, so deltas are taken
+  // per device and only then added up. Taking them across a merged series
+  // subtracted one access point's counter from another's (J4).
+  const raw: { time: string; field: string; device: string; value: number }[] = [];
   try {
     await queryApi.collectRows(fluxQuery, (row, tableMeta) => {
-      const time  = tableMeta.get(row, '_time')  as string;
-      const field = tableMeta.get(row, '_field') as string;
-      const value = tableMeta.get(row, '_value') as number;
-      if (time && field && value != null) raw.push({ time, field, value });
+      const time   = tableMeta.get(row, '_time')  as string;
+      const field  = tableMeta.get(row, '_field') as string;
+      const device = String(tableMeta.get(row, 'device_id') ?? '');
+      const value  = tableMeta.get(row, '_value') as number;
+      if (time && field && value != null) raw.push({ time, field, device, value });
     });
   } catch (err) {
-    console.error(`[clients/traffic] Flux error for ${mac.replace(/[\r\n]/g, '_')}:`, err);
+    // Literal format string, value as an argument: with a template here, a mac
+    // containing "%s" would turn the message into a format string and consume
+    // `err` as its substitution (CodeQL js/tainted-format-string).
+    console.error('[clients/traffic] Flux error for %s:', logSafe(mac), err);
   }
 
-  // Separate tx and rx series, sort by time, then compute non-negative deltas
-  const txSeries = raw.filter(p => p.field === 'tx_bytes').sort((a, b) => a.time.localeCompare(b.time));
-  const rxSeries = raw.filter(p => p.field === 'rx_bytes').sort((a, b) => a.time.localeCompare(b.time));
-
-  const txDeltas = new Map<string, number>();
-  for (let i = 1; i < txSeries.length; i++) {
-    const diff = txSeries[i].value - txSeries[i - 1].value;
-    if (diff >= 0) txDeltas.set(txSeries[i].time, diff);
-  }
-
-  const rxDeltas = new Map<string, number>();
-  for (let i = 1; i < rxSeries.length; i++) {
-    const diff = rxSeries[i].value - rxSeries[i - 1].value;
-    if (diff >= 0) rxDeltas.set(rxSeries[i].time, diff);
-  }
+  const txDeltas = counterDeltas(raw.filter(p => p.field === 'tx_bytes'));
+  const rxDeltas = counterDeltas(raw.filter(p => p.field === 'rx_bytes'));
 
   const allTimes = new Set([...txDeltas.keys(), ...rxDeltas.keys()]);
   const points = [...allTimes].sort().map(time => ({
@@ -365,12 +458,14 @@ router.get('/:mac/signal', async (req: Request, res: Response) => {
   const window = range === '7d' ? '30m' : '5m';
 
   const queryApi = getQueryApi();
+  const deviceFlux = await fluxDeviceFilter(activeSite(req));
   const fluxQuery = `
     from(bucket: "${bucket}")
       |> range(start: -${range})
       |> filter(fn: (r) => r._measurement == "client_presence")
       |> filter(fn: (r) => r._field == "signal_strength")
-      |> filter(fn: (r) => r.mac_address == "${mac}")
+      |> filter(fn: (r) => r.mac_address == ${fluxString(String(mac))})
+      ${deviceFlux}
       |> group(columns: ["_measurement", "_field", "mac_address"])
       |> aggregateWindow(every: ${window}, fn: mean, createEmpty: false)
       |> yield(name: "signal")
@@ -384,7 +479,10 @@ router.get('/:mac/signal', async (req: Request, res: Response) => {
       if (time && value != null) points.push({ time, signal_strength: Math.round(value) });
     });
   } catch (err) {
-    console.error(`[clients/signal] Flux error for ${mac.replace(/[\r\n]/g, '_')}:`, err);
+    // Literal format string, value as an argument: with a template here, a mac
+    // containing "%s" would turn the message into a format string and consume
+    // `err` as its substitution (CodeQL js/tainted-format-string).
+    console.error('[clients/signal] Flux error for %s:', logSafe(mac), err);
   }
 
   return res.json(points);
@@ -396,6 +494,13 @@ router.post('/:mac/wol', requireWrite, async (req: Request, res: Response) => {
   const hexMac = mac.replace(/[:\-.]/g, '');
   if (hexMac.length !== 12) {
     return res.status(400).json({ error: 'Invalid MAC address' });
+  }
+
+  // Only for a client the account can see (P1-7).
+  const scope = siteScopeByDevice(activeSite(req), 'device_id');
+  if (scope) {
+    const seen = await query(`SELECT 1 FROM clients WHERE REPLACE(REPLACE(LOWER(mac_address), ':', ''), '-', '') = $1 AND ${scope} LIMIT 1`, [hexMac.toLowerCase()]);
+    if (seen.length === 0) return res.status(404).json({ error: 'Client not found' });
   }
 
   // Build magic packet: 6 bytes of 0xFF + MAC repeated 16 times
@@ -428,13 +533,91 @@ router.post('/:mac/wol', requireWrite, async (req: Request, res: Response) => {
   });
 });
 
+/**
+ * POST /api/clients/:mac/disconnect { confirm_managed? } — kick a wireless
+ * client off its access point (#338), as WinBox's Remove on the registration
+ * table does; it reassociates by itself, normally within seconds. No config
+ * changes, so it doesn't go through Change Guard.
+ *
+ * A "client" can be a managed MikroTik in station mode (a wireless backhaul):
+ * dropping it drops everything behind it, the manager's path included, so that
+ * case needs confirm_managed and is otherwise answered 409 with the device.
+ */
+router.post('/:mac/disconnect', requireWrite, async (req: Request, res: Response) => {
+  const mac = normalizeMac(req.params.mac);
+  if (!mac) return res.status(400).json({ error: 'Invalid MAC address' });
+
+  // Only where the account may make changes, and only where it's connected now.
+  const scope = siteScopeByDevice(writableScope(req), 'c.device_id');
+  const where = await query<{ device_id: number; name: string }>(
+    `SELECT DISTINCT c.device_id, d.name
+       FROM clients c JOIN devices d ON d.id = c.device_id
+      WHERE LOWER(c.mac_address) = $1 AND c.client_type = 'wireless' AND c.active
+        ${scope ? `AND ${scope}` : ''}`,
+    [mac]
+  );
+  if (where.length === 0) {
+    return res.status(404).json({ error: 'This client isn’t connected to a wireless device you can manage right now.' });
+  }
+
+  if (req.body?.confirm_managed !== true) {
+    const managed = await queryOne<{ name: string }>(
+      `SELECT d.name FROM interfaces i JOIN devices d ON d.id = i.device_id WHERE LOWER(i.mac_address) = $1 LIMIT 1`,
+      [mac]
+    );
+    if (managed) {
+      return res.status(409).json({
+        managed_device: managed.name,
+        error: `This is ${managed.name}, a managed device. Disconnecting it drops it and anything reached through it until it reconnects, possibly including the manager's connection to them.`,
+      });
+    }
+  }
+
+  let removed = 0;
+  const from: string[] = [];
+  const failed: string[] = [];
+  for (const w of where) {
+    const device = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [w.device_id]);
+    if (!device) continue;
+    const c = new DeviceCollector(device);
+    try {
+      await c.connect();
+      const n = await c.disconnectWirelessClient(mac);
+      if (n > 0) { removed += n; from.push(w.name); }
+    } catch (err) {
+      failed.push(`${w.name}: ${(err as Error).message}`);
+    } finally {
+      try { c.disconnect(); } catch { /* ignore */ }
+    }
+  }
+  console.log(`[clients] disconnect ${logSafe(mac)} by ${logSafe(req.user?.username ?? '?')}: removed ${removed} from ${logSafe(from.join(',') || '-')}${failed.length ? `; failed ${logSafe(failed.join('; '))}` : ''}`);
+
+  if (removed === 0) {
+    return failed.length
+      ? res.status(502).json({ error: `Couldn't reach the access point: ${failed.join('; ')}` })
+      : res.status(404).json({ error: 'The client wasn’t in the access point’s registration table; it may have just left.' });
+  }
+  return res.json({ message: `Disconnected from ${from.join(', ')}. It normally reconnects within a few seconds.`, removed, failed });
+});
+
+/**
+ * Restricts a client edit to the records in the sites the account can write
+ * to (P1-7, J4). A MAC can be on record at several sites; an edit made in one
+ * must not rename or annotate another customer's record of it. '' when
+ * unscoped. Site ids are integers, safe to inline.
+ */
+function inScope(req: Request): string {
+  const pred = siteScopeByDevice(writableScope(req), 'device_id');
+  return pred ? `AND ${pred}` : '';
+}
+
 // PUT /api/clients/:mac/hostname  (writes to custom_name — user-set names persist across collector cycles)
 router.put('/:mac/hostname', requireWrite, async (req: Request, res: Response) => {
   const { hostname } = req.body as { hostname?: string };
   const mac = req.params.mac.toLowerCase();
 
   const result = await query(
-    `UPDATE clients SET custom_name = $1 WHERE LOWER(mac_address) = $2 RETURNING *`,
+    `UPDATE clients SET custom_name = $1 WHERE LOWER(mac_address) = $2 ${inScope(req)} RETURNING *`,
     [hostname || null, mac]
   );
   if (!result.length) return res.status(404).json({ error: 'Client not found' });
@@ -452,7 +635,7 @@ router.put('/:mac/category', requireWrite, async (req: Request, res: Response) =
   }
 
   const result = await query(
-    `UPDATE clients SET custom_category = $1 WHERE LOWER(mac_address) = $2 RETURNING *`,
+    `UPDATE clients SET custom_category = $1 WHERE LOWER(mac_address) = $2 ${inScope(req)} RETURNING *`,
     [clear ? null : category, mac]
   );
   if (!result.length) return res.status(404).json({ error: 'Client not found' });
@@ -465,7 +648,7 @@ router.put('/:mac/notes', requireWrite, async (req: Request, res: Response) => {
   const mac = req.params.mac.toLowerCase();
 
   const result = await query(
-    `UPDATE clients SET comment = $1 WHERE LOWER(mac_address) = $2 RETURNING *`,
+    `UPDATE clients SET comment = $1 WHERE LOWER(mac_address) = $2 ${inScope(req)} RETURNING *`,
     [notes ?? null, mac]
   );
   if (!result.length) return res.status(404).json({ error: 'Client not found' });

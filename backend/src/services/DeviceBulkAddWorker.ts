@@ -3,6 +3,8 @@ import { createRedisConnection } from '../config/redis';
 import { redis } from '../config/redis';
 import { createDeviceFromBody, type CreateDeviceInput } from './deviceCreation';
 import type { PollerService } from './PollerService';
+import { sealItems, openItem } from '../utils/bulkAddSecrets';
+import type { PresetCaller } from '../utils/presetAccess';
 
 const QUEUE_NAME = 'bulk-add-devices';
 const JOB_TTL_SEC = 86400;
@@ -33,6 +35,14 @@ export type BulkAddResultRow = {
 interface BulkJobPayload {
   jobId: string;
   items: CreateDeviceInput[];
+  /** Site the batch was queued from, so queued adds land where the operator was looking. */
+  siteId?: number | null;
+  /** Role of the user who queued the job, so preset restrictions apply here too. */
+  requestingUserRole?: string;
+  /** A site-scoped caller's sites (P1-7), so duplicates elsewhere aren't merged into. */
+  allowedSites?: number[] | null;
+  /** Who queued it, for credential preset rules (#228). */
+  presetCaller?: PresetCaller;
 }
 
 async function readMeta(jobId: string): Promise<Record<string, unknown>> {
@@ -68,7 +78,7 @@ async function appendResults(jobId: string, rows: BulkAddResultRow[]): Promise<v
 }
 
 async function processJob(job: Job<BulkJobPayload>): Promise<void> {
-  const { jobId, items } = job.data;
+  const { jobId, items, siteId, requestingUserRole, allowedSites, presetCaller } = job.data;
   await writeMeta(jobId, { status: 'active', processed: 0 });
   const poller = pollerService;
 
@@ -84,19 +94,26 @@ async function processJob(job: Job<BulkJobPayload>): Promise<void> {
       return;
     }
 
-    const item = items[i];
+    const item = openItem(items[i]);
     const identity = item.name || item.ip_address || '';
     await writeMeta(jobId, {
       processed: i,
       current_name: identity,
     });
 
+    // A row naming a site carries its id, resolved and checked when the job
+    // was queued (#306); the rest join the job's site.
+    const { site_id: rowSite, ...body } = item as typeof item & { site_id?: number | null };
     const result = await createDeviceFromBody(
       {
-        ...item,
-        device_type: item.device_type || 'router',
+        ...body,
+        device_type: body.device_type || 'router',
       },
-      poller
+      poller,
+      // Without the role, an operator could use an admin-only preset here, and
+      // since the add connects to the address in the item, send that preset's
+      // credentials to a host of their choosing.
+      { siteId: typeof rowSite === 'number' ? rowSite : siteId ?? null, requestingUserRole, allowedSites: allowedSites ?? null, presetCaller }
     );
 
     let failMsg = 'Failed';
@@ -128,13 +145,22 @@ async function processJob(job: Job<BulkJobPayload>): Promise<void> {
   });
 }
 
-export async function enqueueBulkAddJob(jobId: string, items: CreateDeviceInput[]): Promise<void> {
+export async function enqueueBulkAddJob(
+  jobId: string,
+  items: CreateDeviceInput[],
+  siteId: number | null = null,
+  requestingUserRole?: string,
+  allowedSites: number[] | null = null,
+  presetCaller?: PresetCaller,
+): Promise<void> {
   if (!queue) {
     queue = new Queue(QUEUE_NAME, { connection: createRedisConnection() });
   }
-  await queue.add('run', { jobId, items } satisfies BulkJobPayload, {
+  // Passwords are encrypted before they reach Redis, and a finished job is
+  // removed at once: progress and results live in their own keys.
+  await queue.add('run', { jobId, items: sealItems(items), siteId, requestingUserRole, allowedSites, presetCaller } satisfies BulkJobPayload, {
     attempts: 1,
-    removeOnComplete: { age: 3600, count: 100 },
+    removeOnComplete: true,
     removeOnFail: { age: 86400 },
   });
 }

@@ -1,25 +1,42 @@
 import { useState, FormEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { X, CheckCircle, AlertCircle, Loader2, KeyRound } from 'lucide-react';
+import { X, CheckCircle, AlertCircle, AlertTriangle, Loader2, KeyRound } from 'lucide-react';
 import {
   devicesApi,
-  credentialPresetsApi,
+  tagsApi,
   type DuplicateSerialError,
 } from '../../services/api';
 import ConfirmDuplicateModal from './ConfirmDuplicateModal';
 import { parsePort } from '../../utils/parsePort';
+import { API_SSL_PORT, portFieldError } from '../../utils/apiTls';
+import { isValidDeviceAddress, classifyAddress, addressFieldValue } from '../../utils/deviceAddress';
+import { useSitePresets } from '../../hooks/useSitePresets';
+import SiteField, { siteFieldPayload, useDefaultSiteField, type SiteFieldValue } from './SiteField';
 
 interface Props {
   onClose: () => void;
   onSuccess: () => void;
   prefill?: { name?: string; ip_address?: string };
+  /**
+   * Render only the form, without its own overlay and header.
+   *
+   * Used by the unified Adopt Device dialog, which supplies the surrounding
+   * chrome and the detection panel. Embedding beats duplicating the form:
+   * credential presets and duplicate-serial handling live here and would
+   * otherwise have to be reimplemented and kept in step.
+   */
+  embedded?: boolean;
+  submitLabel?: string;
 }
 
-export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
+export default function AddDeviceModal({
+  onClose, onSuccess, prefill, embedded = false, submitLabel,
+}: Props) {
   const [form, setForm] = useState({
     name: prefill?.name || '',
     ip_address: prefill?.ip_address || '',
-    api_port: '8728',
+    // Blank: the server tries API-SSL (8729) first, then the plain API (8728).
+    api_port: '',
     api_username: 'admin',
     api_password: '',
     ssh_port: '22',
@@ -29,19 +46,51 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
     notes: '',
   });
   const [presetId, setPresetId] = useState<number | null>(null);
+  // The API isn't enabled on the device yet (#174): add it over SSH.
+  const [sshOnly, setSshOnly] = useState(false);
+  // api-ssl on a port of the user's choosing (#257). Null follows the port:
+  // ticked for 8729, unticked otherwise, until the user changes it.
+  const [apiSslChoice, setApiSslChoice] = useState<boolean | null>(null);
+  const [tagIds, setTagIds] = useState<number[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [duplicateSerial, setDuplicateSerial] = useState<DuplicateSerialError | null>(null);
 
-  const { data: presets = [] } = useQuery({
-    queryKey: ['credential-presets'],
-    queryFn: () => credentialPresetsApi.list().then((r) => r.data),
+  // The site it joins, chosen here or the one in view (#306).
+  const [site, setSite] = useState<SiteFieldValue>(useDefaultSiteField());
+  // Only presets that can apply in the site the device joins (#228).
+  const { presets } = useSitePresets(site.newSite != null ? 'new' : site.siteId);
+
+  const { data: tags = [] } = useQuery({
+    queryKey: ['tags'],
+    queryFn: () => tagsApi.list().then((r) => r.data),
     staleTime: 30_000,
   });
+  const toggleTag = (id: number) =>
+    setTagIds((cur) => (cur.includes(id) ? cur.filter((t) => t !== id) : [...cur, id]));
 
   const selectedPreset = presetId != null ? presets.find((p) => p.id === presetId) ?? null : null;
 
   const set = (k: string, v: string) => setForm((f) => ({ ...f, [k]: v }));
+
+  // A pasted URL or "host:port" is split so the port lands in the API Port
+  // field instead of failing address validation; IPv6 brackets are dropped.
+  const setAddress = (v: string) => {
+    const { address, port } = addressFieldValue(v);
+    setForm((f) => ({ ...f, ip_address: address, ...(port ? { api_port: String(port) } : {}) }));
+  };
+
+  const addressTrimmed = form.ip_address.trim();
+  const addressInvalid = addressTrimmed.length > 0 && !isValidDeviceAddress(addressTrimmed);
+  // Plaintext RouterOS API (port 8728) sending credentials over the internet
+  // is worth a nudge; a LAN address or an already-TLS port (8729) is not.
+  // Left blank, API-SSL is tried first, so only a chosen plain port is flagged.
+  const portGiven = form.api_port.trim() !== '';
+  const apiSsl = apiSslChoice ?? parsePort(form.api_port, 8728) === API_SSL_PORT;
+  const showPlaintextWarning =
+    addressTrimmed.length > 0 && !addressInvalid &&
+    classifyAddress(addressTrimmed) !== 'private' &&
+    portGiven && !apiSsl;
 
   const createPayload = (
     opts: { combineWithDeviceId?: number; forceReplace?: boolean } = {}
@@ -49,6 +98,9 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
     const extra = {
       combine_with_device_id: opts.combineWithDeviceId,
       force_replace_existing_by_serial: opts.forceReplace,
+      ...(tagIds.length ? { tag_ids: tagIds } : {}),
+      ...(sshOnly ? { ssh_only: true } : {}),
+      ...siteFieldPayload(site),
     };
     if (selectedPreset) {
       return {
@@ -63,12 +115,14 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
     return {
       name: form.name,
       ip_address: form.ip_address,
-      api_port: parsePort(form.api_port, 8728),
+      // SSH only: one login, used for SSH now and tried on the API later.
+      api_port: sshOnly || !portGiven ? undefined : parsePort(form.api_port, 8728),
+      ...(!sshOnly && portGiven ? { api_tls: apiSsl } : {}),
       api_username: form.api_username,
       api_password: form.api_password,
       ssh_port: parsePort(form.ssh_port, 22),
-      ssh_username: form.ssh_username || undefined,
-      ssh_password: form.ssh_password || undefined,
+      ssh_username: sshOnly ? undefined : form.ssh_username || undefined,
+      ssh_password: sshOnly ? undefined : form.ssh_password || undefined,
       device_type: form.device_type as import('../../types').DeviceType,
       notes: form.notes,
       ...extra,
@@ -78,11 +132,25 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!form.name || !form.ip_address) {
-      setError('Name and IP address are required');
+      setError('Name and address are required');
+      return;
+    }
+    if (addressInvalid) {
+      setError(`"${addressTrimmed}" is not a valid IP address or hostname`);
+      return;
+    }
+    if (site.newSite != null && !site.newSite.trim()) {
+      setError('Name the new site, or choose an existing one');
       return;
     }
     if (!selectedPreset && (!form.api_username || !form.api_password)) {
       setError('Either pick a credential preset or enter username and password');
+      return;
+    }
+    const portError = selectedPreset ? null
+      : portFieldError(form.api_port, 'API port') ?? portFieldError(form.ssh_port, 'SSH port');
+    if (portError) {
+      setError(portError);
       return;
     }
 
@@ -142,19 +210,7 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
     }
   };
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="card w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between p-5 border-b border-gray-200 dark:border-slate-700">
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Add Device</h2>
-          <button
-            onClick={onClose}
-            className="p-1 rounded text-gray-400 hover:text-gray-600 dark:hover:text-slate-300"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
+  const formBody = (
         <form onSubmit={handleSubmit} className="p-5 space-y-4">
           {/* Basic info */}
           <div className="grid grid-cols-2 gap-3">
@@ -168,13 +224,27 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
               />
             </div>
             <div>
-              <label className="label">IP Address *</label>
+              <label className="label">Address (IP or hostname) *</label>
               <input
                 className="input"
                 value={form.ip_address}
-                onChange={(e) => set('ip_address', e.target.value)}
-                placeholder="192.168.1.1"
+                onChange={(e) => setAddress(e.target.value)}
+                placeholder="192.168.88.1 or router.example.com"
               />
+              {addressInvalid && (
+                <p className="text-[11px] text-red-500 mt-1">
+                  Not a valid IP address or hostname.
+                </p>
+              )}
+              {showPlaintextWarning && (
+                <p className="flex items-start gap-1 text-[11px] text-amber-600 dark:text-amber-400 mt-1">
+                  <AlertTriangle className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                  <span>Credentials travel unencrypted to this address. Prefer api-ssl on port 8729, or a VPN.</span>
+                </p>
+              )}
+            </div>
+            <div className="sm:col-span-2">
+              <SiteField value={site} onChange={setSite} />
             </div>
             <div>
               <label className="label">Device Type</label>
@@ -197,6 +267,17 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
               <KeyRound className="w-3.5 h-3.5" />
               Credentials
             </h3>
+
+            <label className="flex items-start gap-2 mb-3 p-2.5 rounded-lg border border-gray-200 dark:border-slate-700 cursor-pointer">
+              <input type="checkbox" className="mt-0.5 w-4 h-4 rounded" checked={sshOnly} onChange={(e) => setSshOnly(e.target.checked)} />
+              <span className="text-sm text-gray-700 dark:text-slate-200">
+                The API isn&apos;t enabled on this device yet
+                <span className="block text-xs text-gray-500 dark:text-slate-400 mt-0.5">
+                  Adds it over SSH. Bulk commands, templates, the terminal and backups work straight away, so you can
+                  turn on api-ssl; the manager switches to the API by itself once it answers.
+                </span>
+              </span>
+            </label>
 
             {presets.length > 0 && (
               <div className="mb-3">
@@ -222,7 +303,7 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
                     {selectedPreset.has_ssh_password && selectedPreset.ssh_username
                       ? ' and SSH credentials'
                       : ''}
-                    {' '}from this preset.
+                    {' '}from this preset{sshOnly ? '; its SSH login (or its API login, when it has none) is used for SSH' : ''}.
                   </p>
                 )}
               </div>
@@ -232,7 +313,7 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
               <>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className="label">RouterOS Username *</label>
+                    <label className="label">{sshOnly ? 'SSH Username *' : 'RouterOS Username *'}</label>
                     <input
                       className="input"
                       value={form.api_username}
@@ -240,30 +321,62 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
                       placeholder="admin"
                     />
                   </div>
+                  {sshOnly ? (
+                    <div>
+                      <label className="label">SSH Port</label>
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={65535}
+                        value={form.ssh_port}
+                        onChange={(e) => set('ssh_port', e.target.value)}
+                        placeholder="22"
+                      />
+                    </div>
+                  ) : (
                   <div>
                     <label className="label">API Port</label>
                     <input
                       className="input"
                       type="number"
+                      min={1}
+                      max={65535}
                       value={form.api_port}
                       onChange={(e) => set('api_port', e.target.value)}
-                      placeholder="8728"
+                      placeholder="Auto"
                     />
+                    {portGiven ? (
+                      <label className="flex items-center gap-1.5 text-xs text-gray-700 dark:text-slate-200 mt-1.5 cursor-pointer"
+                        title="Tick when this port runs api-ssl, for example a forwarded port behind NAT">
+                        <input type="checkbox" className="w-3.5 h-3.5 rounded" checked={apiSsl} onChange={(e) => setApiSslChoice(e.target.checked)} />
+                        API-SSL (encrypted)
+                      </label>
+                    ) : (
+                      <p className="text-[11px] text-gray-400 mt-1">Blank tries API-SSL (8729), then 8728.</p>
+                    )}
                   </div>
+                  )}
                   <div className="col-span-2">
-                    <label className="label">RouterOS Password *</label>
+                    <label className="label">{sshOnly ? 'SSH Password *' : 'RouterOS Password *'}</label>
                     <input
                       className="input"
                       type="password"
                       value={form.api_password}
                       onChange={(e) => set('api_password', e.target.value)}
-                      placeholder="RouterOS API password"
+                      placeholder={sshOnly ? 'SSH password' : 'RouterOS API password'}
                       autoComplete="new-password"
                     />
+                    {sshOnly && (
+                      <p className="text-[11px] text-gray-400 mt-1">
+                        The same login is tried on the API once it&apos;s enabled. To use another one, change the API login in Edit Device later.
+                      </p>
+                    )}
                   </div>
                 </div>
 
                 {/* SSH credentials (optional) */}
+                {!sshOnly && (
                 <details className="group mt-3">
                   <summary className="cursor-pointer text-xs font-semibold text-gray-500 dark:text-slate-400 uppercase tracking-wider select-none">
                     SSH Credentials (optional, for backup/restore)
@@ -283,6 +396,8 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
                       <input
                         className="input"
                         type="number"
+                        min={1}
+                        max={65535}
                         value={form.ssh_port}
                         onChange={(e) => set('ssh_port', e.target.value)}
                         placeholder="22"
@@ -300,9 +415,34 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
                     </div>
                   </div>
                 </details>
+                )}
               </>
             )}
           </div>
+
+          {tags.length > 0 && (
+            <div>
+              <label className="label">Tags (optional)</label>
+              <div className="flex flex-wrap gap-1.5">
+                {tags.map((t) => {
+                  const on = tagIds.includes(t.id);
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => toggleTag(t.id)}
+                      className="px-2 py-0.5 rounded-full text-xs border"
+                      style={on
+                        ? { background: t.color + '33', color: t.color, borderColor: t.color }
+                        : { borderColor: 'var(--line, #e5e7eb)', color: 'var(--ink-3, #6b7280)' }}
+                    >
+                      {t.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           <div>
             <label className="label">Notes (optional)</label>
@@ -326,7 +466,7 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
             <div className="flex items-center gap-2 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
               <Loader2 className="w-4 h-4 text-blue-500 animate-spin flex-shrink-0" />
               <p className="text-sm text-blue-600 dark:text-blue-400">
-                Testing connection and collecting device data...
+                {sshOnly ? 'Trying the API, then logging in over SSH...' : 'Testing connection and collecting device data...'}
               </p>
             </div>
           )}
@@ -341,24 +481,49 @@ export default function AddDeviceModal({ onClose, onSuccess, prefill }: Props) {
               ) : (
                 <CheckCircle className="w-4 h-4" />
               )}
-              Add Device
+              {submitLabel || 'Add Device'}
             </button>
           </div>
         </form>
+  );
+
+  const duplicatePrompt = duplicateSerial && (
+    <ConfirmDuplicateModal
+      duplicate={duplicateSerial}
+      pendingName={form.name}
+      pendingIp={form.ip_address}
+      onCancel={() => { setDuplicateSerial(null); }}
+      onCombine={handleCombineDuplicate}
+      onReplace={handleReplaceDuplicate}
+      loading={loading}
+    />
+  );
+
+  // Embedded: the Adopt Device dialog owns the chrome and the detection panel.
+  if (embedded) {
+    return (
+      <>
+        {formBody}
+        {duplicatePrompt}
+      </>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+      <div className="card w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between p-5 border-b border-gray-200 dark:border-slate-700">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Add Device</h2>
+          <button
+            onClick={onClose}
+            className="p-1 rounded text-gray-400 hover:text-gray-600 dark:hover:text-slate-300"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        {formBody}
       </div>
-      {duplicateSerial && (
-        <ConfirmDuplicateModal
-          duplicate={duplicateSerial}
-          pendingName={form.name}
-          pendingIp={form.ip_address}
-          onCancel={() => {
-            setDuplicateSerial(null);
-          }}
-          onCombine={handleCombineDuplicate}
-          onReplace={handleReplaceDuplicate}
-          loading={loading}
-        />
-      )}
+      {duplicatePrompt}
     </div>
   );
 }

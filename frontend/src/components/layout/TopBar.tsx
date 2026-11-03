@@ -1,20 +1,29 @@
 import { useNavigate } from 'react-router-dom';
-import { Sun, Moon, LogOut, Menu } from 'lucide-react';
+import { Sun, Moon, LogOut, Menu, BookOpen } from 'lucide-react';
 import { useAuthStore } from '../../store/authStore';
 import { useThemeStore } from '../../store/themeStore';
 import GlobalSearch from './GlobalSearch';
+import { docsUrl } from '../../version';
+import { useQuery } from '@tanstack/react-query';
+import { settingsApi, signOut } from '../../services/api';
 
 interface TopBarProps {
   onMenuClick: () => void;
 }
 
 export default function TopBar({ onMenuClick }: TopBarProps) {
-  const { user, logout } = useAuthStore();
+  const { user } = useAuthStore();
+  const { data: appSettings } = useQuery({
+    queryKey: ['app-settings'],
+    queryFn: () => settingsApi.get().then((r) => r.data),
+    staleTime: 300_000,
+  });
+  const docsEnabled = appSettings?.['docs_link_enabled'] !== false;
   const { theme, toggleTheme } = useThemeStore();
   const navigate = useNavigate();
 
-  const handleLogout = () => {
-    logout();
+  const handleLogout = async () => {
+    await signOut();
     navigate('/login');
   };
 
@@ -69,6 +78,23 @@ export default function TopBar({ onMenuClick }: TopBarProps) {
             {user?.username}
           </span>
         </div>
+
+        {/* Documentation. Points at the series this build belongs to rather than
+            "latest", so the pages describe the version actually running. Hidden
+            in Dark Site Mode, where the site cannot be reached. */}
+        {docsEnabled && (
+        <a
+          href={docsUrl()}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="p-[7px] rounded-lg transition-colors hover:text-accent"
+          style={{ color: 'var(--ink-4)' }}
+          title="Documentation"
+          aria-label="Open the documentation in a new tab"
+        >
+          <BookOpen className="w-4 h-4" />
+        </a>
+        )}
 
         {/* Logout */}
         <button

@@ -1,23 +1,143 @@
+import { compareRosVersions } from '../../utils/rosVersion';
+import type { BgpConnectionInput } from '../../utils/bgpConnection';
+import { routingPeersFrom } from '../../utils/routingPeers';
+import { PartialApplyError, stepFailure } from '../changeGuard/partialApply';
 import { createHash } from 'crypto';
-import { RouterOSClient } from './RouterOSClient';
+import { ApiNotEnabledError } from '../../utils/sshOnly';
+import { lease, dropSessions, type Lease, type SessionLane } from './sessionPool';
+import { RouterOSClient, RouterOSTrapError, isNoSuchCommand, type ReadSpec } from './RouterOSClient';
+import { usesApiTls } from '../../utils/apiTls';
 import { query, queryOne } from '../../config/database';
+import { bootChange } from '../../utils/bootTime';
+import { logSafe } from '../../utils/logSafe';
+import { legacyScanScript, parseLegacyScanOutput } from '../../utils/apScan';
+import { resolveNeighbourDevices } from '../topology/resolveNeighbours';
 import { getWriteApi } from '../../config/influxdb';
 import { Point } from '@influxdata/influxdb-client';
+import { verifyDeviceSerial, IdentityMismatchError } from '../identityPins';
+import { fit, normalizeMac } from '../../utils/fit';
+import { rosDurationSeconds } from '../../utils/rosDuration';
+import { guestSsidTag, legacyAuthTypes, legacyProfileName, legacyProfileParams } from './legacySecurity';
 import { decrypt } from '../../utils/crypto';
 import { lookupVendor } from '../../utils/oui';
 import { buildServerArpMap } from '../../utils/serverArp';
-import { aggregateBridgeVlans, portVlanMembership, expandVlanIds } from '../../utils/vlan';
+import { aggregateBridgeVlans, portVlanMembership, expandVlanIds, rosList } from '../../utils/vlan';
 import {
   classifyWifiRole, isCapsmanManaged, parseCapsmanStatus, parseCapStatus,
   normalizeRadios, macIndexKeys, parseRadioMonitor, resolveDatapath,
-  clientsPerRadio, buildMacIndex, matchRadiosToDevices,
+  clientsPerRadio, buildMacIndex, matchRadiosToDevices, lookupDeviceForMac,
+  legacyManagerEnabled, legacyCapInterfaces, legacyRadios, hasRadios, chooseWifiPackage,
   type WifiRole,
 } from './capsman';
+
+/**
+ * How each device's legacy wireless scan is read (#295), learned on the first
+ * scan: 'script' when its API reply leaves out the privacy flag and the
+ * script form has it, 'api' when the script form didn't help either.
+ */
+const legacyScanMode = new Map<number, 'script' | 'api'>();
+
+/**
+ * Version of the wireless role check. Devices classified by an older version
+ * are probed once more; 2 added legacy CAPsMAN (#250).
+ */
+// 3: the legacy wireless package counts as radios only when it lists some, so an
+// all-in-one router (hAP ac²) is standalone and a router without radios isn't.
+// 4: the package is the one whose menu lists radios; the wifi menu answers on
+// every RouterOS 7.13+ device, which hid a hAP ac²'s legacy radios.
+const WIFI_ROLE_PROBE = 4;
+
+/**
+ * How often a device found to have no wireless role is checked again. CAPsMAN
+ * can be switched on after a router was added, and a 'none' was never looked
+ * at again, so the controller's CAPs and clients were never read (#365).
+ */
+const WIFI_ROLE_RECHECK_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A role seen once that would replace a device's recorded one, by device id.
+ * A recorded role is only changed when two checks in a row agree: one bad read
+ * after a restart turned working controllers into 'none' and cleared their CAP
+ * inventory (#365). Kept in memory, so the first check after a restart can't
+ * change a role on its own.
+ */
+const pendingWifiRole = new Map<number, WifiRole>();
+
+/**
+ * What one CAPsMAN reported, by key, for removing what's gone afterwards; null
+ * where the read failed.
+ */
+interface CapsmanInventory {
+  radios: string[] | null;
+  configurations: string[] | null;
+  provisioning: string[] | null;
+}
 import {
   parseLteMonitor, overallQuality, detectChanges, type LteStatus,
 } from '../../utils/lte';
+import { bytesSince, periodKey, shouldSend } from '../../utils/dataCap';
+import { parseDeviceLogTime } from '../../utils/deviceTime';
 import { BackupService } from '../BackupService';
+import { storeProxyConnections } from '../ProxyLogService';
+
+/** RouterOS update commands reach out to MikroTik's servers and are slow by nature. */
+const UPDATE_CHECK_TIMEOUT_MS = 90_000;
+const UPDATE_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+/**
+ * `/log/print` returns the device's entire ring buffer -- a thousand sentences
+ * is normal -- and measured against real hardware it routinely outruns the 30s
+ * default. Timing it out cost the device's whole log *and*, before the client
+ * learned to abandon a timed-out connection, desynchronised the session (#137).
+ */
+const LOG_READ_TIMEOUT_MS = 120_000;
+import { rememberManagerAddress } from '../../utils/managerAddresses';
+import { selectNewLogLines, highestStoredId, surrogateLogId, storedLogId, resumePoint, bufferMark, type RawLogLine } from '../../utils/logDedup';
+import {
+  parseUpdateStatus, latestFromStream, peakPercent, type UpdateStatus,
+} from '../../utils/updateStatus';
+
+/** What `/system/package/update/download` reported while it ran. */
+export interface DownloadResult {
+  status: UpdateStatus;
+  /** Furthest percentage seen, so a partial download can say how far it got. */
+  peakPercent: number | null;
+  /** Number of progress rows streamed; zero means the device said nothing. */
+  rows: number;
+}
 import { alertService } from '../AlertService';
+import { readRevocation } from '../../utils/certRecord';
+import { managerAddressFromActive, stripOwnSessionNoise } from '../../utils/logNoise';
+import { ALL_MODULES, type PollModules } from '../../utils/pollModules';
+import { planVlanWrite, frameTypesFor, planTaggedRemovals } from '../../utils/bridgeVlanPlan';
+import { planBridgePortMove, bridgeDeleteRefusal } from '../../utils/bridgePortMove';
+import { normalizeHealth, evaluateHealth, type HealthVerdict, type HealthIssue } from '../../utils/deviceHealth';
+import { resolveChannel } from '../../utils/updateChannel';
+import { registerPollSession } from '../../utils/pollJobContext';
+import { translateToWifiParams } from './wifiParams';
+import { toV7FilterRule } from './routeFilter';
+import { usesRemoteLogFormat, toSyslogActionParams } from './syslogAction';
+import { configuredServices } from '../../utils/ipServices';
+import { isClockChangeLine } from '../../utils/clockLogLines';
+import { planNtpWrites, isLegacyClient, legacyServerList, type NtpForm } from './ntpSettings';
+import { recordInterfaceCounters } from '../interfaceErrors';
+import { parseRateBps } from '../../utils/wifiRate';
+import { probeUserManager, USER_MANAGER_RECHECK_MS } from '../userManager';
+import { poolSize, usedPerPool } from '../../utils/dhcpPools';
+import { recordOptics } from '../opticLevels';
+
+/** The device tables the bridge-port checks read (#258). */
+export interface BridgeState {
+  bridgePorts: Record<string, string>[]; interfaces: Record<string, string>[];
+  bridgeVlans: Record<string, string>[]; addresses: Record<string, string>[];
+  dhcpClients: Record<string, string>[]; vlanInterfaces: Record<string, string>[];
+  dhcpServers: Record<string, string>[];
+}
+
+/** How long to look for the hardware-offload flag where it is expected after a bridge move. */
+const OFFLOAD_WAIT_MS = 12_000;
+
+/** A RouterOS property name: lower-case words joined by '-' or '.', never '.id'. */
+const ROS_PROPERTY = /^[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*$/;
 
 /** DB column limits for topology_links (see migrate.ts); reject oversize rows instead of silent truncation. */
 const TOPOLOGY_LINK_LIMITS = {
@@ -73,8 +193,19 @@ function parseWifiMonitorChannel(channel: string): { frequency: number; width: s
 export interface DeviceRow {
   id: number;
   name: string;
+  /**
+   * True once an operator has deliberately named this device (Add Device with
+   * a name unlike the router's own identity, or a rename in Edit Device) —
+   * collectSystemInfo() then leaves `name` alone instead of following
+   * /system/identity on every poll. Optional/falsy on a DeviceRow built by
+   * hand for a single narrow action (never poured through collectSystemInfo),
+   * so `undefined` safely means "not locked" rather than requiring every call
+   * site to know about it.
+   */
+  name_locked?: boolean;
   ip_address: string;
   api_port: number;
+  api_tls?: boolean | null;
   ssh_port?: number;
   api_username: string;
   api_password_encrypted: string;
@@ -84,7 +215,27 @@ export interface DeviceRow {
   ros_version?: string;
   device_type: string;
   status: string;
+  /** Added over SSH only; the API isn't enabled yet (#174). */
+  ssh_only?: boolean;
 }
+
+/** Physical ethernet names, which is all `monitor` will accept. */
+function allEthernetNames(
+  ifaces: Record<string, string>[],
+  bridgeNames: Set<string>,
+  bondNames: Set<string>
+): string[] {
+  return ifaces
+    .filter((i) => (i['type'] || '') === 'ether')
+    .map((i) => i['name'])
+    .filter((n): n is string => !!n && !bridgeNames.has(n) && !bondNames.has(n));
+}
+
+/** A log line this poll stored. */
+export interface NewLogEvent { id: number; event_time: Date; severity: string; message: string }
+
+/** Longest log message kept; RouterOS's own are a few hundred characters at most. */
+const MAX_LOG_MESSAGE = 4096;
 
 export class DeviceCollector {
   private client: RouterOSClient;
@@ -94,25 +245,179 @@ export class DeviceCollector {
       device.ip_address,
       device.api_port,
       device.api_username,
-      decrypt(device.api_password_encrypted)
+      decrypt(device.api_password_encrypted),
+      15000,
+      30000,
+      usesApiTls(device),
     );
+    // Lets the poller cancel this session if its job runs out of time.
+    registerPollSession(this);
+  }
+
+  /** Set once the poller gave up on this job; see abort(). */
+  private aborted = false;
+
+  /** Phase timings of this session, for Settings → Polling (#301). */
+  timings: { connectMs: number; reused: boolean } = { connectMs: 0, reused: false };
+
+  /**
+   * Time this poll spent waiting on the device's answers since it connected
+   * (#301); the rest of the collecting is the database and processing.
+   */
+  deviceTime(): number {
+    return this.client.takeDeviceTime();
+  }
+  private leaseHandle: Lease | null = null;
+
+  /**
+   * Connect for a poll through the session pool (#301): an open session for
+   * this device and lane is reused, a new one is opened and kept otherwise.
+   * When the pooled session is busy, or pooling is off, connects on its own.
+   * Pair with release(ok) rather than disconnect().
+   */
+  async connectPooled(lane: SessionLane, enabled = true): Promise<void> {
+    const started = Date.now();
+    if (!enabled) {
+      // Switched off: close any sessions still open from before.
+      dropSessions(this.device.id);
+      await this.connect(); this.timings = { connectMs: Date.now() - started, reused: false }; this.client.takeDeviceTime(); return;
+    }
+    if (this.aborted) throw new Error('Poll cancelled: it ran past its time limit');
+    const l = lease(this.device, lane, usesApiTls(this.device), () => this.client);
+    if (!l) { await this.connect(); this.timings = { connectMs: Date.now() - started, reused: false }; this.client.takeDeviceTime(); return; }
+    this.leaseHandle = l;
+    this.client = l.client;
+    try {
+      if (l.fresh) {
+        await this.connect();
+        l.markVerified();
+      } else if (l.needsVerify) {
+        await this.verifySerial();
+        l.markVerified();
+      }
+    } catch (e) {
+      this.release(false);
+      throw e;
+    }
+    this.timings = { connectMs: Date.now() - started, reused: !l.fresh }; this.client.takeDeviceTime();
+  }
+
+  /** End a poll: a pooled session is kept when the poll succeeded, closed otherwise. */
+  release(ok: boolean): void {
+    if (this.leaseHandle) {
+      const l = this.leaseHandle;
+      this.leaseHandle = null;
+      l.release(ok && !this.aborted);
+    } else {
+      this.client.disconnect();
+    }
   }
 
   async connect(): Promise<void> {
+    if (this.aborted) throw new Error('Poll cancelled: it ran past its time limit');
+    // Added over SSH only (#174): nothing here works until the API is on. Many
+    // routes load only a few columns, so the flag is looked up when it's missing.
+    let sshOnly = this.device.ssh_only;
+    let name = this.device.name;
+    if (sshOnly === undefined && this.device.id) {
+      const row = await queryOne<{ ssh_only: boolean; name: string }>(
+        `SELECT ssh_only, name FROM devices WHERE id = $1`, [this.device.id]).catch(() => null);
+      sshOnly = row?.ssh_only;
+      name = name ?? row?.name;
+    }
+    if (sshOnly) throw new ApiNotEnabledError(name ?? `Device ${this.device.id}`);
     await this.client.connect();
+    await this.verifySerial();
+  }
+
+  /**
+   * Is this still the device the record is about (outside review P2-19)? A
+   * different serial number means another device answers at the address, so
+   * the connection is closed before anything is read from or written to it.
+   * A device with no serial (CHR, x86) or that won't say has nothing to
+   * compare, and a database hiccup here doesn't fail the poll.
+   */
+  private async verifySerial(): Promise<void> {
+    let serial: string | undefined;
+    try {
+      const rb = await this.client.execute('/system/routerboard/print');
+      serial = rb[0]?.['serial-number'];
+    } catch {
+      return;
+    }
+    if (!serial) return;
+    try {
+      await verifyDeviceSerial(this.device.id, this.device.name, serial);
+    } catch (err) {
+      if (err instanceof IdentityMismatchError) {
+        this.client.disconnect();
+        throw err;
+      }
+    }
   }
 
   disconnect(): void {
     this.client.disconnect();
   }
 
+  /**
+   * Stop a poll that ran past its time limit (utils/pollJobContext.ts). The
+   * connection is closed, and the device is not marked online afterwards: the
+   * job already counted as failed, and a late "online" left its outage open.
+   */
+  abort(): void {
+    this.aborted = true;
+    this.client.disconnect();
+    // A pooled session is dropped too: its reply stream can't be trusted now.
+    if (this.leaseHandle) { this.leaseHandle.release(false); this.leaseHandle = null; }
+  }
+
   // ─── Fast poll (every 30s) ─────────────────────────────────────────────────
 
+  /**
+   * Which collectors are switched on. Defaults to all, so a caller that does
+   * not set them behaves exactly as before.
+   */
+  modules: PollModules = ALL_MODULES;
+  /**
+   * Send a fast poll's reads together (#301): one round trip instead of one
+   * per read. Settings → Polling can turn it off.
+   */
+  pipelineReads = true;
+
   async collectFast(): Promise<void> {
+    if (this.pipelineReads) {
+      // The reads every fast poll makes, sent together; the collectors below
+      // are served from the answers and ask the device for anything else.
+      const reads: ReadSpec[] = [
+        { command: '/interface/print', params: { stats: '' } },
+        { command: '/interface/ethernet/print', params: { stats: '' } },
+        { command: '/system/resource/print' },
+      ];
+      if (this.modules.clients) {
+        reads.push(
+          { command: '/interface/wifi/print' }, { command: '/interface/wireless/print' },
+          { command: '/ip/arp/print' }, { command: '/ip/dhcp-server/lease/print' },
+          { command: '/interface/wifi/registration-table/print' }, { command: '/interface/bridge/host/print' },
+        );
+      }
+      if (this.device.device_type === 'switch') reads.push({ command: '/interface/ethernet/poe/print' });
+      await this.client.prefetch(reads).catch(() => { /* read one by one instead */ });
+    }
+    try {
+      await this.collectFastReads();
+    } finally {
+      this.client.endPrefetch();
+    }
+  }
+
+  private async collectFastReads(): Promise<void> {
     await this.collectInterfaceTraffic();
     await this.collectResourceUsage();
-    await this.updateClients();
-    if (this.device.device_type === 'wireless_ap') {
+    if (this.modules.clients) await this.updateClients();
+    // Radios of its own, whatever it was added as: an all-in-one router such
+    // as the hAP ac² is an access point too.
+    if (hasRadios(this.device as unknown as { device_type: string; wifi_role?: string | null })) {
       await this.collectWirelessStats();
     }
     if (this.device.device_type === 'switch') {
@@ -121,7 +426,18 @@ export class DeviceCollector {
     if ((this.device as unknown as { has_lte?: boolean }).has_lte) {
       await this.collectLte();
     }
+    if (this.aborted) throw new Error('Poll cancelled: it ran past its time limit');
+    this.assertStillConnected();
     await this.updateDeviceStatus('online');
+  }
+
+  /**
+   * The individual collectors log and swallow their own errors, so a poll
+   * whose connection dropped halfway still reached "online" with a fresh
+   * last_seen (outside review J1). A lost connection fails the poll instead.
+   */
+  private assertStillConnected(): void {
+    if (!this.client.isConnected()) throw new Error('The connection to the device was lost during the poll');
   }
 
   // ─── Slow poll (every 5 min) ───────────────────────────────────────────────
@@ -131,15 +447,22 @@ export class DeviceCollector {
    *
    * `device_type` alone is wrong for CAPsMAN: a dedicated controller is usually
    * classified as a router, has no radios of its own, and yet owns the wireless
-   * configuration of the entire fleet. Probing every device once and remembering
-   * the answer costs one call on first sight and nothing afterwards, which beats
-   * both probing forever and never noticing a controller.
+   * configuration of the entire fleet. A device without a wireless role is
+   * checked again about once a day, and on a manual Sync (`recheck`), so CAPsMAN
+   * switched on later is noticed (#365): two calls a day, not every poll.
    */
-  private shouldCollectWireless(): boolean {
+  private shouldCollectWireless(recheck = false): boolean {
     if (this.device.device_type === 'wireless_ap') return true;
-    const role = (this.device as unknown as { wifi_role?: string | null }).wifi_role;
+    const d = this.device as unknown as { wifi_role?: string | null; wifi_role_probe?: number | null; wifi_role_checked_at?: string | Date | null };
+    const role = d.wifi_role;
     if (role == null) return true;                 // never determined — probe once
-    return role !== 'none' && role !== 'standalone';
+    // Classified by an older role check: look once more (legacy CAPsMAN, #250).
+    if ((d.wifi_role_probe ?? 0) < WIFI_ROLE_PROBE) return true;
+    // 'standalone' is a device with its own radios (an all-in-one router, say).
+    if (role !== 'none') return true;
+    if (recheck) return true;
+    const checked = d.wifi_role_checked_at ? new Date(d.wifi_role_checked_at).getTime() : 0;
+    return !(Date.now() - checked < WIFI_ROLE_RECHECK_MS);
   }
 
   async collectSlow(): Promise<void> {
@@ -149,20 +472,215 @@ export class DeviceCollector {
     await this.collectSystemInfo();
     await this.collectStp();
     await this.collectLte();
+    if (this.modules.certificates) await this.collectCertificates();
+    await this.collectWireGuardPeers();
+    await this.collectRoutingPeers();
     if (this.shouldCollectWireless()) {
       await this.collectWirelessInterfaces();
       await this.collectSecurityProfiles();
       await this.collectCapsman();
     }
+    await this.checkUserManager();
+    await this.collectDhcpPools();
+  }
+
+  /**
+   * How full each IPv4 address pool is (#156). Two reads; a device without
+   * pools stores nothing. A failed read keeps what was stored.
+   */
+  private async collectDhcpPools(): Promise<void> {
+    try {
+      const pools = await this.client.execute('/ip/pool/print').catch(() => null);
+      if (pools === null) return;
+      // RouterOS 7 reports total and used on each pool; older releases need
+      // the used-address list, which can run to thousands of rows.
+      const reportsCounts = pools.every((p) => p['total'] !== undefined && p['used'] !== undefined);
+      const used = pools.length && !reportsCounts
+        ? await this.client.execute('/ip/pool/used/print', { '.proplist': 'pool' }).catch(() => null)
+        : [];
+      if (used === null) return;
+      const counts = usedPerPool(used);
+      const names: string[] = [];
+      for (const p of pools) {
+        const name = (p['name'] || '').slice(0, 64);
+        if (!name) continue;
+        names.push(name);
+        await query(
+          `INSERT INTO dhcp_pool_usage (device_id, name, ranges, size, used, updated_at) VALUES ($1,$2,$3,$4,$5,NOW())
+           ON CONFLICT (device_id, name) DO UPDATE SET ranges=$3, size=$4, used=$5, updated_at=NOW()`,
+          [this.device.id, name, p['ranges'] ?? null,
+           reportsCounts ? Number(p['total']) || poolSize(p['ranges']) : poolSize(p['ranges']),
+           reportsCounts ? Number(p['used']) || 0 : counts.get(p['name']) ?? 0]);
+      }
+      await query(`DELETE FROM dhcp_pool_usage WHERE device_id = $1 AND NOT (name = ANY($2::text[]))`, [this.device.id, names]);
+    } catch (err) {
+      console.warn(`[${this.device.name}] DHCP pools not read:`, (err as Error).message);
+    }
+  }
+
+  /**
+   * Does this device run User Manager (#251)? Asked once a day, so a device
+   * that starts running it shows up on the Services page within a day, and
+   * the rest of the fleet pays one call a day.
+   */
+  private async checkUserManager(): Promise<void> {
+    const d = this.device as unknown as { user_manager_checked_at?: string | Date | null };
+    const last = d.user_manager_checked_at ? new Date(d.user_manager_checked_at).getTime() : 0;
+    if (Date.now() - last < USER_MANAGER_RECHECK_MS) return;
+    const running = await probeUserManager((cmd) => this.client.execute(cmd));
+    if (running === null) return;
+    await query(`UPDATE devices SET user_manager = $2, user_manager_checked_at = NOW() WHERE id = $1`, [this.device.id, running])
+      .catch(() => { /* advisory */ });
+  }
+
+  /**
+   * WireGuard peers and their last handshake, for the stale-peer alert (#208).
+   * A device without WireGuard (RouterOS 6, or no package) answers "no such
+   * command" and simply has none; a failed read keeps what was stored.
+   */
+  async collectWireGuardPeers(): Promise<void> {
+    let ifaces: Record<string, string>[];
+    let peers: Record<string, string>[];
+    try {
+      ifaces = await this.client.execute('/interface/wireguard/print');
+      peers = await this.client.execute('/interface/wireguard/peers/print', { detail: '' });
+    } catch (err) {
+      if (err instanceof RouterOSTrapError) {
+        await query(`DELETE FROM wireguard_peers WHERE device_id = $1`, [this.device.id]).catch(() => {});
+      }
+      return;
+    }
+    try {
+      const ifaceDisabled = new Map(ifaces.map((i) => [i['name'], i['disabled'] === 'true']));
+      const seen: string[] = [];
+      for (const p of peers) {
+        const id = p['.id'];
+        if (!id) continue;
+        seen.push(id);
+        const endpoint = p['current-endpoint-address'] || p['endpoint-address'] || '';
+        const port = p['current-endpoint-port'] || p['endpoint-port'] || '';
+        await query(
+          `INSERT INTO wireguard_peers (device_id, peer_id, interface, name, public_key, endpoint, allowed_address,
+                                        last_handshake_sec, disabled, interface_disabled, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+           ON CONFLICT (device_id, peer_id) DO UPDATE SET
+             interface = EXCLUDED.interface, name = EXCLUDED.name, public_key = EXCLUDED.public_key,
+             endpoint = EXCLUDED.endpoint, allowed_address = EXCLUDED.allowed_address,
+             last_handshake_sec = EXCLUDED.last_handshake_sec, disabled = EXCLUDED.disabled,
+             interface_disabled = EXCLUDED.interface_disabled, updated_at = NOW()`,
+          // RouterOS names peers peer1, peer2... by itself; a comment says more.
+          [this.device.id, fit(id, 16), fit(p['interface'] || null, 64),
+           fit((/^peer\d+$/.test(p['name'] || '') ? p['comment'] : '') || p['name'] || p['comment'] || null, 128),
+           fit(p['public-key'] || null, 64), fit(endpoint ? (port ? `${endpoint}:${port}` : endpoint) : null, 128),
+           p['allowed-address'] || null, rosDurationSeconds(p['last-handshake']),
+           p['disabled'] === 'true', ifaceDisabled.get(p['interface']) ?? false]
+        );
+      }
+      await query(`DELETE FROM wireguard_peers WHERE device_id = $1 AND NOT (peer_id = ANY($2::text[]))`, [this.device.id, seen]);
+    } catch (err) {
+      console.error(`[${this.device.name}] Failed to store WireGuard peers:`, (err as Error).message);
+    }
+  }
+
+  /**
+   * BGP peers and OSPF neighbours (#279). Two cheap reads on a device without
+   * either; the sessions and neighbours only where something is configured. A
+   * failed read keeps what was stored, as for WireGuard.
+   */
+  async collectRoutingPeers(): Promise<void> {
+    const none = () => [] as Record<string, string>[];
+    let bgpConnections: Record<string, string>[];
+    let ospfInstances: Record<string, string>[];
+    try {
+      [bgpConnections, ospfInstances] = await Promise.all([
+        // RouterOS 7: connection; 6: peer. A device without either answers with a trap.
+        this.client.execute('/routing/bgp/connection/print', { detail: '' })
+          .catch((e) => (e instanceof RouterOSTrapError
+            ? this.client.execute('/routing/bgp/peer/print', { detail: '' }).catch((e2) => (e2 instanceof RouterOSTrapError ? none() : Promise.reject(e2)))
+            : Promise.reject(e))),
+        this.client.execute('/routing/ospf/instance/print').catch((e) => (e instanceof RouterOSTrapError ? none() : Promise.reject(e))),
+      ]);
+    } catch {
+      return;
+    }
+    if (bgpConnections.length === 0 && ospfInstances.length === 0) {
+      await query(`DELETE FROM routing_peers WHERE device_id = $1`, [this.device.id]).catch(() => {});
+      return;
+    }
+    try {
+      const [bgpSessions, ospfNeighbors] = await Promise.all([
+        bgpConnections.length ? this.client.execute('/routing/bgp/session/print', { detail: '' }).catch(none) : none(),
+        ospfInstances.length ? this.client.execute('/routing/ospf/neighbor/print', { detail: '' }) : none(),
+      ]);
+      const peers = routingPeersFrom({ bgpConnections, bgpSessions, ospfNeighbors });
+      for (const p of peers) {
+        await query(
+          `INSERT INTO routing_peers (device_id, protocol, peer_key, name, remote_address, remote_as, remote_id, instance,
+                                      detail, state, up, disabled, uptime, prefix_count, last_up_at, last_change_at, last_seen_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, CASE WHEN $11 THEN NOW() END, NOW(), NOW(), NOW())
+           ON CONFLICT (device_id, protocol, peer_key) DO UPDATE SET
+             name = EXCLUDED.name, remote_address = EXCLUDED.remote_address, remote_as = EXCLUDED.remote_as,
+             remote_id = EXCLUDED.remote_id, instance = EXCLUDED.instance, detail = EXCLUDED.detail,
+             state = EXCLUDED.state, disabled = EXCLUDED.disabled, uptime = EXCLUDED.uptime,
+             prefix_count = EXCLUDED.prefix_count,
+             last_change_at = CASE WHEN routing_peers.up <> EXCLUDED.up THEN NOW() ELSE routing_peers.last_change_at END,
+             last_up_at = CASE WHEN EXCLUDED.up THEN NOW() ELSE routing_peers.last_up_at END,
+             up = EXCLUDED.up, last_seen_at = NOW(), updated_at = NOW()`,
+          [this.device.id, p.protocol, fit(p.key, 160), fit(p.name, 128), fit(p.remoteAddress, 64), fit(p.remoteAs, 16),
+           fit(p.remoteId, 64), fit(p.instance, 64), fit(p.detail, 160), fit(p.state, 32), p.up, p.disabled,
+           fit(p.uptime, 32), p.prefixCount]
+        );
+      }
+      const bgpKeys = peers.filter((p) => p.protocol === 'bgp').map((p) => fit(p.key, 160));
+      const ospfKeys = peers.filter((p) => p.protocol === 'ospf').map((p) => fit(p.key, 160));
+      // A BGP connection that's gone was removed on purpose.
+      await query(`DELETE FROM routing_peers WHERE device_id = $1 AND protocol = 'bgp' AND NOT (peer_key = ANY($2::text[]))`, [this.device.id, bgpKeys]);
+      if (ospfInstances.length === 0) {
+        await query(`DELETE FROM routing_peers WHERE device_id = $1 AND protocol = 'ospf'`, [this.device.id]);
+      } else {
+        // An OSPF neighbour that vanished has gone down: keep it, marked down,
+        // for a week, then forget it (a neighbour removed for good).
+        await query(
+          `UPDATE routing_peers SET up = FALSE, state = 'down', uptime = NULL,
+                  last_change_at = CASE WHEN up THEN NOW() ELSE last_change_at END, updated_at = NOW()
+            WHERE device_id = $1 AND protocol = 'ospf' AND NOT (peer_key = ANY($2::text[]))`,
+          [this.device.id, ospfKeys]);
+        await query(
+          `DELETE FROM routing_peers WHERE device_id = $1 AND protocol = 'ospf' AND last_seen_at < NOW() - INTERVAL '7 days'`,
+          [this.device.id]);
+      }
+    } catch (err) {
+      console.error(`[${this.device.name}] Failed to store routing peers:`, (err as Error).message);
+    }
   }
 
   // ─── Log poll (every 60s) ─────────────────────────────────────────────────
 
-  async collectLogs(): Promise<void> {
-    await this.collectEvents();
+  /** Collect new log lines; returns the ones actually stored, for log alerts. */
+  async collectLogs(): Promise<NewLogEvent[]> {
+    return this.collectEvents();
   }
 
   // ─── Full initial collection ───────────────────────────────────────────────
+
+  /**
+   * A Sync of just what one tab shows, so its Refresh brings fresh data from
+   * the device in a second or two instead of re-reading what the last poll
+   * stored. 'vlans': interfaces, addresses and the bridge VLAN table (the
+   * VLANs and Ports tabs); 'wireless': radios, security profiles and CAPsMAN.
+   */
+  async collectScope(scope: 'vlans' | 'wireless'): Promise<void> {
+    if (scope === 'vlans') {
+      await this.collectInterfaces();
+      await this.collectIpAddressesCache();
+      await this.collectVlans();
+    } else if (this.shouldCollectWireless(true)) {
+      await this.collectWirelessInterfaces();
+      await this.collectSecurityProfiles();
+      await this.collectCapsman();
+    }
+    this.assertStillConnected();
+  }
 
   async collectAll(): Promise<void> {
     await this.collectSystemInfo();
@@ -171,19 +689,32 @@ export class DeviceCollector {
     await this.collectVlans();
     await this.collectInterfaceTraffic();
     await this.collectResourceUsage();
-    await this.updateClients();
-    await this.collectEvents();
-    await this.collectNeighbors();
+    // A manual Sync honours the toggles as well. Collecting something that is
+    // switched off would populate data nothing refreshes afterwards, which is
+    // worse than not having it.
+    if (this.modules.clients) await this.updateClients();
+    if (this.modules.logs) await this.collectEvents();
+    if (this.modules.neighbors) await this.collectNeighbors();
+    // Topology and spanning tree belong in a full resync: someone pressing Sync
+    // after rewiring expects the map to catch up, and previously STP only
+    // refreshed on the five-minute slow poll (#131).
+    await this.collectStp();
     await this.collectLte();
+    // WireGuard and routing peers too, so Sync shows a tunnel or BGP session
+    // that just came up or dropped (#279) rather than waiting for the slow poll.
+    await this.collectWireGuardPeers();
+    await this.collectRoutingPeers();
     // Wireless data belongs in a full resync too — without this, a manual sync
     // never refreshed radios/SSIDs (or pruned ones deleted on the device), so
-    // the UI could only catch up on the 5-minute slow poll.
-    if (this.shouldCollectWireless()) {
+    // the UI could only catch up on the 5-minute slow poll. A device without a
+    // wireless role is checked again, so CAPsMAN switched on since is found.
+    if (this.shouldCollectWireless(true)) {
       await this.collectWirelessInterfaces();
       await this.collectSecurityProfiles();
       await this.collectCapsman();
     }
     await this.saveFullConfig();
+    this.assertStillConnected();
     await this.updateDeviceStatus('online');
   }
 
@@ -194,23 +725,58 @@ export class DeviceCollector {
       const identity = await this.client.execute('/system/identity/print');
       const resource = await this.client.execute('/system/resource/print');
       const routerboard = await this.client.execute('/system/routerboard/print').catch(() => [] as Record<string, string>[]);
+      // Needed to place log timestamps correctly — they are device-local (#117).
+      const clock = await this.client.execute('/system/clock/print').catch(() => [] as Record<string, string>[]);
+      // Architecture and installed packages: the firmware mirror fetches only
+      // what the fleet runs (#193). RouterOS 7 lists packages it could install
+      // as available=true; those aren't installed. A failed read keeps what was
+      // stored rather than emptying it.
+      const packages = await this.client.execute('/system/package/print').catch(() => null);
+      const installedPackages = packages
+        ? [...new Set(packages.filter((p) => p['available'] !== 'true' && p['name']).map((p) => p['name'].slice(0, 40)))].sort()
+        : null;
 
       const info = resource[0] || {};
       const rb = routerboard[0] || {};
-      const identityName = identity[0]?.['name'] || this.device.name;
+      // Only adopt the router's own /system/identity as the display name when
+      // nothing has been deliberately set — i.e. name_locked is false. Without
+      // this gate, the very first poll after "+ Add Device" (or a rename in
+      // Edit Device) silently reverted whatever the operator just typed,
+      // often to RouterOS's un-customized factory identity, "MikroTik".
+      // name_locked itself is decided at creation (deviceCreation.ts) and on
+      // every Edit Device rename (routes/devices.ts), and "Use the router's
+      // identity" in Edit Device clears it to opt back into following it.
+      const identityName = (!this.device.name_locked && identity[0]?.['name']) || this.device.name;
 
       const rosVersion = (info['version'] || '').split(' ')[0];
       const model = rb['model'] || info['board-name'] || null;
       const serial = rb['serial-number'] || null;
       const firmware = rb['current-firmware'] || rb['factory-firmware'] || null;
+      // RouterBOOT no longer pending: the installed firmware is at least the one
+      // RouterOS offers. Cleared here on every poll, as RouterOS updates are
+      // below; only the firmware check sets it, so its alert still fires once (#372).
+      const rbCurrent = (rb['current-firmware'] || '').trim();
+      const rbUpgrade = (rb['upgrade-firmware'] || '').trim();
+      const routerbootCurrent = rbCurrent && rbUpgrade ? compareRosVersions(rbUpgrade, rbCurrent) <= 0 : false;
 
       await query(
         `UPDATE devices SET
           name = COALESCE($1, name),
           model = COALESCE($2, model),
-          serial_number = COALESCE($3, serial_number),
+          -- Not a serial another record holds (the unique index would fail the
+          -- whole update); the duplicate is the add dialog's to resolve (C3).
+          serial_number = COALESCE(
+            (SELECT $3::text WHERE NOT EXISTS (SELECT 1 FROM devices o WHERE o.serial_number = $3::text AND o.id <> $6)),
+            serial_number),
           firmware_version = COALESCE($4, firmware_version),
           ros_version = COALESCE($5, ros_version),
+          time_zone_name = COALESCE($7, time_zone_name),
+          gmt_offset = COALESCE($8, gmt_offset),
+          architecture = COALESCE($9, architecture),
+          installed_packages = COALESCE($10::text[], installed_packages),
+          -- The router's own name, kept even while the manager's name is
+          -- locked, so the two can be compared (#253).
+          ros_identity = COALESCE($11, ros_identity),
           -- An update that has landed is no longer pending. The dedicated
           -- firmware check only runs once a day, so without this a device stays
           -- flagged "update available" for up to 24 hours after it has already
@@ -221,9 +787,16 @@ export class DeviceCollector {
                  AND NULLIF($5,'') = latest_ros_version THEN FALSE
             ELSE firmware_update_available
           END,
+          routerboard_upgrade_available = CASE WHEN $12::boolean THEN FALSE ELSE routerboard_upgrade_available END,
+          upgrade_firmware_version = CASE WHEN $12::boolean THEN NULLIF($13, '') ELSE upgrade_firmware_version END,
           updated_at = NOW()
         WHERE id = $6`,
-        [identityName, model, serial, firmware, rosVersion, this.device.id]
+        // Cut to the columns (P2-20): an identity over 100 characters failed
+        // this whole update, and the time zone was then never stored.
+        [fit(identityName, 100), fit(model, 100), fit(serial, 50), fit(firmware, 50), fit(rosVersion, 20), this.device.id,
+         fit(clock[0]?.['time-zone-name'] || null, 64), fit(clock[0]?.['gmt-offset'] || null, 16),
+         fit(info['architecture-name'] || null, 32), installedPackages && installedPackages.length ? installedPackages : null,
+         fit(identity[0]?.['name'] || null, 255), routerbootCurrent, fit(rbUpgrade, 50)]
       );
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect system info:`, err);
@@ -258,8 +831,31 @@ export class DeviceCollector {
       }
 
       await writeApi.flush().catch((e) => console.error('InfluxDB flush error:', e));
+      await this.collectInterfaceErrors(stats);
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect interface traffic:`, err);
+    }
+  }
+
+  /** When this device's error counters were last read, for the interval. */
+  private static lastErrorPoll = new Map<number, number>();
+
+  /**
+   * Frame errors and link drops per Ethernet port (#249), from the same poll.
+   * One extra read; a device that can't answer it (no Ethernet ports, an old
+   * release) just has nothing recorded.
+   */
+  private async collectInterfaceErrors(ifaceStats: Record<string, string>[]): Promise<void> {
+    try {
+      const ethernet = await this.client.execute('/interface/ethernet/print', { stats: '' });
+      const linkDowns = new Map(ifaceStats.map((i) => [i['name'], i['link-downs']] as [string, string | undefined]));
+      const now = Date.now();
+      const last = DeviceCollector.lastErrorPoll.get(this.device.id);
+      DeviceCollector.lastErrorPoll.set(this.device.id, now);
+      const intervalSec = last ? Math.max(1, Math.round((now - last) / 1000)) : 0;
+      await recordInterfaceCounters(this.device.id, ethernet, linkDowns, intervalSec);
+    } catch (err) {
+      console.warn(`[${this.device.name}] Interface error counters not read:`, (err as Error).message);
     }
   }
 
@@ -291,10 +887,33 @@ export class DeviceCollector {
         .timestamp(new Date());
 
       writeApi.writePoint(point);
+      if (r['uptime']) await this.noteBootTime(this.parseUptime(r['uptime']));
       await writeApi.flush().catch((e) => console.error('InfluxDB flush error:', e));
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect resources:`, err);
     }
+  }
+
+  /**
+   * When the device booted, from its uptime, and whether it has rebooted
+   * since we last looked (#326). The boot time moving later by more than a
+   * couple of minutes means a reboot, however quick, and however long since
+   * the last poll (the manager being down included). It's stored only when it
+   * moves, so a large fleet doesn't pay a write per poll.
+   */
+  private async noteBootTime(uptimeSec: number): Promise<void> {
+    if (!Number.isFinite(uptimeSec) || uptimeSec <= 0) return;
+    const bootAt = new Date(Date.now() - uptimeSec * 1000);
+    const known = (this.device as unknown as { boot_at?: string | Date | null }).boot_at;
+    const change = bootChange(known ? new Date(known).getTime() : null, bootAt.getTime());
+    if (change === 'same') return;
+    try {
+      if (change === 'reboot') {
+        await query(`INSERT INTO device_reboots (device_id, boot_at) VALUES ($1, $2)`, [this.device.id, bootAt.toISOString()]);
+      }
+      await query(`UPDATE devices SET boot_at = $2 WHERE id = $1`, [this.device.id, bootAt.toISOString()]);
+      (this.device as unknown as { boot_at?: string }).boot_at = bootAt.toISOString();
+    } catch { /* bookkeeping only */ }
   }
 
   private parseUptime(uptime: string): number {
@@ -314,6 +933,31 @@ export class DeviceCollector {
 
   // ─── Interfaces → Postgres ────────────────────────────────────────────────
 
+  /**
+   * `/interface/ethernet/monitor` for every ethernet port, in one call.
+   *
+   * Returns an empty map on any failure. This is enrichment: a device that will
+   * not answer should still have its interfaces stored, just without a rate.
+   */
+  private async collectEthernetMonitor(names: string[]): Promise<Map<string, Record<string, string>>> {
+    const out = new Map<string, Record<string, string>>();
+    if (names.length === 0) return out;
+    try {
+      const rows = await this.client.execute(
+        '/interface/ethernet/monitor',
+        { numbers: names.join(','), once: '' },
+        [],
+        { timeoutMs: 30000 }
+      );
+      for (const r of rows) {
+        if (r['name']) out.set(r['name'], r);
+      }
+    } catch {
+      // Older RouterOS, a device mid-reboot, or a board with no ethernet at all.
+    }
+    return out;
+  }
+
   async collectInterfaces(): Promise<void> {
     try {
       const [ifaces, bridges, bonds] = await Promise.all([
@@ -324,6 +968,18 @@ export class DeviceCollector {
 
       const bridgeNames = new Set(bridges.map((b) => b['name']).filter(Boolean));
       const bondNames   = new Set(bonds.map((b) => b['name']).filter(Boolean));
+
+      // Negotiated rate and SFP module facts. Neither /interface/print nor
+      // /interface/ethernet/print carries them — the `speed` column had been
+      // null for every interface since it was added, because the field it read
+      // does not exist (#146). `monitor` has them, and takes every interface in
+      // one call rather than one call per port: 17 ports in 386ms on a CRS510.
+      const monitorByName = await this.collectEthernetMonitor(
+        allEthernetNames(ifaces, bridgeNames, bondNames)
+      );
+      // The same reading carries the optics' light levels and temperature.
+      await recordOptics(this.device.id, monitorByName)
+        .catch((e) => console.warn(`[${this.device.name}] Optic readings not stored:`, (e as Error).message));
 
       // Map bridge name → full bridge data (includes vlan-filtering, etc.)
       const bridgeDataMap = new Map<string, Record<string, string>>();
@@ -338,14 +994,18 @@ export class DeviceCollector {
       for (const iface of allIfaces) {
         const name = iface['name'];
         if (!name) continue;
+        const mon = monitorByName.get(name);
         const rosType = iface['type'] || 'ether';
         const resolvedType = bridgeNames.has(name) ? 'bridge' : bondNames.has(name) ? 'bond' : rosType;
 
         // For bridge interfaces, merge bridge-specific properties (vlan-filtering, etc.)
         // /interface/print lacks bridge-only fields; /interface/bridge/print has them.
+        // Bonds carry their member list too, so spanning-tree analysis can see
+        // that a bonded root port is reached through its members (J6).
+        const bondRow = resolvedType === 'bond' ? bonds.find((b) => b['name'] === name) : undefined;
         const enrichedIface = resolvedType === 'bridge' && bridgeDataMap.has(name)
           ? { ...iface, ...bridgeDataMap.get(name)! }
-          : iface;
+          : bondRow ? { ...iface, slaves: bondRow['slaves'] ?? '', mode: bondRow['mode'] ?? '' } : iface;
 
         // RouterOS bridges may report mtu as 'auto' or '...' (inherited); use actual-mtu as fallback
         const rawMtu = parseInt(enrichedIface['actual-mtu'] || enrichedIface['mtu'] || '0', 10);
@@ -359,11 +1019,14 @@ export class DeviceCollector {
             : null;
 
           await query(
-            `INSERT INTO interfaces (device_id, name, type, mac_address, mtu, running, disabled, comment, speed, vlan_filtering, config_json, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+            `INSERT INTO interfaces (device_id, name, type, mac_address, mtu, running, disabled, comment, speed, vlan_filtering, config_json, default_name,
+              link_rate, sfp_present, sfp_type, sfp_connector, sfp_vendor, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
              ON CONFLICT (device_id, name) DO UPDATE SET
                type=$3, mac_address=$4, mtu=$5, running=$6, disabled=$7, comment=$8, speed=$9,
-               vlan_filtering=$10, config_json=$11, updated_at=NOW()`,
+               vlan_filtering=$10, config_json=$11, default_name=$12,
+               link_rate=$13, sfp_present=$14, sfp_type=$15, sfp_connector=$16, sfp_vendor=$17,
+               updated_at=NOW()`,
             [
               this.device.id,
               name,
@@ -376,6 +1039,15 @@ export class DeviceCollector {
               enrichedIface['speed'] || null,
               vlanFiltering,
               JSON.stringify(enrichedIface),
+              // Present on /interface/print detail for physical ports; absent
+              // for bridges, bonds and VLANs, which never had a factory name.
+              enrichedIface['default-name'] || null,
+              mon?.['rate'] || null,
+              // Tri-state on purpose: absent means not an SFP cage at all.
+              mon && 'sfp-module-present' in mon ? mon['sfp-module-present'] === 'true' : null,
+              mon?.['sfp-type'] || null,
+              mon?.['sfp-connector-type'] || null,
+              mon?.['sfp-vendor-part-number'] || null,
             ]
           );
         } catch (insertErr) {
@@ -401,7 +1073,9 @@ export class DeviceCollector {
     try {
       const rows = await this.client
         .execute('/ip/address/print', { detail: '' })
-        .catch(() => [] as Record<string, string>[]);
+        .catch(() => null);
+      // A failed read keeps the cache it had; an empty one wiped it (P2-21).
+      if (rows === null) return;
       const minimalist = rows
         .filter((r) => r['disabled'] !== 'true' && r['invalid'] !== 'true')
         .map((r) => ({
@@ -540,8 +1214,6 @@ export class DeviceCollector {
 
   async updateClients(): Promise<void> {
     try {
-      await query(`UPDATE clients SET active = FALSE WHERE device_id = $1`, [this.device.id]);
-
       // Detect which wireless package is in use before the parallel fetch so we
       // query the correct registration table path (new wifi pkg vs legacy wireless pkg).
       const wifiPkg = await this.detectWifiPackage().catch(() => 'none' as const);
@@ -552,14 +1224,42 @@ export class DeviceCollector {
       // Collect all data sources in parallel.
       // Note: { detail: '' } is omitted — the RouterOS binary API always returns all fields,
       // and passing =detail= causes a silent !trap on some RouterOS builds.
-      const [arpEntries, dhcpLeases, wirelessClients, bridgeHosts] = await Promise.all([
-        this.client.execute('/ip/arp/print').catch(() => []),
-        this.client.execute('/ip/dhcp-server/lease/print').catch(() => []),
+      //
+      // A read that fails is null, not "none": with an empty list in its place,
+      // a timeout made every client this device sees look gone (P2-21).
+      const failed = () => null;
+      // A legacy CAPsMAN controller lists its CAPs' clients in its own table;
+      // the CAPs' tables stay empty (#250). `stats` adds signal, rates, uptime
+      // and traffic; plain print is the fallback if a release refuses it.
+      const flavor = (this.device as unknown as { capsman_flavor?: string | null }).capsman_flavor;
+      const legacyController = flavor === 'legacy' || flavor === 'both';
+      const legacyRegs = (): Promise<Record<string, string>[] | null> => legacyController
+        ? this.client.execute('/caps-man/registration-table/print', { stats: '' })
+          .catch(() => this.client.execute('/caps-man/registration-table/print'))
+          .catch(failed)
+        : Promise.resolve([] as Record<string, string>[]);
+      const [arpRead, dhcpRead, wirelessRead, bridgeRead, legacyRead] = await Promise.all([
+        this.client.execute('/ip/arp/print').catch(failed),
+        this.client.execute('/ip/dhcp-server/lease/print').catch(failed),
         wifiPkg === 'none'
           ? Promise.resolve([] as Record<string, string>[])
-          : this.client.execute(regTableCmd).catch(() => [] as Record<string, string>[]),
-        this.client.execute('/interface/bridge/host/print').catch(() => []),
+          : this.client.execute(regTableCmd).catch(failed),
+        this.client.execute('/interface/bridge/host/print').catch(failed),
+        legacyRegs(),
       ]);
+      const complete = arpRead !== null && dhcpRead !== null && wirelessRead !== null && bridgeRead !== null
+        && legacyRead !== null;
+      const arpEntries = arpRead ?? [];
+      const dhcpLeases = dhcpRead ?? [];
+      const wirelessClients = [...(wirelessRead ?? []), ...(legacyRead ?? [])];
+      // The name given to a client on the controller (the registration entry's
+      // comment), used when DHCP doesn't name it.
+      const regComments: Record<string, string> = {};
+      for (const r of legacyRead ?? []) {
+        const mac = (r['mac-address'] || '').toLowerCase();
+        if (mac && r['comment']) regComments[mac] = r['comment'];
+      }
+      const bridgeHosts = bridgeRead ?? [];
 
       // DHCP hostname + IP lookup
       const dhcpHostnames: Record<string, string> = {};
@@ -577,25 +1277,45 @@ export class DeviceCollector {
       //   legacy: signal-strength (e.g. "-65dBm"), bytes ("rx,tx" combined)
       //   new wifi pkg: signal (e.g. "-65"), tx-bytes / rx-bytes (separate fields)
       const wifiSignal: Record<string, number> = {};
+      // Wireless clients whose entry carries no signal at all (a legacy CAPsMAN
+      // table read without stats): stored as unknown, not as 0 dBm.
+      const noSignal = new Set<string>();
       const wifiInterface: Record<string, string> = {};
       const wifiTx: Record<string, number> = {};
+      const wifiLastIp: Record<string, string> = {};
+      const wifiTxRate: Record<string, number | null> = {};
+      const wifiRxRate: Record<string, number | null> = {};
       const wifiRx: Record<string, number> = {};
       for (const wc of wirelessClients) {
         const mac = (wc['mac-address'] || '').toLowerCase();
         if (!mac) continue;
         // Signal strength — strip any trailing unit suffix (e.g. "dBm")
-        const rawSignal = wc['signal-strength'] || wc['signal'] || '0';
+        // Legacy CAPsMAN calls it rx-signal.
+        const rawSignal = wc['signal-strength'] || wc['signal'] || wc['rx-signal'] || '0';
         wifiSignal[mac] = parseInt(rawSignal, 10) || 0;
+        if (wc['signal-strength'] === undefined && wc['signal'] === undefined && wc['rx-signal'] === undefined) noSignal.add(mac);
         wifiInterface[mac] = wc['interface'] || '';
-        // Traffic counters — new wifi pkg has separate fields; legacy combines as "rx,tx"
+        // Link rates (#252): a bare bit rate (wifi package) or "130Mbps-20MHz/2S".
+        wifiTxRate[mac] = parseRateBps(wc['tx-rate']);
+        wifiRxRate[mac] = parseRateBps(wc['rx-rate']);
+        // Traffic counters — some tables have separate fields, others combine them in one
         if (wc['tx-bytes'] !== undefined || wc['rx-bytes'] !== undefined) {
           wifiTx[mac] = parseInt(wc['tx-bytes'] || '0', 10) || 0;
           wifiRx[mac] = parseInt(wc['rx-bytes'] || '0', 10) || 0;
         } else {
+          // "sent,received" from the access point's side, per MikroTik's docs, and
+          // borne out by #250: a streaming stick's first figure was 150 MB, its
+          // second 19 MB. This was read the other way round before 0.37.0,
+          // swapping TX and RX for every client of both the wifi package and the
+          // legacy driver, which both report a combined `bytes`.
           const parts = (wc['bytes'] || '0,0').split(',');
-          wifiRx[mac] = parseInt(parts[0] || '0', 10) || 0;
-          wifiTx[mac] = parseInt(parts[1] || '0', 10) || 0;
+          wifiTx[mac] = parseInt(parts[0] || '0', 10) || 0;
+          wifiRx[mac] = parseInt(parts[1] || '0', 10) || 0;
         }
+        // The client's address as the access point last saw it (legacy driver
+        // and legacy CAPsMAN): the only one there is when the device running
+        // the table isn't the DHCP server.
+        if (wc['last-ip']) wifiLastIp[mac] = wc['last-ip'];
       }
 
       // ARP table — IP enrichment and activity validation.
@@ -648,8 +1368,9 @@ export class DeviceCollector {
       ]);
 
       let totalClients = 0;
+      const seenMacs: string[] = [];
       for (const mac of allMacs) {
-        if (!mac) continue;
+        if (!normalizeMac(mac)) continue; // not a MAC address; nothing to key a client on
         const isWireless = mac in wifiSignal;
         const entry = bridgeHostMap[mac];
         const interfaceName = isWireless
@@ -657,35 +1378,58 @@ export class DeviceCollector {
           : (entry?.port || arpInterfaces[mac] || null);
         const vlanId = entry?.vid ?? null;
 
+        // One bad row costs only itself (P2-20): it used to end the loop and
+        // leave every client after it stale.
+        try {
+          await query(
+            `INSERT INTO clients (device_id, mac_address, hostname, ip_address, interface_name, vlan_id, tx_bytes, rx_bytes, signal_strength, client_type, tx_rate_bps, rx_rate_bps, active, last_seen, first_seen)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,NOW(),NOW())
+             ON CONFLICT (device_id, mac_address) DO UPDATE SET
+               hostname=COALESCE($3, clients.hostname),
+               ip_address=COALESCE(NULLIF($4,''), clients.ip_address),
+               interface_name=COALESCE($5, clients.interface_name),
+               -- The VLAN of this sighting, not one kept from an earlier
+               -- sighting on another port: a client seen by ARP on vrrp20
+               -- kept VLAN 98 from the bridge (#363). Kept only when the
+               -- port isn't known either.
+               vlan_id=CASE WHEN $5::varchar IS NULL THEN clients.vlan_id ELSE $6::integer END,
+               tx_bytes=$7,
+               rx_bytes=$8,
+               signal_strength=$9,
+               client_type=$10,
+               tx_rate_bps=$11,
+               rx_rate_bps=$12,
+               active=TRUE,
+               last_seen=NOW(),
+               first_seen=COALESCE(clients.first_seen, NOW())`,
+            [
+              this.device.id,
+              mac,
+              fit(dhcpHostnames[mac] || regComments[mac] || null, 255),
+              fit(dhcpIPs[mac] || arpIPs[mac] || wifiLastIp[mac] || null, 45),
+              fit(interfaceName, 50),
+              vlanId,
+              wifiTx[mac] || 0,
+              wifiRx[mac] || 0,
+              isWireless && !noSignal.has(mac) ? wifiSignal[mac] : null,
+              isWireless ? 'wireless' : 'wired',
+              isWireless ? wifiTxRate[mac] ?? null : null,
+              isWireless ? wifiRxRate[mac] ?? null : null,
+            ]
+          );
+          seenMacs.push(mac);
+          totalClients++;
+        } catch (err) {
+          console.error(`[${this.device.name}] Skipped client ${mac}:`, (err as Error).message);
+        }
+      }
+
+      // Clients this device no longer sees go inactive, but only when every
+      // read succeeded; after a failed read their absence means nothing (P2-21).
+      if (complete) {
         await query(
-          `INSERT INTO clients (device_id, mac_address, hostname, ip_address, interface_name, vlan_id, tx_bytes, rx_bytes, signal_strength, client_type, active, last_seen, first_seen)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,TRUE,NOW(),NOW())
-           ON CONFLICT (device_id, mac_address) DO UPDATE SET
-             hostname=COALESCE($3, clients.hostname),
-             ip_address=COALESCE(NULLIF($4,''), clients.ip_address),
-             interface_name=COALESCE($5, clients.interface_name),
-             vlan_id=COALESCE($6, clients.vlan_id),
-             tx_bytes=$7,
-             rx_bytes=$8,
-             signal_strength=$9,
-             client_type=$10,
-             active=TRUE,
-             last_seen=NOW(),
-             first_seen=COALESCE(clients.first_seen, NOW())`,
-          [
-            this.device.id,
-            mac,
-            dhcpHostnames[mac] || null,
-            dhcpIPs[mac] || arpIPs[mac] || null,
-            interfaceName,
-            vlanId,
-            wifiTx[mac] || 0,
-            wifiRx[mac] || 0,
-            isWireless ? wifiSignal[mac] : null,
-            isWireless ? 'wireless' : 'wired',
-          ]
-        );
-        totalClients++;
+          `UPDATE clients SET active = FALSE WHERE device_id = $1 AND active AND NOT (mac_address = ANY($2::text[]))`,
+          [this.device.id, seenMacs]);
       }
 
       // OUI vendor lookup: fill in up to 10 clients that are missing vendor per cycle
@@ -699,7 +1443,7 @@ export class DeviceCollector {
           .tag('mac_address', mac)
           .tag('device_id', String(this.device.id))
           .intField('online', 1);
-        if (mac in wifiSignal) {
+        if (mac in wifiSignal && !noSignal.has(mac)) {
           presencePoint.intField('signal_strength', wifiSignal[mac]);
           presencePoint.intField('tx_bytes', wifiTx[mac] ?? 0);
           presencePoint.intField('rx_bytes', wifiRx[mac] ?? 0);
@@ -732,6 +1476,30 @@ export class DeviceCollector {
         .timestamp(new Date());
       writeApi.writePoint(globalPoint);
 
+      // The same deduplicated count, but for this device's site (issue #130).
+      // Summing the per-device series instead would double-count a client seen
+      // by two access points -- which is the exact error the global series was
+      // introduced to avoid, so the site series has to be deduplicated too.
+      const siteRows = await query<{ site_id: number | null; count: string }>(
+        `SELECT d0.site_id,
+                (SELECT COUNT(DISTINCT c.mac_address)
+                   FROM clients c
+                   JOIN devices d ON d.id = c.device_id
+                  WHERE c.active = TRUE AND d.site_id = d0.site_id) AS count
+           FROM devices d0 WHERE d0.id = $1`,
+        [this.device.id]
+      );
+      const siteId = siteRows[0]?.site_id ?? null;
+      if (siteId != null) {
+        writeApi.writePoint(
+          new Point('client_counts')
+            .tag('device_id', `_site_${siteId}`)
+            .tag('device_name', `_site_${siteId}`)
+            .intField('total_clients', parseInt(siteRows[0]?.count || '0', 10))
+            .timestamp(new Date())
+        );
+      }
+
       await writeApi.flush().catch(() => {});
     } catch (err) {
       console.error(`[${this.device.name}] Failed to update clients:`, err);
@@ -763,123 +1531,190 @@ export class DeviceCollector {
 
   // ─── Events/Logs ─────────────────────────────────────────────────────────
 
-  async collectEvents(): Promise<void> {
+  async collectEvents(): Promise<NewLogEvent[]> {
+    const stored: NewLogEvent[] = [];
     try {
-      const logs = await this.client.execute('/log/print');
-      if (!logs.length) return;
+      const logs = await this.client.execute(
+        '/log/print', {}, [], { timeoutMs: LOG_READ_TIMEOUT_MS }
+      );
+      if (!logs.length) return stored;
 
-      // RouterOS log .id values are hex strings like "*1A2F". Parse to int for comparison.
-      const parseRosId = (id: string): number => {
-        const hex = (id || '').replace(/^\*/, '');
-        return hex ? parseInt(hex, 16) : 0;
-      };
-
-      // Find the highest RouterOS log ID we've already stored for this device.
-      const lastRow = await queryOne<{ log_id: string }>(
+      // The highest id we hold, taken across recent rows rather than from the
+      // single most recently inserted one. Those are usually the same, but when
+      // they differ the watermark slips backwards and the entire buffer looks
+      // new on every poll (#137).
+      const storedIds = await query<{ log_id: string }>(
         `SELECT log_id FROM events WHERE device_id = $1 AND log_id IS NOT NULL AND log_id != ''
-         ORDER BY id DESC LIMIT 1`,
+         ORDER BY id DESC LIMIT 2000`,
         [this.device.id]
       );
-      const lastIdNum = parseRosId(lastRow?.log_id || '');
-
       // Always get the latest stored event time — needed for timestamp fallback.
       const latestStored = await queryOne<{ event_time: Date }>(
         `SELECT event_time FROM events WHERE device_id = $1 ORDER BY event_time DESC LIMIT 1`,
         [this.device.id]
       );
-      const latestTime = latestStored?.event_time ? new Date(latestStored.event_time) : new Date(0);
+      // And what was last seen on the device, so clearing events doesn't send
+      // the next poll back to the start of the buffer (#361).
+      const mark = await queryOne<{ log_watermark_id: string | null; log_watermark_at: Date | null }>(
+        `SELECT log_watermark_id, log_watermark_at FROM devices WHERE id = $1`, [this.device.id]);
+      const resume = resumePoint(
+        {
+          lastId: highestStoredId(storedIds.map((r) => r.log_id)),
+          latestTime: latestStored?.event_time ? new Date(latestStored.event_time) : new Date(0),
+        },
+        {
+          lastId: mark?.log_watermark_id != null ? Number(mark.log_watermark_id) : null,
+          latestTime: mark?.log_watermark_at ? new Date(mark.log_watermark_at) : null,
+        },
+      );
+      const lastIdNum = resume.lastId;
+      const latestTime = resume.latestTime;
 
-      // Detect log buffer overflow or device reboot: if all current IDs are below
-      // our stored lastIdNum, RouterOS has cleared/reset its log buffer.
-      // In that case, fall back to timestamp-based deduplication to avoid missing events.
-      const currentIds = logs.map(l => parseRosId(l['.id'] || '')).filter(id => id > 0);
-      const maxCurrentId = currentIds.length > 0 ? Math.max(...currentIds) : 0;
-      const logReset = lastRow && maxCurrentId > 0 && maxCurrentId < lastIdNum;
+
+      // Collect the candidates first, then insert them in batches.
+      //
+      // This used to issue one INSERT per line and count every attempt as new,
+      // so a poll that re-read the whole ring buffer and inserted nothing still
+      // reported "Collected 1000 new log entries" — a thousand round trips a
+      // minute per device, described as work that had not happened (#137).
+      // Counting what the database actually accepted makes the log line true
+      // and the duplicate case cheap.
+      const fresh = selectNewLogLines(logs as RawLogLine[], {
+        lastStoredId: lastIdNum,
+        latestStoredTime: latestTime,
+        parseTime: (raw) => this.parseLogTime(raw),
+      });
+
+      // Drop the login/logout pair this poll itself just caused. Without this
+      // the manager stores its own connection noise once per poll per device:
+      // 99.8% of the events table on the reference fleet (see utils/logNoise).
+      // Only lines from the manager's own address (S9): someone else using
+      // the same account is kept.
+      // Our own SSH sessions too (#238): backups, commands and the terminal.
+      const key = await queryOne<{ ssh_username: string | null; fingerprint: string | null }>(
+        `SELECT ssh_username, fingerprint FROM device_ssh_keys WHERE device_id = $1`, [this.device.id]).catch(() => null);
+      const { kept, dropped } = stripOwnSessionNoise(
+        fresh as { topics?: string; message?: string }[],
+        this.device.api_username,
+        await this.learnManagerAddresses(),
+        {
+          username: key?.ssh_username || this.device.ssh_username || this.device.api_username,
+          keyFingerprint: key?.fingerprint ?? null,
+        },
+      );
+      if (dropped > 0) {
+        console.log(`[${this.device.name}] skipped ${dropped} of our own API/SSH session log lines`);
+      }
+
+      const pending: unknown[][] = [];
+      for (const log of kept as RawLogLine[]) {
+        const rawId = (log['.id'] || '') as string;
+        // Cut to a sane size before anything parses or stores them: a device
+        // can log anything, and later readers (roaming, log alerts) run
+        // patterns over these (outside review P2-17).
+        const topics = ((log['topics'] as string) || '').slice(0, 100); // events.topic is VARCHAR(100)
+        const message = ((log['message'] as string) || '').slice(0, MAX_LOG_MESSAGE);
+        const time = this.parseLogTime(log['time'] || '');
+        const severity = this.mapLogSeverity(topics, message);
+        // Never store a null log_id: the unique index that stops re-insertion
+        // does not constrain nulls, so a device whose lines carry no `.id`
+        // would accumulate the same entries for ever (#137).
+        // Bound to the line's content as well as RouterOS's id, which restarts
+        // after a reboot (J9).
+        const logId = rawId ? storedLogId(rawId, log['time'] || '', topics, message) : surrogateLogId(log['time'] || '', topics, message);
+        pending.push([
+          this.device.id,
+          time.toISOString(),
+          severity,
+          topics || null,
+          message,
+          JSON.stringify({ ...log, topics, message }),
+          logId,
+        ]);
+      }
 
       let newCount = 0;
-      for (const log of logs) {
-        const logId = (log['.id'] || '') as string;
-        const logIdNum = parseRosId(logId);
-
-        if (logId && !logReset) {
-          // Primary: skip entries already stored by RouterOS ID
-          if (logIdNum <= lastIdNum) continue;
-        } else {
-          // Fallback: no .id field, or log buffer has been reset — use timestamp deduplication
-          const time = this.parseLogTime(log['time'] || '');
-          if (time <= latestTime) continue;
-        }
-
-        const time = this.parseLogTime(log['time'] || '');
-        const severity = this.mapLogSeverity(log['topics'] || '');
-
-        await query(
+      const COLS = 7;
+      const BATCH = 200;
+      for (let i = 0; i < pending.length; i += BATCH) {
+        const chunk = pending.slice(i, i + BATCH);
+        const values = chunk
+          .map((_, r) => `(${Array.from({ length: COLS }, (_, c) => `$${r * COLS + c + 1}`).join(',')})`)
+          .join(',');
+        // RETURNING reports only the rows actually written; ON CONFLICT rows are
+        // silently dropped, which is exactly the count we want.
+        const inserted = await query<NewLogEvent>(
           `INSERT INTO events (device_id, event_time, severity, topic, message, raw_json, log_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)
-           ON CONFLICT (device_id, log_id) DO NOTHING`,
-          [
-            this.device.id,
-            time.toISOString(),
-            severity,
-            log['topics'] || null,
-            log['message'] || '',
-            JSON.stringify(log),
-            logId || null,
-          ]
+           VALUES ${values}
+           ON CONFLICT (device_id, log_id) DO NOTHING
+           RETURNING id, event_time, severity, message`,
+          chunk.flat()
         );
-        newCount++;
+        newCount += inserted.length;
+        stored.push(...inserted);
       }
 
-      if (newCount > 0) {
-        await query(
-          `DELETE FROM events WHERE device_id = $1 AND event_time < NOW() - INTERVAL '30 days'`,
-          [this.device.id]
+      // Proxy access logs from containers: parse into their own table. Failure here
+      // must not affect event collection.
+      try {
+        await storeProxyConnections(
+          this.device.id,
+          (kept as RawLogLine[]).map((log, i) => ({
+            logId: pending[i][6] as string,
+            topics: (log['topics'] as string) || '',
+            message: (log['message'] as string) || '',
+          })),
         );
-        console.log(`[${this.device.name}] Collected ${newCount} new log entries`);
+      } catch (err) {
+        console.error(`[${this.device.name}] Failed to store proxy connections:`, err);
       }
+
+      // Remember how far this read got, whatever was kept (#361).
+      const seen = bufferMark(logs as RawLogLine[], (raw) => this.parseLogTime(raw));
+      await query(
+        `UPDATE devices SET log_watermark_id = $2, log_watermark_at = COALESCE($3, log_watermark_at) WHERE id = $1`,
+        [this.device.id, seen.lastId || null, seen.latestTime ? seen.latestTime.toISOString() : null],
+      );
+
+      // Old events are pruned by the scheduled sweep, which follows the
+      // retention setting. A hard 30-day delete here ignored it (P2-18).
+      if (newCount > 0) console.log(`[${this.device.name}] Collected ${newCount} new log entries`);
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect events:`, err);
     }
+    return stored;
   }
 
+  /**
+   * The addresses this manager is known to log in from, as this device sees
+   * them (S9). Learned from /user/active during the manager's own session and
+   * remembered per device, so log lines from earlier polls still match. A few
+   * are kept, for a manager that reaches the device over more than one path.
+   */
+  private async learnManagerAddresses(): Promise<ReadonlySet<string>> {
+    const active = await this.client.execute('/user/active/print').catch(() => null);
+    const addr = active ? managerAddressFromActive(active, this.device.api_username) : null;
+    return rememberManagerAddress(this.device.id, addr);
+  }
+
+  /**
+   * A log timestamp as a real instant, using the device's own clock.
+   *
+   * Falls back to the collection time only when the device timezone is unknown
+   * or the format is unrecognised — approximate, but never confidently wrong by
+   * a whole timezone, which is what the previous version was (#117).
+   */
   private parseLogTime(timeStr: string): Date {
-    // RouterOS log time formats:
-    //   "jan/01 00:00:05"       — month/day only (no year) → default to current year
-    //   "jan/01/2024 00:00:05"  — full date with year
-    //   "00:00:05"              — time only (today, e.g. device uptime < 1 day)
-    if (!timeStr) return new Date();
-    try {
-      if (timeStr.includes('/')) {
-        const spaceIdx = timeStr.lastIndexOf(' ');
-        if (spaceIdx === -1) return new Date();
-        const datePart = timeStr.substring(0, spaceIdx);
-        const timePart = timeStr.substring(spaceIdx + 1);
-        const parts = datePart.split('/');
-        const monthStr = parts[0];
-        const day = parts[1];
-        if (!monthStr || !day) return new Date();
-        const year = parts[2] !== undefined ? parts[2] : String(new Date().getFullYear());
-        const months: Record<string, string> = {
-          jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
-          jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
-        };
-        const month = months[monthStr.toLowerCase()] || '01';
-        const d = new Date(`${year}-${month}-${day.padStart(2, '0')}T${timePart}Z`);
-        if (isNaN(d.getTime())) return new Date();
-        return d;
-      } else {
-        // Time only (today)
-        const today = new Date().toISOString().split('T')[0];
-        const d = new Date(`${today}T${timeStr}Z`);
-        if (isNaN(d.getTime())) return new Date();
-        return d;
-      }
-    } catch {
-      return new Date();
-    }
+    const d = this.device as unknown as { time_zone_name?: string | null; gmt_offset?: string | null };
+    const parsed = parseDeviceLogTime(timeStr, {
+      timeZoneName: d.time_zone_name, gmtOffset: d.gmt_offset,
+    });
+    return parsed ?? new Date();
   }
 
-  private mapLogSeverity(topics: string): string {
+  private mapLogSeverity(topics: string, message?: string): string {
+    // A clock adjustment is routine, whatever RouterOS tags it (#213).
+    if (isClockChangeLine(message)) return 'info';
     if (topics.includes('critical') || topics.includes('error')) return 'error';
     if (topics.includes('warning')) return 'warning';
     if (topics.includes('info')) return 'info';
@@ -916,14 +1751,19 @@ export class DeviceCollector {
 
       if (Object.keys(macIpMap).length === 0) return;
 
-      // Enrich client records across all devices: fill in missing IPs only,
-      // so DHCP-assigned addresses that already exist are not overwritten.
+      // Enrich client records seen by devices in this device's site: fill in
+      // missing IPs only, so DHCP-assigned addresses that already exist are not
+      // overwritten. Another site's record of the same MAC is another network,
+      // and this address means nothing there (outside review P2-19).
       for (const [mac, ip] of Object.entries(macIpMap)) {
         await query(
-          `UPDATE clients SET ip_address = $1
-           WHERE mac_address = $2
-             AND (ip_address IS NULL OR ip_address = '')`,
-          [ip, mac]
+          `UPDATE clients c SET ip_address = $1
+             FROM devices d
+            WHERE c.device_id = d.id
+              AND d.site_id IS NOT DISTINCT FROM (SELECT site_id FROM devices WHERE id = $3)
+              AND c.mac_address = $2
+              AND (c.ip_address IS NULL OR c.ip_address = '')`,
+          [ip, mac, this.device.id]
         );
       }
 
@@ -937,12 +1777,18 @@ export class DeviceCollector {
 
   async collectNeighbors(): Promise<void> {
     try {
-      const [neighbors, arpEntries, dhcpLeases, serverArpMap] = await Promise.all([
-        this.client.execute('/ip/neighbor/print').catch(() => []),
+      const [neighborRead, arpEntries, dhcpLeases, serverArpMap] = await Promise.all([
+        this.client.execute('/ip/neighbor/print').catch(() => null),
         this.client.execute('/ip/arp/print').catch(() => []),
         this.client.execute('/ip/dhcp-server/lease/print').catch(() => []),
         buildServerArpMap(),
       ]);
+
+      // The neighbour list failed to read: keep the links there are rather
+      // than delete them all (P2-21). ARP and DHCP only fill in addresses, so
+      // those can be missing.
+      if (neighborRead === null) return;
+      const neighbors = neighborRead;
 
       // Build MAC → IPv4 lookup from ARP and DHCP as fallback for neighbors
       // whose MNDP advertisement only contains an IPv6 address.
@@ -1052,16 +1898,7 @@ export class DeviceCollector {
         );
       }
 
-      // Try to resolve neighbor_address to a known device
-      await query(
-        `UPDATE topology_links tl
-         SET to_device_id = d.id
-         FROM devices d
-         WHERE tl.from_device_id = $1
-           AND d.ip_address = tl.neighbor_address
-           AND tl.to_device_id IS DISTINCT FROM d.id`,
-        [this.device.id]
-      );
+      await resolveNeighbourDevices(this.device.id);
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect neighbors:`, err);
     }
@@ -1069,15 +1906,106 @@ export class DeviceCollector {
 
   async collectStp(): Promise<void> {
     try {
+      // Ask each bridge what it thinks the spanning tree looks like.
+      //
+      // This used to be inferred from port roles and got it wrong every time:
+      // the comparison was against 'root' while RouterOS reports 'root-port', so
+      // nothing matched and the topology crowned whichever device sorted first.
+      // The device already knows — `/interface/bridge/monitor` reports whether it
+      // is the root and names the root it sees (#131).
+      const bridgeRead = await this.client
+        .execute('/interface/bridge/print', { detail: '' })
+        .catch(() => null);
+      // Failed to read: keep what is known rather than report no bridges (P2-21).
+      if (bridgeRead === null) return;
+      const bridges = bridgeRead;
+
       const bridgePorts = await this.client
         .execute('/interface/bridge/port/print', { detail: '' })
-        .catch(() => []);
+        .catch(() => [] as Record<string, string>[]);
+
+      const seen: string[] = [];
+      for (const bridge of bridges) {
+        const name = bridge['name'];
+        if (!name) continue;
+        const mon = await this.client
+          .execute('/interface/bridge/monitor', { numbers: name, once: '' })
+          .catch(() => [] as Record<string, string>[]);
+        const m = mon[0];
+        if (!m) continue;
+        seen.push(name);
+
+        // The bridge on the far end of the root port, as spanning tree knows
+        // it: the exact upstream, where neighbour discovery only lists
+        // candidates (#260). One more read, for the root port only.
+        let designated: Record<string, string> = {};
+        const rootPort = m['root-port'];
+        if (rootPort && rootPort !== 'none') {
+          const portRow = bridgePorts.find((p) => p['bridge'] === name && p['interface'] === rootPort);
+          if (portRow?.['.id']) {
+            designated = (await this.client
+              .execute('/interface/bridge/port/monitor', { numbers: portRow['.id'], once: '' })
+              .catch(() => [] as Record<string, string>[]))[0] ?? {};
+          }
+        }
+        const dCost = parseInt(designated['designated-cost'] || '', 10);
+
+        const cost = parseInt(m['root-path-cost'] || '', 10);
+        await query(
+          `INSERT INTO device_bridges
+             (device_id, bridge_name, bridge_id, root_bridge, root_bridge_id,
+              root_port, root_path_cost, protocol_mode, designated_bridge_id, designated_port_id, designated_cost, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+           ON CONFLICT (device_id, bridge_name) DO UPDATE SET
+             bridge_id = EXCLUDED.bridge_id, root_bridge = EXCLUDED.root_bridge,
+             root_bridge_id = EXCLUDED.root_bridge_id, root_port = EXCLUDED.root_port,
+             root_path_cost = EXCLUDED.root_path_cost,
+             protocol_mode = EXCLUDED.protocol_mode, designated_bridge_id = EXCLUDED.designated_bridge_id,
+             designated_port_id = EXCLUDED.designated_port_id, designated_cost = EXCLUDED.designated_cost, updated_at = NOW()`,
+          [
+            this.device.id, name, m['bridge-id'] || null,
+            m['root-bridge'] === 'true',
+            m['root-bridge-id'] || null,
+            m['root-port'] || null,
+            Number.isFinite(cost) ? cost : null,
+            bridge['protocol-mode'] || null,
+            designated['designated-bridge-id'] || null,
+            designated['designated-port-id'] || null,
+            Number.isFinite(dCost) ? dCost : null,
+          ]
+        );
+      }
+
+      // A bridge that has been deleted should stop being reported as root.
+      if (seen.length > 0) {
+        await query(
+          `DELETE FROM device_bridges WHERE device_id = $1 AND NOT (bridge_name = ANY($2::text[]))`,
+          [this.device.id, seen]
+        );
+      } else {
+        await query(`DELETE FROM device_bridges WHERE device_id = $1`, [this.device.id]);
+      }
+
+      // A bonded port's links are stored under its members' names, as LLDP
+      // reports them (sfp-sfpplus1, not Po1), so a bond's role goes to its
+      // members' links too (#363).
+      const bondMembers = new Map<string, string[]>();
+      const bondRows = await query<{ name: string; slaves: string | null }>(
+        `SELECT name, config_json->>'slaves' AS slaves FROM interfaces WHERE device_id = $1 AND type = 'bond'`,
+        [this.device.id]
+      ).catch(() => [] as { name: string; slaves: string | null }[]);
+      for (const b of bondRows) {
+        bondMembers.set(b.name, (b.slaves ?? '').split(',').map((m) => m.trim()).filter(Boolean));
+      }
 
       for (const port of bridgePorts) {
         const iface = (port['interface'] as string) || '';
-        const role = (port['role'] as string) || '';
         const bridgeName = (port['bridge'] as string) || '';
-        // Derive state from role — alternate/backup are blocking, root/designated are forwarding
+        // RouterOS suffixes every role with "-port" — "root-port",
+        // "alternate-port". Comparing against the bare word matched nothing, so
+        // blocked links were drawn as forwarding. Normalised on write so both
+        // ends of the system agree on one vocabulary.
+        const role = ((port['role'] as string) || '').replace(/-port$/, '');
         const state = (role === 'alternate' || role === 'backup') ? 'blocking' : 'forwarding';
 
         if (!iface) continue;
@@ -1085,13 +2013,101 @@ export class DeviceCollector {
         await query(
           `UPDATE topology_links
            SET stp_role=$3, stp_state=$4, bridge_name=$5
-           WHERE from_device_id=$1 AND from_interface=$2`,
-          [this.device.id, iface, role || null, state, bridgeName || null]
+           WHERE from_device_id=$1 AND (from_interface=$2 OR from_interface = ANY($6::text[]))`,
+          [this.device.id, iface, role || null, state, bridgeName || null, bondMembers.get(iface) ?? []]
         );
       }
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect STP:`, err);
     }
+  }
+
+  /**
+   * Certificates held on the device (#143).
+   *
+   * Read on the slow poll: certificates change rarely, and the thing that
+   * matters about them — the expiry date — moves on its own.
+   *
+   * `invalid-after` is a wall-clock time in the device's own zone, like every
+   * other RouterOS timestamp, so it goes through the same parser as log lines
+   * rather than being read as UTC.
+   */
+  async collectCertificates(): Promise<void> {
+    try {
+      const rows = await this.client
+        .execute('/certificate/print', { detail: '' })
+        .catch(() => null);
+      // A failed read (or no permission to read /certificate) keeps the
+      // inventory there is. Treated as "no certificates", it deleted them and
+      // expiry alerts stopped (P2-21).
+      if (rows === null) return;
+
+      const seen: string[] = [];
+      for (const r of rows) {
+        const name = (r['name'] || '').trim();
+        if (!name) continue;
+        seen.push(name);
+
+        const size = parseInt(r['key-size'] || '', 10);
+        const rev = readRevocation(r);
+        await query(
+          `INSERT INTO device_certificates
+             (device_id, name, common_name, serial_number, fingerprint, key_type, key_size,
+              invalid_before, invalid_after, is_authority, has_private_key, trusted,
+              revoked, revoked_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+           ON CONFLICT (device_id, name) DO UPDATE SET
+             common_name = EXCLUDED.common_name, serial_number = EXCLUDED.serial_number,
+             fingerprint = EXCLUDED.fingerprint, key_type = EXCLUDED.key_type,
+             key_size = EXCLUDED.key_size, invalid_before = EXCLUDED.invalid_before,
+             invalid_after = EXCLUDED.invalid_after, is_authority = EXCLUDED.is_authority,
+             has_private_key = EXCLUDED.has_private_key, trusted = EXCLUDED.trusted,
+             revoked = EXCLUDED.revoked, revoked_at = EXCLUDED.revoked_at,
+             updated_at = NOW()`,
+          [
+            this.device.id, name.slice(0, 128),
+            (r['common-name'] || '').slice(0, 255) || null,
+            (r['serial-number'] || '').slice(0, 64) || null,
+            (r['fingerprint'] || '').slice(0, 160) || null,
+            (r['key-type'] || '').slice(0, 16) || null,
+            Number.isFinite(size) ? size : null,
+            this.parseCertTime(r['invalid-before']),
+            this.parseCertTime(r['invalid-after']),
+            r['authority'] === 'true',
+            r['private-key'] === 'true',
+            r['trusted'] === 'true',
+            // Not `r['revoked'] === 'true'`. RouterOS sends the attribute twice
+            // — once as a timestamp, once as a boolean — and omits it entirely
+            // when the certificate is fine. See utils/certRecord.ts, which was
+            // written against captures of both cases from a real switch.
+            rev.revoked,
+            rev.revokedAtRaw ? this.parseCertTime(rev.revokedAtRaw) : null,
+          ]
+        );
+      }
+
+      // A certificate removed from the device must stop being alerted on.
+      if (seen.length > 0) {
+        await query(
+          `DELETE FROM device_certificates WHERE device_id = $1 AND NOT (name = ANY($2::text[]))`,
+          [this.device.id, seen]
+        );
+      } else {
+        await query(`DELETE FROM device_certificates WHERE device_id = $1`, [this.device.id]);
+      }
+    } catch (err) {
+      console.error(`[${this.device.name}] Failed to collect certificates:`, err);
+    }
+  }
+
+  /** RouterOS certificate dates are wall-clock in the device's zone, as logs are. */
+  private parseCertTime(raw: string | undefined): string | null {
+    if (!raw || !raw.trim()) return null;
+    const d = this.device as unknown as { time_zone_name?: string | null; gmt_offset?: string | null };
+    const parsed = parseDeviceLogTime(raw.trim(), {
+      timeZoneName: d.time_zone_name, gmtOffset: d.gmt_offset,
+    });
+    return parsed ? parsed.toISOString() : null;
   }
 
   // ─── LLDP Management ──────────────────────────────────────────────────────
@@ -1163,46 +2179,64 @@ export class DeviceCollector {
     }
   }
 
+  /**
+   * Apply SNMP changes to this device, touching only the fields given.
+   *
+   * Used for fleet changes, so it must never write something the operator did
+   * not choose. Two things it used to do:
+   *   - required on/off, version and community on every call, so they were
+   *     always written;
+   *   - when no community matched the name, renamed the device's first one
+   *     (often "public", possibly a community something else relies on).
+   *     A community that doesn't exist is now added alongside the others.
+   */
   async setSnmpConfig(config: {
-    enabled: boolean; contact?: string; location?: string; trap_target?: string;
-    community_name: string; version: 'v1' | 'v2c' | 'v3';
+    enabled?: boolean; contact?: string; location?: string; trap_target?: string;
+    community_name?: string; version?: 'v1' | 'v2c' | 'v3';
     auth_protocol?: string; auth_password?: string;
     priv_protocol?: string; priv_password?: string;
   }): Promise<void> {
     // 1. Global settings
-    const globalParams: Record<string, string> = { enabled: config.enabled ? 'yes' : 'no' };
+    const globalParams: Record<string, string> = {};
+    if (typeof config.enabled === 'boolean') globalParams['enabled'] = config.enabled ? 'yes' : 'no';
     if (config.contact  !== undefined) globalParams['contact']      = config.contact;
     if (config.location !== undefined) globalParams['location']     = config.location;
     if (config.trap_target !== undefined) globalParams['trap-target'] = config.trap_target;
-    globalParams['trap-version'] = config.version === 'v1' ? '1' : config.version === 'v3' ? '3' : '2';
-    await this.client.execute('/snmp/set', globalParams);
+    if (config.version) globalParams['trap-version'] = config.version === 'v1' ? '1' : config.version === 'v3' ? '3' : '2';
+    if (Object.keys(globalParams).length) await this.client.execute('/snmp/set', globalParams);
 
-    // 2. Community security level
-    let security = 'none';
-    if (config.version === 'v3') {
-      const hasPriv = config.priv_protocol && config.priv_protocol !== 'none' && config.priv_password;
-      security = hasPriv ? 'private' : 'authorized';
-    }
+    // 2. The community (v1/v2c) or user (v3), only when one was named.
+    const name = config.community_name?.trim();
+    if (!name) return;
 
-    const communityParams: Record<string, string> = { name: config.community_name, security };
+    const communityParams: Record<string, string> = { name };
     if (config.version === 'v3') {
+      // A privacy protocol means encrypted SNMP, whether or not the password is
+      // being changed. Deciding on the password alone downgraded an existing
+      // encrypted setup to authentication-only whenever the form left it blank
+      // to keep the current one (P2-13).
+      const wantsPriv = !!config.priv_protocol && config.priv_protocol !== 'none';
+      communityParams['security'] = wantsPriv ? 'private' : 'authorized';
       if (config.auth_protocol && config.auth_protocol !== 'none') {
         communityParams['authentication-protocol'] = config.auth_protocol;
         if (config.auth_password) communityParams['authentication-password'] = config.auth_password;
       }
-      if (config.priv_protocol && config.priv_protocol !== 'none') {
-        communityParams['encryption-protocol'] = config.priv_protocol;
+      if (wantsPriv) {
+        communityParams['encryption-protocol'] = config.priv_protocol!;
         if (config.priv_password) communityParams['encryption-password'] = config.priv_password;
       }
+    } else if (config.version) {
+      communityParams['security'] = 'none';
     }
 
-    // Find existing community by name or fall back to first
-    const communities = await this.client.execute('/snmp/community/print').catch(() => [] as Record<string, string>[]);
-    const existing = (communities as Record<string, string>[]).find(c => c['name'] === config.community_name)
-      ?? (communities as Record<string, string>[])[0];
-
+    const communities = await this.client.execute('/snmp/community/print');
+    const existing = communities.find((c) => c['name'] === name);
     if (existing?.['.id']) {
-      await this.client.execute('/snmp/community/set', { '.id': existing['.id'], ...communityParams });
+      const { name: _n, ...changes } = communityParams;
+      void _n;
+      if (Object.keys(changes).length) {
+        await this.client.execute('/snmp/community/set', { '.id': existing['.id'], ...changes });
+      }
     } else {
       await this.client.execute('/snmp/community/add', communityParams);
     }
@@ -1281,31 +2315,64 @@ export class DeviceCollector {
    * restorable, and fires a `config_drift` alert when the config changed.
    * Returns true when a new snapshot row was created, false on dedup/failure.
    */
-  async snapshotConfig(reason = 'sync'): Promise<boolean> {
+  /**
+   * Take a config snapshot. 'unchanged' means the config matched the last
+   * snapshot (and that snapshot has its restorable backup); 'repaired' that it
+   * matched, but the backup missing from it was made now; 'failed' carries why
+   * (outside review C10: a failure used to read as "no changes").
+   */
+  async snapshotConfig(reason = 'sync'): Promise<
+    { status: 'created' | 'unchanged' | 'repaired' } | { status: 'failed'; reason: string }
+  > {
     try {
       const backupService = new BackupService();
       const device = this.device as unknown as import('../BackupService').BackupDevice;
 
       // The export requires SSH; without it there's no restorable snapshot to take.
+      // Never with secrets: the snapshot text is stored in the database and
+      // shown in Config History diffs (#172). v6 uses hide-sensitive for this.
       let rsc: string;
+      let rscHasSecrets = false;
       try {
-        rsc = await backupService.exportConfig(device);
+        ({ text: rsc, containsSecrets: rscHasSecrets } = await backupService.exportConfig(device));
       } catch (e) {
         console.warn(`[${this.device.name}] config snapshot skipped — /export failed: ${(e as Error).message}`);
-        return false;
+        return { status: 'failed', reason: `the configuration export failed: ${(e as Error).message}` };
+      }
+      // Only when the version is unknown (not read yet); the next poll knows it.
+      if (rscHasSecrets) {
+        console.warn(`[${this.device.name}] config snapshot skipped — RouterOS version not known yet, so the export may hold secrets`);
+        return { status: 'failed', reason: "the RouterOS version isn't known yet, so the export could contain secrets. Try again after the next poll" };
       }
 
       const text = DeviceCollector.normalizeRsc(rsc);
       const hash = createHash('sha256').update(text).digest('hex');
 
-      const latest = await queryOne<{ config_hash: string | null; config_text: string | null }>(
-        `SELECT config_hash, config_text FROM device_configs
+      const latest = await queryOne<{ id: number; config_hash: string | null; config_text: string | null; backup_id: number | null }>(
+        `SELECT id, config_hash, config_text, backup_id FROM device_configs
          WHERE device_id = $1 ORDER BY collected_at DESC LIMIT 1`,
         [this.device.id]
       );
 
-      // No change since the last snapshot — nothing to store.
-      if (latest && latest.config_hash === hash) return false;
+      // No change since the last snapshot. If that snapshot's backup failed
+      // to save, it has nothing to roll back to; this export is the same
+      // config, so it becomes that backup now (outside review C10).
+      if (latest && latest.config_hash === hash) {
+        if (latest.backup_id) {
+          await this.markConfigChecked();
+          return { status: 'unchanged' };
+        }
+        const repaired = await backupService.createBackupFromContent(
+          device, rsc, `Config snapshot (${reason})`, 'config-snapshot', rscHasSecrets
+        ).catch((e: Error) => {
+          console.warn(`[${this.device.name}] snapshot backup still unavailable: ${e.message}`);
+          return null;
+        });
+        if (!repaired) return { status: 'failed', reason: "the configuration hasn't changed, but its restorable backup couldn't be saved" };
+        await query(`UPDATE device_configs SET backup_id = $2 WHERE id = $1 AND backup_id IS NULL`, [latest.id, repaired]);
+        await this.markConfigChecked();
+        return { status: 'repaired' };
+      }
 
       const isFirst = !latest;
       const summary = isFirst
@@ -1320,15 +2387,16 @@ export class DeviceCollector {
           device,
           rsc,
           `Config snapshot (${reason})`,
-          'config-snapshot'
+          'config-snapshot',
+          rscHasSecrets
         );
       } catch (e) {
         console.warn(`[${this.device.name}] snapshot backup unavailable: ${(e as Error).message}`);
       }
 
       await query(
-        `INSERT INTO device_configs (device_id, config_json, config_text, config_hash, change_summary, backup_id)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+        `INSERT INTO device_configs (device_id, config_json, config_text, config_hash, change_summary, backup_id, contains_secrets)
+         VALUES ($1, $2, $3, $4, $5, $6, false)`,
         [this.device.id, '{}', text, hash, summary, backupId]
       );
 
@@ -1342,16 +2410,59 @@ export class DeviceCollector {
           details: summary,
         }).catch(() => { /* alerting is best-effort */ });
       }
-      return true;
+      if (backupId === null) return { status: 'failed', reason: "the snapshot was stored, but its restorable backup couldn't be saved. The next snapshot retries it" };
+      await this.markConfigChecked();
+      return { status: 'created' };
     } catch (err) {
       console.error(`[${this.device.name}] Failed to save config:`, err);
-      return false;
+      return { status: 'failed', reason: (err as Error).message };
     }
+  }
+
+  /**
+   * The running configuration was just read and has a restorable backup.
+   * The dashboard counts this as a fresh backup: an unchanged config stores no
+   * new copy, so the newest one can be weeks old and still current (#377).
+   */
+  private async markConfigChecked(): Promise<void> {
+    await query(`UPDATE devices SET config_checked_at = NOW() WHERE id = $1`, [this.device.id])
+      .catch((e: Error) => console.warn(`[${this.device.name}] couldn't record the config check: ${e.message}`));
   }
 
   /** Back-compat entry point used by the full-sync flow. */
   async saveFullConfig(): Promise<void> {
     await this.snapshotConfig('full-sync');
+  }
+
+  /**
+   * Read /system/health and store a verdict (#168). Returns the previous state
+   * so the poller can alert on a change, or null if health could not be read,
+   * in which case the stored verdict is left as it was.
+   */
+  async collectHealth(tempLimitC?: number): Promise<{
+    prevStatus: string | null;
+    prevItems: string[];
+    verdict: HealthVerdict;
+  } | null> {
+    let rows: Record<string, string>[];
+    try {
+      rows = (await this.client.execute('/system/health/print')) as Record<string, string>[];
+    } catch {
+      return null;
+    }
+    const [prev] = await query<{ health_status: string | null; health_issues: { issues?: HealthIssue[] } | null; health_ignored: string[] | null }>(
+      `SELECT health_status, health_issues, health_ignored FROM devices WHERE id = $1`, [this.device.id]
+    );
+    const verdict = evaluateHealth(normalizeHealth(rows), { tempLimitC, ignored: prev?.health_ignored ?? [] });
+    await query(
+      `UPDATE devices SET health_status = $2, health_issues = $3, health_checked_at = NOW() WHERE id = $1`,
+      [this.device.id, verdict.status, JSON.stringify({ issues: verdict.issues, ignored: verdict.ignored })]
+    );
+    return {
+      prevStatus: prev?.health_status ?? null,
+      prevItems: (prev?.health_issues?.issues ?? []).map((i) => i.item),
+      verdict,
+    };
   }
 
   async updateDeviceStatus(status: string): Promise<void> {
@@ -1421,6 +2532,8 @@ export class DeviceCollector {
 
 
   private wifiRoleCache: WifiRole | null = null;
+  /** Set when the last role check didn't get an answer from every read. */
+  private wifiRoleUncertain = false;
 
   /**
    * Is this device a CAPsMAN controller, a CAP, both, or neither?
@@ -1431,22 +2544,81 @@ export class DeviceCollector {
    */
   async detectWifiRole(): Promise<WifiRole> {
     if (this.wifiRoleCache !== null) return this.wifiRoleCache;
+    this.wifiRoleHeld = false;
+    const role = await this.readWifiRole();
+    if (this.wifiRoleUncertain) return role;
+
+    // A change to a recorded role waits for a second check that agrees (#365).
+    // Until then the device keeps the role it had, and its radios and CAPsMAN
+    // inventory are left as they are. A role found where none was recorded
+    // ('none' or never checked) is taken at once: finding one takes real data.
+    const d = this.device as unknown as { id: number; wifi_role?: string | null; capsman_flavor?: string | null };
+    const recorded = (d.wifi_role ?? null) as WifiRole | null;
+    if (recorded !== null && recorded !== 'none' && role !== recorded && pendingWifiRole.get(d.id) !== role) {
+      pendingWifiRole.set(d.id, role);
+      this.wifiRoleHeld = true;
+      this.wifiRoleUncertain = true;
+      this.capsmanFlavor = (d.capsman_flavor ?? null) as 'wifi' | 'legacy' | 'both' | null;
+      this.wifiRoleCache = recorded;
+      return recorded;
+    }
+    pendingWifiRole.delete(d.id);
+    this.wifiRoleCache = role;
+    return role;
+  }
+
+  /** Set when the role read differs from the recorded one and waits for a second look. */
+  private wifiRoleHeld = false;
+
+  /** The role from the device's own menus, without the hold above. */
+  private async readWifiRole(): Promise<WifiRole> {
     const pkg = await this.detectWifiPackage();
-    if (pkg !== 'wifi') {
-      // Legacy /caps-man is a separate API tree and is not covered yet; treat the
-      // old wireless package as standalone rather than guessing.
-      this.wifiRoleCache = pkg === 'none' ? 'none' : 'standalone';
-      return this.wifiRoleCache;
+    if (pkg === 'none') {
+      // Both menus failing to answer isn't "no wireless" (#365).
+      this.wifiRoleUncertain = this.wifiPackageUncertain;
+      return 'none';
     }
 
-    const [capsman, cap, ifaces] = await Promise.all([
-      this.client.execute('/interface/wifi/capsman/print').catch(() => null),
-      this.client.execute('/interface/wifi/cap/print').catch(() => null),
-      this.client.execute('/interface/wifi/print').catch(() => [] as Record<string, string>[]),
+    // The device saying the menu doesn't exist means "not configured here"; a
+    // timeout, or any other trap ("interrupted"), says nothing. If a read didn't
+    // get an answer the role is a guess, and nothing may be deleted on the
+    // strength of it (P2-21, #365).
+    const absentOrUnknown = (err: unknown): null => {
+      if (!isNoSuchCommand(err)) this.wifiRoleUncertain = true;
+      return null;
+    };
+    // A package guessed from a read that timed out makes the role a guess too.
+    this.wifiRoleUncertain = this.wifiPackageUncertain;
+    // Legacy CAPsMAN (#250) comes with the wireless package: /caps-man on a
+    // controller (a CHR can carry it alongside the wifi package), and
+    // /interface/wireless/cap on an access point that is one of its CAPs.
+    const [capsman, cap, ifaces, legacyMgr, legacyCap] = await Promise.all([
+      pkg === 'wifi' ? this.client.execute('/interface/wifi/capsman/print').catch(absentOrUnknown) : Promise.resolve(null),
+      pkg === 'wifi' ? this.client.execute('/interface/wifi/cap/print').catch(absentOrUnknown) : Promise.resolve(null),
+      // Both packages: whether the device really has radios. The wireless
+      // package is installed on many RouterOS 6 routers that have none.
+      this.client.execute(pkg === 'wifi' ? '/interface/wifi/print' : '/interface/wireless/print').catch(absentOrUnknown),
+      this.client.execute('/caps-man/manager/print').catch(absentOrUnknown),
+      pkg === 'wireless' ? this.client.execute('/interface/wireless/cap/print').catch(absentOrUnknown) : Promise.resolve(null),
     ]);
-    this.wifiRoleCache = classifyWifiRole(capsman, cap, ifaces.length > 0);
-    return this.wifiRoleCache;
+    const newController = !!capsman?.some((r) => r['enabled'] === 'true' || r['enabled'] === 'yes');
+    const legacyController = legacyManagerEnabled(legacyMgr);
+    // Both can be on at once: a CHR serving newer APs and legacy ones (#250).
+    this.capsmanFlavor = newController && legacyController ? 'both'
+      : newController ? 'wifi' : legacyController ? 'legacy' : null;
+    this.legacyCapIfaces = legacyCapInterfaces(legacyCap);
+    const role = classifyWifiRole(
+      newController || legacyController ? [{ enabled: 'yes' }] : capsman,
+      this.legacyCapIfaces.length > 0 ? [{ enabled: 'yes' }] : cap,
+      (ifaces ?? []).length > 0,
+    );
+    return role;
   }
+
+  /** Which CAPsMAN this device runs as a controller, set by detectWifiRole. */
+  private capsmanFlavor: 'wifi' | 'legacy' | 'both' | null = null;
+  /** Interfaces this device hands to a legacy controller, when it is a legacy CAP (#250). */
+  private legacyCapIfaces: string[] = [];
 
   /**
    * Controller-side inventory: the radios it manages, the named configurations, and
@@ -1460,14 +2632,33 @@ export class DeviceCollector {
   async collectCapsman(): Promise<void> {
     try {
       const role = await this.detectWifiRole();
+      // The role read differently this time: leave the inventory until the
+      // next check says whether it really changed (#365).
+      if (this.wifiRoleHeld) return;
       if (role !== 'controller' && role !== 'controller_cap') {
+        // Couldn't tell: keep the inventory rather than wipe it on a timeout.
+        if (this.wifiRoleUncertain) return;
         // Not a controller: clear any inventory left from when it was one.
         await query(`DELETE FROM capsman_radios WHERE controller_device_id = $1`, [this.device.id]);
         await query(`DELETE FROM capsman_configurations WHERE controller_device_id = $1`, [this.device.id]);
         await query(`DELETE FROM capsman_provisioning WHERE controller_device_id = $1`, [this.device.id]);
         return;
       }
+      // Each CAPsMAN in use is read and stored; what no longer exists is removed
+      // afterwards, against what both found. Removing per CAPsMAN deleted the
+      // other one's radios when a controller ran both (#250). Anything that
+      // couldn't be read stops the removal, so a timeout never wipes inventory.
+      const parts: CapsmanInventory[] = [];
+      if (this.capsmanFlavor !== 'legacy') parts.push(await this.collectWifiCapsman());
+      if (this.capsmanFlavor === 'legacy' || this.capsmanFlavor === 'both') parts.push(await this.collectLegacyCapsman());
+      await this.pruneCapsman(parts);
+    } catch (err) {
+      console.error(`[${this.device.name}] Failed to collect CAPsMAN data:`, (err as Error).message);
+    }
+  }
 
+  /** The newer CAPsMAN (/interface/wifi/capsman). */
+  private async collectWifiCapsman(): Promise<CapsmanInventory> {
       const [radioRows, configRows, provRows, ifaceRows, regRows] = await Promise.all([
         this.client.execute('/interface/wifi/radio/print').catch(() => null),
         this.client.execute('/interface/wifi/configuration/print', { detail: '' }).catch(() => null),
@@ -1492,6 +2683,7 @@ export class DeviceCollector {
       ).catch(() => []);
       const macIndex = buildMacIndex(macRows);
 
+      let radiosSeen: string[] | null = null;
       if (radioRows !== null) {
         const radios = normalizeRadios(radioRows);
 
@@ -1555,98 +2747,176 @@ export class DeviceCollector {
             ]
           );
         }
-        await query(
-          `DELETE FROM capsman_radios WHERE controller_device_id = $1 AND NOT (radio_mac = ANY($2::text[]))`,
-          [this.device.id, seen]
-        );
+        radiosSeen = seen;
       }
 
-      if (configRows !== null) {
-        const seen: string[] = [];
-        for (const cfg of configRows) {
-          const name = cfg['name'];
-          if (!name) continue;
-          seen.push(name);
-          await query(
-            `INSERT INTO capsman_configurations
-               (controller_device_id, name, ssid, mode, band, security, authentication_types, config_json, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
-             ON CONFLICT (controller_device_id, name) DO UPDATE SET
-               ssid=$3, mode=$4, band=$5, security=$6, authentication_types=$7,
-               config_json=$8, updated_at=NOW()`,
-            [
-              this.device.id, name,
-              cfg['ssid'] ?? null,
-              cfg['mode'] ?? null,
-              cfg['channel.band'] ?? cfg['band'] ?? null,
-              cfg['security'] ?? null,
-              cfg['security.authentication-types'] ?? null,
-              JSON.stringify(cfg),
-            ]
-          );
-        }
-        await query(
-          `DELETE FROM capsman_configurations WHERE controller_device_id = $1 AND NOT (name = ANY($2::text[]))`,
-          [this.device.id, seen]
-        );
-      }
+      return {
+        radios: radiosSeen,
+        configurations: configRows !== null ? await this.storeCapsmanConfigurations(configRows) : null,
+        provisioning: provRows !== null ? await this.storeCapsmanProvisioning(provRows, '') : null,
+      };
+  }
 
-      if (provRows !== null) {
-        const seen: string[] = [];
-        for (const prov of provRows) {
-          const rosId = prov['.id'];
-          if (!rosId) continue;
-          seen.push(rosId);
-          await query(
-            `INSERT INTO capsman_provisioning
-               (controller_device_id, ros_id, action, master_configuration, slave_configurations,
-                radio_mac, comment, disabled, config_json, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
-             ON CONFLICT (controller_device_id, ros_id) DO UPDATE SET
-               action=$3, master_configuration=$4, slave_configurations=$5, radio_mac=$6,
-               comment=$7, disabled=$8, config_json=$9, updated_at=NOW()`,
-            [
-              this.device.id, rosId,
-              prov['action'] ?? null,
-              prov['master-configuration'] ?? null,
-              prov['slave-configurations'] ?? null,
-              (prov['radio-mac'] || '').toUpperCase() || null,
-              prov['comment'] ?? null,
-              prov['disabled'] === 'true',
-              JSON.stringify(prov),
-            ]
-          );
-        }
+
+  /**
+   * Legacy CAPsMAN controller (#250): its radios, configurations and
+   * provisioning, stored in the same tables as the newer CAPsMAN so the Wireless
+   * pages need no second code path. Every radio lives on a CAP, and is matched
+   * to the managed device carrying its MAC.
+   */
+  private async collectLegacyCapsman(): Promise<CapsmanInventory> {
+    const failed = () => null;
+    const [ifaceRows, radioRows, capRows, configRows, provRows, regRows] = await Promise.all([
+      this.client.execute('/caps-man/interface/print', { detail: '' }).catch(failed),
+      this.client.execute('/caps-man/radio/print').catch(failed),
+      this.client.execute('/caps-man/remote-cap/print').catch(failed),
+      this.client.execute('/caps-man/configuration/print', { detail: '' }).catch(failed),
+      this.client.execute('/caps-man/provisioning/print', { detail: '' }).catch(failed),
+      this.client.execute('/caps-man/registration-table/print').catch(failed),
+    ]);
+
+    let radiosSeen: string[] | null = null;
+    if (ifaceRows !== null) {
+      const radios = legacyRadios(ifaceRows, radioRows, capRows, configRows, regRows);
+      const macRows = await query<{ device_id: number; mac_address: string }>(
+        `SELECT device_id, mac_address FROM interfaces WHERE mac_address IS NOT NULL
+         UNION
+         SELECT device_id, mac_address FROM wireless_interfaces WHERE mac_address IS NOT NULL`
+      ).catch(() => []);
+      const macIndex = buildMacIndex(macRows);
+      const seen: string[] = [];
+      for (const r of radios) {
+        seen.push(r.radioMac);
         await query(
-          `DELETE FROM capsman_provisioning WHERE controller_device_id = $1 AND NOT (ros_id = ANY($2::text[]))`,
-          [this.device.id, seen]
+          `INSERT INTO capsman_radios
+             (controller_device_id, radio_mac, interface_name, local, hw_type,
+              current_channel, remote_cap_name, matched_device_id, config_json,
+              state, registered_peers, authorized_peers, tx_power, ssid, updated_at)
+           VALUES ($1,$2,$3,false,NULL,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+           ON CONFLICT (controller_device_id, radio_mac) DO UPDATE SET
+             interface_name=$3, local=false, hw_type=NULL, current_channel=$4,
+             remote_cap_name=$5, matched_device_id=$6, config_json=$7,
+             state=$8, registered_peers=$9, authorized_peers=$10, tx_power=$11,
+             ssid=$12, updated_at=NOW()`,
+          [
+            this.device.id, r.radioMac, r.interfaceName, r.channel, r.capIdentity,
+            lookupDeviceForMac(r.radioMac, macIndex, this.device.id),
+            JSON.stringify(r.raw), r.state, r.registeredPeers, r.authorizedPeers, r.txPower, r.ssid,
+          ]
         );
       }
-    } catch (err) {
-      console.error(`[${this.device.name}] Failed to collect CAPsMAN data:`, (err as Error).message);
+      radiosSeen = seen;
     }
+    return {
+      radios: radiosSeen,
+      configurations: configRows !== null ? await this.storeCapsmanConfigurations(configRows) : null,
+      // Rule ids restart at *1 in each menu tree, so the legacy ones are kept
+      // apart with a prefix.
+      provisioning: provRows !== null ? await this.storeCapsmanProvisioning(provRows, 'legacy:') : null,
+    };
+  }
+
+  /** Remove what no CAPsMAN reported any more, unless a read failed. */
+  private async pruneCapsman(parts: CapsmanInventory[]): Promise<void> {
+    const all = <K extends keyof CapsmanInventory>(k: K): string[] | null =>
+      parts.some((p) => p[k] === null) ? null : parts.flatMap((p) => p[k] as string[]);
+    const radios = all('radios');
+    if (radios) await query(
+      `DELETE FROM capsman_radios WHERE controller_device_id = $1 AND NOT (radio_mac = ANY($2::text[]))`,
+      [this.device.id, radios]);
+    const configs = all('configurations');
+    if (configs) await query(
+      `DELETE FROM capsman_configurations WHERE controller_device_id = $1 AND NOT (name = ANY($2::text[]))`,
+      [this.device.id, configs]);
+    const prov = all('provisioning');
+    if (prov) await query(
+      `DELETE FROM capsman_provisioning WHERE controller_device_id = $1 AND NOT (ros_id = ANY($2::text[]))`,
+      [this.device.id, prov]);
+  }
+
+  /** Named CAPsMAN configurations, from either CAPsMAN (same field names). */
+  private async storeCapsmanConfigurations(configRows: Record<string, string>[]): Promise<string[]> {
+      const seen: string[] = [];
+      for (const cfg of configRows) {
+        const name = cfg['name'];
+        if (!name) continue;
+        seen.push(name);
+        await query(
+          `INSERT INTO capsman_configurations
+             (controller_device_id, name, ssid, mode, band, security, authentication_types, config_json, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+           ON CONFLICT (controller_device_id, name) DO UPDATE SET
+             ssid=$3, mode=$4, band=$5, security=$6, authentication_types=$7,
+             config_json=$8, updated_at=NOW()`,
+          [
+            this.device.id, name,
+            cfg['ssid'] ?? null,
+            cfg['mode'] ?? null,
+            cfg['channel.band'] ?? cfg['band'] ?? null,
+            cfg['security'] ?? null,
+            cfg['security.authentication-types'] ?? null,
+            JSON.stringify(cfg),
+          ]
+        );
+      }
+      return seen;
+  }
+
+  /** Provisioning rules, from either CAPsMAN (same field names). */
+  private async storeCapsmanProvisioning(provRows: Record<string, string>[], idPrefix: string): Promise<string[]> {
+      const seen: string[] = [];
+      for (const prov of provRows) {
+        const rosId = prov['.id'] ? `${idPrefix}${prov['.id']}` : '';
+        if (!rosId) continue;
+        seen.push(rosId);
+        await query(
+          `INSERT INTO capsman_provisioning
+             (controller_device_id, ros_id, action, master_configuration, slave_configurations,
+              radio_mac, comment, disabled, config_json, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+           ON CONFLICT (controller_device_id, ros_id) DO UPDATE SET
+             action=$3, master_configuration=$4, slave_configurations=$5, radio_mac=$6,
+             comment=$7, disabled=$8, config_json=$9, updated_at=NOW()`,
+          [
+            this.device.id, rosId,
+            prov['action'] ?? null,
+            prov['master-configuration'] ?? null,
+            prov['slave-configurations'] ?? null,
+            (prov['radio-mac'] || '').toUpperCase() || null,
+            prov['comment'] ?? null,
+            prov['disabled'] === 'true',
+            JSON.stringify(prov),
+          ]
+        );
+      }
+      return seen;
   }
 
   // ─── Wifi package detection ───────────────────────────────────────────────
 
   private wifiPackageCache: 'wifi' | 'wireless' | 'none' | null = null;
+  /** Set when a package read failed without the device refusing it (a timeout). */
+  private wifiPackageUncertain = false;
 
   async detectWifiPackage(): Promise<'wifi' | 'wireless' | 'none'> {
     if (this.wifiPackageCache !== null) return this.wifiPackageCache;
-    // Try RouterOS 7 "wifi" package first (Wi-Fi 6/7 hardware — wlan names are wifi1, wifi2)
-    try {
-      await this.client.execute('/interface/wifi/print');
-      this.wifiPackageCache = 'wifi';
-      return 'wifi';
-    } catch { /* fall through */ }
-    // Try legacy "wireless" package (RouterOS 6.x / older 7.x hardware)
-    try {
-      await this.client.execute('/interface/wireless/print');
-      this.wifiPackageCache = 'wireless';
-      return 'wireless';
-    } catch { /* fall through */ }
-    this.wifiPackageCache = 'none';
-    return 'none';
+    // Both menus, because the wifi one answers on every RouterOS 7.13+ device
+    // (CAPsMAN is built in) even when the radios are on the legacy wireless
+    // package, as on a hAP ac². See chooseWifiPackage.
+    //
+    // "No such menu" is an answer; a timeout, or any other trap, isn't. A wifi
+    // menu that failed made a RouterOS 7 controller look like a router with no
+    // wireless, and the 'none' was recorded and never checked again (#365).
+    let uncertain = false;
+    const read = (cmd: string) => this.client.execute(cmd).catch((err: unknown) => {
+      if (!isNoSuchCommand(err)) uncertain = true;
+      return null;
+    });
+    const [wifi, wireless] = await Promise.all([read('/interface/wifi/print'), read('/interface/wireless/print')]);
+    const pkg = chooseWifiPackage(wifi?.length ?? null, wireless?.length ?? null);
+    this.wifiPackageUncertain = uncertain;
+    if (!uncertain) this.wifiPackageCache = pkg;
+    return pkg;
   }
 
   // Normalize RouterOS 7 wifi package dot-notation fields to flat keys
@@ -1672,17 +2942,26 @@ export class DeviceCollector {
   async collectWirelessInterfaces(): Promise<void> {
     try {
       const pkg = await this.detectWifiPackage();
-      if (pkg === 'none') return;
 
       // Recorded per device so the UI can explain a blank SSID as delegation to a
       // controller rather than leaving it looking like an unconfigured radio.
       const role = await this.detectWifiRole();
+      // The role read differently from the recorded one: keep the device's
+      // radios as they are until the next check agrees (#365).
+      if (this.wifiRoleHeld) return;
       // The package is recorded alongside the role because TX-retry data only
       // exists on the legacy 'wireless' driver, and a panel that can never have
-      // data on this fleet should not occupy space (issue #96).
-      await query(`UPDATE devices SET wifi_role = $2, wifi_package = $3 WHERE id = $1`,
-                  [this.device.id, role, pkg])
-        .catch(() => { /* advisory; never fail collection over it */ });
+      // data on this fleet should not occupy space (issue #96). A role that is
+      // only a guess (a read timed out) isn't recorded. Recorded even with no
+      // wireless package, so the device isn't probed again on every poll.
+      if (!this.wifiRoleUncertain) {
+        await query(
+          `UPDATE devices SET wifi_role = $2, wifi_package = $3, capsman_flavor = $4, wifi_role_probe = $5,
+                              wifi_role_checked_at = NOW() WHERE id = $1`,
+          [this.device.id, role, pkg, this.capsmanFlavor, WIFI_ROLE_PROBE]
+        ).catch(() => { /* advisory; never fail collection over it */ });
+      }
+      if (pkg === 'none') return;
 
       // null = the fetch itself failed. Distinguished from an empty list (device
       // genuinely has no wireless interfaces) so a transient API error can never
@@ -1712,6 +2991,23 @@ export class DeviceCollector {
         }));
       }
 
+      // A legacy CAP keeps its old local settings on the interfaces it hands to
+      // the controller, which no longer apply. The controller's view of the radio
+      // (same MAC) has the SSID actually on the air (#250).
+      const controllerSsid = new Map<string, string>();
+      if (this.legacyCapIfaces.length > 0) {
+        const macs = wlans.filter((w) => this.legacyCapIfaces.includes(w['name']))
+          .map((w) => (w['mac-address'] || '').toUpperCase()).filter(Boolean);
+        if (macs.length > 0) {
+          const rows = await query<{ radio_mac: string; ssid: string | null }>(
+            `SELECT DISTINCT ON (radio_mac) radio_mac, ssid FROM capsman_radios
+              WHERE radio_mac = ANY($1::text[]) AND ssid IS NOT NULL ORDER BY radio_mac, updated_at DESC`,
+            [macs]
+          ).catch(() => []);
+          for (const r of rows) controllerSsid.set(r.radio_mac, r.ssid as string);
+        }
+      }
+
       for (const wlan of wlans) {
         const name = wlan['name'];
         if (!name) continue;
@@ -1719,7 +3015,8 @@ export class DeviceCollector {
         // status line is the only place an SSID or channel appears. Fall back to it
         // rather than storing nulls that render as an empty, broken-looking AP.
         const capsmanStatus = parseCapsmanStatus(wlan);
-        const managed = isCapsmanManaged(wlan, role);
+        // A legacy CAP names the interfaces it hands to its controller (#250).
+        const managed = isCapsmanManaged(wlan, role) || this.legacyCapIfaces.includes(name);
         const master = wlan['master-interface'];
         const liveF = liveFreq[name] ?? (master ? liveFreq[master] : undefined);
         const liveW = liveWidth[name] ?? (master ? liveWidth[master] : undefined);
@@ -1736,47 +3033,52 @@ export class DeviceCollector {
           || (!isNaN(statusFreq) && statusFreq > 0 ? bandPrefix(statusFreq) : null);
         const widthStr = wlan['channel-width'] || liveW || null;
 
-        await query(
-          `INSERT INTO wireless_interfaces
-            (device_id, name, ssid, mode, band, frequency, channel_width, tx_power,
-             tx_power_mode, antenna_gain, country, installation, disabled, running,
-             mac_address, security_profile, config_json, managed_by_capsman, radio_mac,
-             capsman_controller_mac, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
-           ON CONFLICT (device_id, name) DO UPDATE SET
-             ssid=$3, mode=$4, band=$5, frequency=$6, channel_width=$7, tx_power=$8,
-             tx_power_mode=$9, antenna_gain=$10, country=$11, installation=$12,
-             disabled=$13, running=$14, mac_address=$15, security_profile=$16,
-             config_json=$17, managed_by_capsman=$18, radio_mac=$19,
-             capsman_controller_mac=$20, updated_at=NOW()`,
-          [
-            this.device.id, name,
-            wlan['ssid'] || capsmanStatus?.ssid || null,
-            wlan['mode'] || capsmanStatus?.mode || null,
-            bandStr || null,
-            !isNaN(effFreq) && effFreq > 0 ? effFreq : null,
-            widthStr,
-            !isNaN(txPow) && txPow > 0 ? txPow : null,
-            wlan['tx-power-mode'] || null,
-            !isNaN(gain) ? gain : null,
-            wlan['country'] || null,
-            wlan['installation'] || 'indoor',
-            wlan['disabled'] === 'true',
-            wlan['running'] === 'true',
-            wlan['mac-address'] || null,
-            wlan['security-profile'] || null,
-            JSON.stringify(wlan),
-            managed,
-            (wlan['radio-mac'] || '').toUpperCase() || null,
-            capsmanStatus?.controllerMac ?? null,
-          ]
-        );
+        // Values cut to their columns, and one bad radio costs only itself (P2-20).
+        try {
+          await query(
+            `INSERT INTO wireless_interfaces
+              (device_id, name, ssid, mode, band, frequency, channel_width, tx_power,
+               tx_power_mode, antenna_gain, country, installation, disabled, running,
+               mac_address, security_profile, config_json, managed_by_capsman, radio_mac,
+               capsman_controller_mac, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW())
+             ON CONFLICT (device_id, name) DO UPDATE SET
+               ssid=$3, mode=$4, band=$5, frequency=$6, channel_width=$7, tx_power=$8,
+               tx_power_mode=$9, antenna_gain=$10, country=$11, installation=$12,
+               disabled=$13, running=$14, mac_address=$15, security_profile=$16,
+               config_json=$17, managed_by_capsman=$18, radio_mac=$19,
+               capsman_controller_mac=$20, updated_at=NOW()`,
+            [
+              this.device.id, fit(name, 50),
+              fit(controllerSsid.get((wlan['mac-address'] || '').toUpperCase()) || wlan['ssid'] || capsmanStatus?.ssid || null, 100),
+              fit(wlan['mode'] || capsmanStatus?.mode || null, 30),
+              fit(bandStr || null, 50),
+              !isNaN(effFreq) && effFreq > 0 ? effFreq : null,
+              fit(widthStr, 30),
+              !isNaN(txPow) && txPow > 0 ? txPow : null,
+              fit(wlan['tx-power-mode'] || null, 30),
+              !isNaN(gain) ? gain : null,
+              fit(wlan['country'] || null, 50),
+              fit(wlan['installation'] || 'indoor', 20),
+              wlan['disabled'] === 'true',
+              wlan['running'] === 'true',
+              fit(wlan['mac-address'] || null, 17),
+              fit(wlan['security-profile'] || null, 100),
+              JSON.stringify(wlan),
+              managed,
+              fit((wlan['radio-mac'] || '').toUpperCase() || null, 17),
+              fit(capsmanStatus?.controllerMac ?? null, 17),
+            ]
+          );
+        } catch (err) {
+          console.error(`[${this.device.name}] Skipped wireless interface ${name}:`, (err as Error).message);
+        }
       }
 
       // Drop rows for interfaces that no longer exist on the device (e.g. a
       // virtual AP removed directly in WinBox/WebFig). Without this the upsert
       // above only ever adds, so deleted radios linger in the UI forever.
-      const present = wlans.map((w) => w['name']).filter(Boolean);
+      const present = wlans.map((w) => fit(w['name'], 50)).filter(Boolean);
       await query(
         `DELETE FROM wireless_interfaces WHERE device_id = $1 AND NOT (name = ANY($2::text[]))`,
         [this.device.id, present]
@@ -1911,6 +3213,7 @@ export class DeviceCollector {
                 'authentication-types': r['security.authentication-types'] || '',
                 passphrase:             r['security.passphrase'] || '',
                 encryption:             r['security.encryption'] || '',
+                inline:                 'true',
               },
             }));
         }
@@ -1975,42 +3278,9 @@ export class DeviceCollector {
 
   // ─── Wireless live-query helpers (for routes) ──────────────────────────────
 
-  // Field map for translating old wireless-style flat keys → new wifi dot-notation
-  private static readonly WIFI_FIELD_MAP: Record<string, string> = {
-    'ssid':                   'configuration.ssid',
-    'mode':                   'configuration.mode',
-    'band':                   'channel.band',
-    'frequency':              'channel.frequency',
-    'channel-width':          'channel.width',
-    'passphrase':             'security.passphrase',
-    'wpa2-pre-shared-key':    'security.passphrase',
-    'authentication-types':   'security.authentication-types',
-    'encryption':             'security.encryption',
-    'security-profile':       'security',   // old pkg "security-profile" → new pkg "security"
-    'disabled':               'disabled',
-    'master-interface':       'master-interface',
-    'name':                   'name',
-  };
-
-  // Params valid only in the legacy wireless package — silently dropped for new wifi package
-  private static readonly WIFI_UNSUPPORTED_PARAMS = new Set([
-    'tx-power-mode', 'tx-power', 'antenna-gain',
-    'country', 'installation',
-    'wpa-pre-shared-key', 'unicast-ciphers', 'group-ciphers', 'management-protection',
-  ]);
 
   private translateToWifiParams(params: Record<string, string>): Record<string, string> {
-    const out: Record<string, string> = {};
-    // Virtual APs (master-interface set) inherit mode from their master — RouterOS rejects
-    // configuration.mode if it is sent explicitly for a virtual interface.
-    const isVirtualAp = !!params['master-interface'];
-    for (const [k, v] of Object.entries(params)) {
-      if (DeviceCollector.WIFI_UNSUPPORTED_PARAMS.has(k)) continue;
-      if (k === 'mode' && isVirtualAp) continue;
-      const mapped = DeviceCollector.WIFI_FIELD_MAP[k];
-      out[mapped ?? k] = v;
-    }
-    return out;
+    return translateToWifiParams(params);
   }
 
   // ─── Bridge helpers ───────────────────────────────────────────────────────
@@ -2058,6 +3328,141 @@ export class DeviceCollector {
         interface: ifaceName, bridge, ...extra,
       });
     }
+  }
+
+  // ─── Bridge membership for any port (#258) ─────────────────────────────────
+
+  /**
+   * Everything the bridge-port checks read, in one round of queries, asking
+   * only for the properties they use. A full print of every port and
+   * interface, status and counters included, took a CRS112 nine seconds
+   * (#258). The VLAN-interface and DHCP-server tables only matter for
+   * deleting a bridge.
+   */
+  async readBridgeState(opts: { forDelete?: boolean } = {}): Promise<BridgeState> {
+    const none = [] as Record<string, string>[];
+    const pl = (props: string) => ({ '.proplist': props });
+    const [bridgePorts, interfaces, bridgeVlans, addresses, dhcpClients, vlanInterfaces, dhcpServers] = await Promise.all([
+      this.client.execute('/interface/bridge/port/print', pl('.id,interface,bridge,dynamic,hw-offload')),
+      this.client.execute('/interface/print', pl('.id,name,type,slave')),
+      this.client.execute('/interface/bridge/vlan/print', pl('.id,bridge,vlan-ids,tagged,untagged,dynamic')),
+      this.client.execute('/ip/address/print', pl('.id,address,interface,dynamic')),
+      this.client.execute('/ip/dhcp-client/print', pl('.id,interface')).catch(() => none),
+      opts.forDelete ? this.client.execute('/interface/vlan/print', pl('.id,name,interface')).catch(() => none) : none,
+      opts.forDelete ? this.client.execute('/ip/dhcp-server/print', pl('.id,name,interface')).catch(() => none) : none,
+    ]);
+    return { bridgePorts, interfaces, bridgeVlans, addresses, dhcpClients, vlanInterfaces, dhcpServers };
+  }
+
+  /**
+   * Move ports into a bridge, optionally creating it, or out of any bridge.
+   * Planned afresh from the device's state (see planBridgePortMove). Returns
+   * whether each moved port ended up hardware switched, read back from the
+   * device: most switch chips offload one bridge only.
+   */
+  async moveBridgePorts(ports: string[], target: string | null, opts: {
+    create?: boolean;
+    /**
+     * The state the route already read for its checks. The device lock keeps
+     * other writes out in between, and reading it again cost a slow switch
+     * another eight seconds (#258).
+     */
+    state?: BridgeState;
+  } = {}): Promise<{
+    moved: string[]; unchanged: string[]; created: boolean; offload: Record<string, boolean>;
+    /** Hardware switching was expected but not yet reported; the flag may still change. */
+    offloadPending: boolean;
+  }> {
+    const state = opts.state ?? await this.readBridgeState();
+    const planned = planBridgePortMove({
+      ports, target, createTarget: opts.create,
+      bridgePorts: state.bridgePorts, interfaces: state.interfaces, bridgeVlans: state.bridgeVlans,
+    });
+    if (!planned.ok) throw new Error(planned.error);
+    const { plan } = planned;
+
+    const done: string[] = [];
+    const where = target ? `into ${target}` : 'out of their bridge';
+    /** Something was written, so a later failure leaves a half-applied move. */
+    let wrote = false;
+    const fail = (step: string, err: unknown): never => {
+      // No reply isn't "not applied": a lost reply on a write that was sent may
+      // well have landed (a move that cuts the manager off succeeds on the
+      // device and the answer never arrives), so only a clear rejection counts
+      // as nothing written.
+      throw stepFailure(err, wrote,
+        `${step} failed: ${(err as Error).message}.`
+        + (done.length ? ` Confirmed moved ${where}: ${done.join(', ')}.` : ' No port was confirmed moved.'));
+    };
+
+    if (plan.createBridge) {
+      await this.client.execute('/interface/bridge/add', { name: plan.createBridge, 'protocol-mode': 'rstp' })
+        .catch((e) => fail(`Creating bridge ${plan.createBridge}`, e));
+      wrote = true;
+    }
+    // The old bridges stop listing the ports first: an entry naming a port
+    // that has left is invalid, and would apply again if the port came back.
+    for (const e of plan.vlanEdits) {
+      await this.client.execute('/interface/bridge/vlan/set', {
+        '.id': e.id, tagged: e.tagged.join(','), untagged: e.untagged.join(','),
+      }).catch((err) => fail(`Removing the ports from VLAN ${e.vlanIds} on ${e.bridge}`, err));
+      wrote = true;
+    }
+    for (const op of plan.ops) {
+      try {
+        if (op.action === 'remove') {
+          await this.client.execute('/interface/bridge/port/remove', { '.id': op.id! });
+        } else if (op.action === 'set') {
+          // VLAN settings belonged to the old bridge.
+          await this.client.execute('/interface/bridge/port/set', {
+            '.id': op.id!, bridge: target!, pvid: '1', 'frame-types': 'admit-all',
+          });
+        } else {
+          await this.client.execute('/interface/bridge/port/add', { interface: op.port, bridge: target! });
+        }
+        done.push(op.port);
+        wrote = true;
+      } catch (err) {
+        fail(`Moving ${op.port}`, err);
+      }
+    }
+
+    // The H flag appears a moment after the port joins, later on a slow
+    // switch. Where hardware switching is expected (the bridge already has
+    // offloaded ports), keep looking for a while; elsewhere one look, since
+    // switch chips offload one bridge and the answer won't change. MikroTik
+    // documents CRS1xx/2xx as offloading several, but a CRS112 on 7.24.5
+    // didn't (#258), so they aren't assumed to.
+    const offload: Record<string, boolean> = {};
+    let offloadPending = false;
+    if (target && done.length) {
+      const expected = state.bridgePorts.some((p) => p['bridge'] === target && p['hw-offload'] === 'true');
+      const deadline = Date.now() + (expected ? OFFLOAD_WAIT_MS : 0);
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const after = await this.client.execute('/interface/bridge/port/print', { '.proplist': 'interface,hw-offload' })
+          .catch(() => [] as Record<string, string>[]);
+        for (const port of done) {
+          const row = after.find((p) => p['interface'] === port);
+          if (row) offload[port] = row['hw-offload'] === 'true';
+        }
+        if (done.every((p) => offload[p]) || Date.now() >= deadline) break;
+      }
+      offloadPending = expected && done.some((p) => !offload[p]);
+    }
+    return { moved: done, unchanged: plan.unchanged, created: !!plan.createBridge, offload, offloadPending };
+  }
+
+  /** Delete a bridge that has no ports, addresses, VLAN interfaces or DHCP server. */
+  async deleteBridge(name: string, opts: { state?: BridgeState } = {}): Promise<void> {
+    const state = opts.state ?? await this.readBridgeState({ forDelete: true });
+    const bridge = state.interfaces.find((i) => i['name'] === name && i['type'] === 'bridge');
+    if (!bridge) throw new Error(`There is no bridge called ${name} on this device.`);
+    const refusal = bridgeDeleteRefusal(name, state);
+    if (refusal) throw new Error(refusal);
+    const rows = await this.client.execute('/interface/bridge/print', {}, [`?name=${name}`]);
+    if (!rows[0]?.['.id']) throw new Error(`There is no bridge called ${name} on this device.`);
+    await this.client.execute('/interface/bridge/remove', { '.id': rows[0]['.id'] });
   }
 
   // ─── Live wireless interface list (enriched with bridge port data) ─────────
@@ -2146,11 +3551,45 @@ export class DeviceCollector {
     if (pkg === 'wifi') {
       await this.client.execute('/interface/wifi/set', { '.id': name, ...this.translateToWifiParams(params) });
     } else {
-      // Legacy wireless: drop inline security params — not supported directly on the interface
-      const { passphrase, 'authentication-types': _at, ...legacyParams } = params;
-      void passphrase; void _at;
+      // Legacy wireless: security lives in a security profile (P2-12). A new
+      // passphrase goes into this interface's own profile, which the interface
+      // is then pointed at; a shared profile is never changed.
+      const { passphrase, 'authentication-types': authTypes, ...legacyParams } = params;
+      if (passphrase) {
+        legacyParams['security-profile'] = await this.ensureLegacyProfile(name, passphrase, authTypes);
+      } else if (authTypes) {
+        // A new security type without a passphrase: only possible on the
+        // manager's own profile, which already holds the key.
+        const iface = (await this.client.execute('/interface/wireless/print', {}, [`?name=${name}`]))[0];
+        if (iface?.['security-profile'] === legacyProfileName(name)) {
+          const profile = (await this.client.execute('/interface/wireless/security-profiles/print', {}, [`?name=${legacyProfileName(name)}`]))[0];
+          if (profile?.['.id']) {
+            await this.client.execute('/interface/wireless/security-profiles/set', {
+              '.id': profile['.id'], 'authentication-types': legacyAuthTypes(authTypes),
+            });
+          }
+        }
+      }
       await this.client.execute('/interface/wireless/set', { '.id': name, ...legacyParams });
     }
+  }
+
+  /**
+   * Create or update the manager's own security profile for a legacy
+   * interface and return its name (P2-12). Any failure throws, so the caller
+   * never goes on to create or change the SSID without its security.
+   */
+  private async ensureLegacyProfile(iface: string, passphrase: string, authTypes: string | undefined): Promise<string> {
+    if (!iface) throw new Error('An interface name is needed to secure it');
+    const name = legacyProfileName(iface);
+    const params = legacyProfileParams(passphrase, legacyAuthTypes(authTypes));
+    const existing = (await this.client.execute('/interface/wireless/security-profiles/print', {}, [`?name=${name}`]))[0];
+    if (existing?.['.id']) {
+      await this.client.execute('/interface/wireless/security-profiles/set', { '.id': existing['.id'], ...params });
+    } else {
+      await this.client.execute('/interface/wireless/security-profiles/add', { name, ...params });
+    }
+    return name;
   }
 
   async addWirelessInterface(params: Record<string, string>): Promise<void> {
@@ -2158,10 +3597,25 @@ export class DeviceCollector {
     if (pkg === 'wifi') {
       await this.client.execute('/interface/wifi/add', this.translateToWifiParams(params));
     } else {
-      // Legacy wireless: drop inline security params — not supported directly on the interface
-      const { passphrase, 'authentication-types': _at, ...legacyParams } = params;
-      void passphrase; void _at;
-      await this.client.execute('/interface/wireless/add', legacyParams);
+      // Legacy wireless (P2-12): the SSID is created already pointing at its
+      // security profile, which is made first. If that fails, nothing goes on
+      // the air. It used to be created open, with a warning afterwards.
+      const { passphrase, 'authentication-types': authTypes, ...legacyParams } = params;
+      if (passphrase) {
+        legacyParams['security-profile'] = await this.ensureLegacyProfile(params['name'] ?? '', passphrase, authTypes);
+      } else if (authTypes && authTypes.split(',').some((t) => t.trim())) {
+        throw new Error('A passphrase is needed for a secured network.');
+      }
+      try {
+        await this.client.execute('/interface/wireless/add', legacyParams);
+      } catch (err) {
+        // Don't leave the profile behind for an SSID that was never created.
+        if (passphrase) {
+          const orphan = (await this.client.execute('/interface/wireless/security-profiles/print', {}, [`?name=${legacyProfileName(params['name'] ?? '')}`]).catch(() => []))[0];
+          if (orphan?.['.id']) await this.client.execute('/interface/wireless/security-profiles/remove', { '.id': orphan['.id'] }).catch(() => {});
+        }
+        throw err;
+      }
     }
   }
 
@@ -2169,6 +3623,18 @@ export class DeviceCollector {
     const pkg = await this.detectWifiPackage();
     const cmd = pkg === 'wifi' ? '/interface/wifi/remove' : '/interface/wireless/remove';
     await this.client.execute(cmd, { '.id': name });
+  }
+
+  /**
+   * True when `name` is not a /interface/wifi/security profile but an
+   * interface with inline security.* settings, which getSecurityProfilesLive
+   * lists as a profile of the same name.
+   */
+  private async isInlineWifiSecurity(name: string): Promise<boolean> {
+    const named = await this.client.execute('/interface/wifi/security/print');
+    if (named.some((p) => p['name'] === name)) return false;
+    const ifaces = await this.client.execute('/interface/wifi/print');
+    return ifaces.some((r) => r['name'] === name && !!(r['security.authentication-types'] || r['security.passphrase']));
   }
 
   async getSecurityProfilesLive(): Promise<Record<string, string>[]> {
@@ -2199,6 +3665,8 @@ export class DeviceCollector {
           'encryption':           r['security.encryption'] || '',
           'ft':                   r['security.ft'] || 'false',
           'ft-over-ds':           r['security.ft-over-ds'] || 'false',
+          // Not a profile: the interface's own security settings (C6).
+          'inline':               'true',
         }));
     }
     return this.client.execute('/interface/wireless/security-profiles/print').catch(() => []);
@@ -2228,12 +3696,19 @@ export class DeviceCollector {
   async setSecurityProfile(name: string, params: Record<string, string>): Promise<void> {
     const pkg = await this.detectWifiPackage();
     if (pkg === 'wifi') {
-      const secParams: Record<string, string> = { '.id': name };
-      if (params['mode'])                 secParams['mode']                 = params['mode'];
+      // The wifi security menu has no legacy `mode` (C6); it's never sent.
+      const secParams: Record<string, string> = {};
       if (params['authentication-types']) secParams['authentication-types'] = params['authentication-types'];
       if (params['passphrase'])           secParams['passphrase']           = params['passphrase'];
       if (params['encryption'])           secParams['encryption']           = params['encryption'];
-      await this.client.execute('/interface/wifi/security/set', secParams);
+      if (await this.isInlineWifiSecurity(name)) {
+        // A "profile" synthesized from an interface's inline security is
+        // edited on that interface, where it lives (C6).
+        const inline = Object.fromEntries(Object.entries(secParams).map(([k, v]) => [`security.${k}`, v]));
+        await this.client.execute('/interface/wifi/set', { '.id': name, ...inline });
+      } else {
+        await this.client.execute('/interface/wifi/security/set', { '.id': name, ...secParams });
+      }
     } else {
       const legacyParams: Record<string, string> = { ...params };
       if (params['passphrase']) {
@@ -2247,6 +3722,12 @@ export class DeviceCollector {
 
   async removeSecurityProfile(name: string): Promise<void> {
     const pkg = await this.detectWifiPackage();
+    if (pkg === 'wifi' && await this.isInlineWifiSecurity(name)) {
+      throw new Error(
+        `"${name}" is the security set directly on interface ${name}, not a security profile, so there is nothing to delete. ` +
+        'Edit it instead, or change the security on the SSID.'
+      );
+    }
     const cmd = pkg === 'wifi'
       ? '/interface/wifi/security/remove'
       : '/interface/wireless/security-profiles/remove';
@@ -2275,8 +3756,59 @@ export class DeviceCollector {
 
   async scanWireless(iface: string, durationMs = 5_000): Promise<Record<string, string>[]> {
     const pkg = await this.detectWifiPackage();
-    const cmd = pkg === 'wifi' ? '/interface/wifi/scan' : '/interface/wireless/scan';
-    return this.client.executeStreaming(cmd, { '.id': iface }, durationMs).catch(() => []);
+    // Which fields the router sent (names only, never values), on every path,
+    // so a report like #295 can be settled from one log line.
+    const report = (path: string, rows: Record<string, string>[]) => {
+      const fields = [...new Set(rows.flatMap((r) => Object.keys(r)))].sort();
+      console.log(`[ap-scan] ${logSafe(this.device.name)} ${logSafe(iface)} (${path}): ${rows.length} rows, fields: ${fields.join(',') || '(none)'}`);
+    };
+    if (pkg === 'wifi') {
+      const rows = await this.client.executeStreaming('/interface/wifi/scan', { '.id': iface }, durationMs).catch(() => [] as Record<string, string>[]);
+      report('wifi package', rows);
+      return rows;
+    }
+    // The legacy package, as a timed scan. It ends by itself with !done; the
+    // read limit is a little longer, as a backstop.
+    const seconds = Math.max(1, Math.round(durationMs / 1000));
+    // Some routers leave the privacy flag out of the API's scan reply (#295),
+    // though the same scan in the terminal has it. On those the scan runs as
+    // a script, whose output does; a device found to need that goes straight
+    // to the script next time.
+    const deviceId = this.device.id;
+    if (legacyScanMode.get(deviceId) === 'script') {
+      const viaScript = await this.legacyScanViaScript(iface, seconds);
+      if (viaScript) { report('legacy wireless, as a script', viaScript); return viaScript; }
+      legacyScanMode.delete(deviceId);
+    }
+    const rows = await this.client
+      .executeStreaming('/interface/wireless/scan', { '.id': iface, duration: String(seconds) }, durationMs + 5_000)
+      .catch(() => [] as Record<string, string>[]);
+    report(`legacy wireless, detected as ${pkg}`, rows);
+    if (rows.length > 0 && !rows.some((r) => 'privacy' in r) && legacyScanMode.get(deviceId) !== 'api') {
+      const viaScript = await this.legacyScanViaScript(iface, seconds);
+      if (viaScript && viaScript.some((r) => 'privacy' in r)) {
+        legacyScanMode.set(deviceId, 'script');
+        report('legacy wireless, as a script', viaScript);
+        return viaScript;
+      }
+      // The script didn't help (no /execute as-string before RouterOS 7, or
+      // no permission); don't run the scan twice on every poll.
+      legacyScanMode.set(deviceId, 'api');
+    }
+    return rows;
+  }
+
+  /** The legacy scan run as a script (#295); null when that didn't work. */
+  private async legacyScanViaScript(iface: string, seconds: number): Promise<Record<string, string>[] | null> {
+    const script = legacyScanScript(iface, seconds);
+    if (!script) return null;
+    try {
+      const rows = parseLegacyScanOutput(await this.client.runScript(script, seconds * 1000 + 15_000));
+      return rows.length > 0 ? rows : null;
+    } catch (err) {
+      console.log(`[ap-scan] ${logSafe(this.device.name)} ${logSafe(iface)}: scan as a script failed: ${logSafe((err as Error).message)}`);
+      return null;
+    }
   }
 
   // Run a spectral scan on a wifi interface for ~10 s and return the raw rows.
@@ -2319,8 +3851,45 @@ export class DeviceCollector {
     await this.client.execute('/ip/firewall/filter/add', params);
   }
 
+  /**
+   * Update one item in a RouterOS menu (outside review P2-10, P2-14).
+   *
+   * A value sent as '' means "clear it". RouterOS rejects an empty value for
+   * many properties (an address matcher expects an address), so a cleared
+   * property is removed with `unset`, and only if the item actually has it.
+   * Before this, empty values were dropped on the way in and the device kept
+   * the old value while the UI showed it gone.
+   *
+   * The item is always the one named by `id`: a '.id' or 'numbers' in the
+   * request body used to override it, so a write could land on a different
+   * object than the one in the URL and the audit log.
+   */
+  private async setItem(menu: string, id: string, params: Record<string, string>): Promise<void> {
+    // Property names come from request bodies on some routes, so only names
+    // shaped like RouterOS properties ("dst-port", "security.passphrase") are
+    // accepted, and the words are built as entries rather than by writing
+    // arbitrary keys onto an object.
+    const entries = Object.entries(params).filter(([k]) => ROS_PROPERTY.test(k) && k !== 'numbers');
+    const toSet = entries.filter(([, v]) => v !== '');
+    const clear = entries.filter(([, v]) => v === '').map(([k]) => k);
+    if (toSet.length) await this.client.execute(`${menu}/set`, Object.fromEntries([...toSet, ['.id', id]]));
+    if (!clear.length) return;
+
+    const item = (await this.client.execute(`${menu}/print`, { detail: '' })).find((r) => r['.id'] === id);
+    const current = new Map(Object.entries(item ?? {}));
+    for (const k of clear) {
+      if (!current.get(k)) continue;   // already clear
+      try {
+        await this.client.execute(`${menu}/unset`, { numbers: id, 'value-name': k });
+      } catch {
+        // A property that can't be unset but takes an empty value (a comment, say).
+        await this.client.execute(`${menu}/set`, Object.fromEntries([[k, ''], ['.id', id]]));
+      }
+    }
+  }
+
   async updateFirewallRule(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/ip/firewall/filter/set', { '.id': id, ...params });
+    await this.setItem('/ip/firewall/filter', id, params);
   }
 
   async deleteFirewallRule(id: string): Promise<void> {
@@ -2349,7 +3918,7 @@ export class DeviceCollector {
   }
 
   async updateNatRule(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/ip/firewall/nat/set', { '.id': id, ...params });
+    await this.setItem('/ip/firewall/nat', id, params);
   }
 
   async deleteNatRule(id: string): Promise<void> {
@@ -2373,7 +3942,7 @@ export class DeviceCollector {
   }
 
   async updateAddressListEntry(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/ip/firewall/address-list/set', { '.id': id, ...params });
+    await this.setItem('/ip/firewall/address-list', id, params);
   }
 
   async removeAddressListEntry(id: string): Promise<void> {
@@ -2384,6 +3953,21 @@ export class DeviceCollector {
 
   async getConnections(): Promise<Record<string, string>[]> {
     return this.client.execute('/ip/firewall/connection/print', { detail: '' }).catch(() => [] as Record<string, string>[]);
+  }
+
+  /**
+   * The first `limit` connections, without reading the whole table (#300): a
+   * busy edge router can track hundreds of thousands, and printing them all
+   * every refresh loaded both it and the manager. Rows stream in and the
+   * print is cancelled once there are enough; only the shown fields are sent;
+   * a protocol filter is applied by the router.
+   */
+  async getConnectionsPage(limit: number, protocol?: string): Promise<Record<string, string>[]> {
+    return this.client.executeStreaming('/ip/firewall/connection/print', {
+      // src-port and dst-port: RouterOS 7.24 keeps the ports there, not on the
+      // address, and leaving them out lost them (discussion #85).
+      '.proplist': '.id,protocol,src-address,src-port,dst-address,dst-port,tcp-state,orig-rate,repl-rate,orig-bytes,repl-bytes',
+    }, 20_000, { maxRows: limit, queries: protocol ? [`?protocol=${protocol}`] : [] }).catch(() => [] as Record<string, string>[]);
   }
 
   // /ip/firewall/connection/tracking holds the global conntrack state. `enabled`
@@ -2404,7 +3988,7 @@ export class DeviceCollector {
   }
 
   async updateSimpleQueue(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/queue/simple/set', { '.id': id, ...params });
+    await this.setItem('/queue/simple', id, params);
   }
 
   async removeSimpleQueue(id: string): Promise<void> {
@@ -2455,6 +4039,28 @@ export class DeviceCollector {
 
   async getHotspotActive(): Promise<Record<string, string>[]> {
     return this.client.execute('/ip/hotspot/active/print', { detail: '' }).catch(() => [] as Record<string, string>[]);
+  }
+
+  /**
+   * Kick a wireless client off (#338): remove its registration-table entries,
+   * as WinBox's Remove does, so it reassociates. Every table this device might
+   * list it in is checked: the wifi package's (which on a CAPsMAN controller
+   * holds its CAPs' clients too), legacy wireless, and a legacy CAPsMAN
+   * controller's. A menu the device doesn't have is skipped. Returns how many
+   * entries were removed; `mac` is lower-case colon form.
+   */
+  async disconnectWirelessClient(mac: string): Promise<number> {
+    let removed = 0;
+    for (const menu of ['/interface/wifi/registration-table', '/interface/wireless/registration-table', '/caps-man/registration-table']) {
+      const rows = await this.client.execute(`${menu}/print`, { '.proplist': '.id,mac-address' }).catch(() => null);
+      if (!rows) continue;
+      for (const r of rows) {
+        if ((r['mac-address'] || '').toLowerCase() !== mac || !r['.id']) continue;
+        await this.client.execute(`${menu}/remove`, { '.id': r['.id'] });
+        removed++;
+      }
+    }
+    return removed;
   }
 
   async disconnectHotspotActive(id: string): Promise<void> {
@@ -2538,11 +4144,28 @@ export class DeviceCollector {
         );
       }
 
-      const existingBySsid = raw.filter(r =>
+      // Rerunning the setup reuses the SSIDs it created before, known by the
+      // tag it put on them. Another SSID that merely has the same name is
+      // somebody else's network: it used to be adopted and moved into the
+      // guest bridge or VLAN (P2-12). Now the setup stops instead.
+      const tag = guestSsidTag(name);
+      const sameName = raw.filter(r =>
         (r['ssid'] || r['configuration.ssid'] || '') === ssid.ssid && r['master-interface']);
-      if (existingBySsid.length > 0) {
-        // Idempotency: SSID already exists — reuse it
-        for (const e of existingBySsid) ssidInterfaces.push(e['name']);
+      const foreign = sameName.filter(r => (r['comment'] || '') !== tag);
+      if (foreign.length > 0) {
+        throw new Error(
+          `An SSID named "${ssid.ssid}" already exists on ${foreign.map(r => r['name']).join(', ')} and wasn't created `
+          + `by this guest setup, so it won't be taken over. Choose another SSID, or remove or rename that one first.`
+        );
+      }
+      if (sameName.length > 0) {
+        for (const e of sameName) {
+          ssidInterfaces.push(e['name']);
+          if (ssid.passphrase) {
+            await this.setWirelessInterface(e['name'], { passphrase: ssid.passphrase, 'authentication-types': 'wpa2-psk' });
+          }
+        }
+        if (!ssid.passphrase) warnings.push(`Reused the existing guest SSID; its security was left as it was.`);
       } else {
         for (const radio of physicals) {
           const ifaceName = await this.getNextInterfaceName();
@@ -2551,6 +4174,7 @@ export class DeviceCollector {
             'master-interface': radio['name'],
             ssid: ssid.ssid,
             disabled: 'no',
+            comment: tag,
           };
           if (pkg !== 'wifi') params['mode'] = 'ap-bridge';
           if (ssid.passphrase) {
@@ -2559,9 +4183,6 @@ export class DeviceCollector {
           }
           await this.addWirelessInterface(params);
           ssidInterfaces.push(ifaceName);
-        }
-        if (pkg !== 'wifi' && ssid.passphrase) {
-          warnings.push('Legacy wireless package: passphrase requires a security profile — the guest SSID was created OPEN. Assign a security profile manually if you need WPA2.');
         }
       }
 
@@ -2742,8 +4363,42 @@ export class DeviceCollector {
 
   // ─── IP Services (for security-posture audit + hardening) ───────────────────
 
+  /** The configured services, without the live-connection rows RouterOS also prints (#192). */
   async getServices(): Promise<Record<string, string>[]> {
+    return configuredServices(await this.getServicesWithConnections());
+  }
+
+  /** Every /ip/service row, live connections included. */
+  async getServicesWithConnections(): Promise<Record<string, string>[]> {
     return this.client.execute('/ip/service/print', { detail: '' }).catch(() => [] as Record<string, string>[]);
+  }
+
+  /**
+   * This connection's command runner, for services that share helpers written
+   * against the raw client (the certificate steps of API-SSL and www-ssl, #234).
+   */
+  commandRunner(): Pick<RouterOSClient, 'execute'> {
+    return this.client;
+  }
+
+  /** Several reads in one round trip, for targeted queries (#313). */
+  batchReader(): Pick<RouterOSClient, 'executeMany'> {
+    return this.client;
+  }
+
+  /** The local TCP port of this collector's own API connection. */
+  apiLocalPort(): number | undefined {
+    return this.client.localPort ?? undefined;
+  }
+
+  /** The address this collector's API connection reached. */
+  apiRemoteAddress(): string | undefined {
+    return this.client.remoteAddress ?? undefined;
+  }
+
+  /** Set a service's allowed addresses (empty = any), under this version's property name. */
+  async setServiceAllowedFrom(id: string, key: 'available-from' | 'address', list: string[]): Promise<void> {
+    await this.client.execute('/ip/service/set', { '.id': id, [key]: list.join(',') });
   }
 
   async setServiceDisabled(id: string, disabled: boolean): Promise<void> {
@@ -2760,6 +4415,19 @@ export class DeviceCollector {
       '.id': bridge['.id'],
       'vlan-filtering': enabled ? 'yes' : 'no',
     });
+  }
+
+  /** Spanning tree mode of a bridge (none, stp, rstp, mstp); for the Config Health fix (#239). */
+  async setBridgeProtocolMode(bridgeName: string, mode: 'rstp'): Promise<void> {
+    const bridges = await this.client.execute('/interface/bridge/print');
+    const bridge = bridges.find((b) => b['name'] === bridgeName);
+    if (!bridge || !bridge['.id']) throw new Error(`Bridge '${bridgeName}' not found`);
+    await this.client.execute('/interface/bridge/set', { '.id': bridge['.id'], 'protocol-mode': mode });
+  }
+
+  /** The bridge VLAN table entries of one bridge, as configured. */
+  async getBridgeVlanEntries(bridge: string): Promise<Record<string, string>[]> {
+    return this.client.execute('/interface/bridge/vlan/print', { detail: '' }, [`?bridge=${bridge}`]);
   }
 
   async getSystemResource(): Promise<Record<string, string>> {
@@ -2808,6 +4476,17 @@ export class DeviceCollector {
     }
   }
 
+  /**
+   * Cut a port's PoE output for `seconds`, then restore it (#291): restarts
+   * an AP or camera powered from it. An action, not a configuration change.
+   */
+  async poePowerCycle(name: string, seconds: number): Promise<void> {
+    const ports = await this.client.execute('/interface/ethernet/poe/print', {}, [`?name=${name}`])
+      .catch((e) => (e instanceof RouterOSTrapError ? [] : Promise.reject(e)));
+    if (!ports[0]?.['.id']) throw new Error(`${name} doesn't supply PoE on this device.`);
+    await this.client.execute('/interface/ethernet/poe/power-cycle', { numbers: ports[0]['.id'], duration: `${seconds}s` });
+  }
+
   async getPoEStatus(name: string): Promise<Record<string, string> | null> {
     const result = await this.client
       .execute('/interface/ethernet/poe/print', {}, [`?name=${name}`])
@@ -2821,8 +4500,14 @@ export class DeviceCollector {
 
   async collectPoePower(): Promise<void> {
     try {
+      // monitor needs the ports named (`monitor ether9`, or `[find]` for all).
+      // Called without, it failed on every PoE switch, so no readings were
+      // ever stored and the PoE power-cycle button never appeared (#291).
+      const poe = await this.client.execute('/interface/ethernet/poe/print').catch(() => [] as Record<string, string>[]);
+      const ids = poe.map((p) => p['.id']).filter(Boolean);
+      if (ids.length === 0) return;
       const ports = await this.client
-        .execute('/interface/ethernet/poe/monitor', { once: '' })
+        .execute('/interface/ethernet/poe/monitor', { numbers: ids.join(','), once: '' })
         .catch(() => [] as Record<string, string>[]);
       if (ports.length === 0) return;
 
@@ -2830,7 +4515,11 @@ export class DeviceCollector {
       for (const port of ports) {
         const name = port['name'] || port['port-name'] || '';
         if (!name) continue;
-        const watts = parseFloat(port['poe-out-voltage'] || '0') * parseFloat(port['poe-out-current'] || '0') / 1000;
+        // RouterOS reports poe-out-power itself ("24.3W"); work it out from
+        // voltage and current only where it doesn't.
+        const watts = port['poe-out-power'] !== undefined
+          ? parseFloat(port['poe-out-power']) || 0
+          : parseFloat(port['poe-out-voltage'] || '0') * parseFloat(port['poe-out-current'] || '0') / 1000;
         const currentMa = parseFloat(port['poe-out-current'] || '0');
         const voltageV = parseFloat(port['poe-out-voltage'] || '0');
         writeApi.writePoint(
@@ -2848,6 +4537,56 @@ export class DeviceCollector {
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect PoE power:`, err);
     }
+  }
+
+  /**
+   * Send an SMS through the modem.
+   *
+   * Used for carrier data-cap resets, where texting a short code lifts a daily
+   * throttle. The message is deliberately allowed to be empty — that is exactly
+   * what several carriers expect, and an API that refused it would be useless
+   * for the case it exists to serve.
+   */
+  async sendSms(port: string, phoneNumber: string, message = ''): Promise<void> {
+    await this.client.execute('/tool/sms/send', {
+      port, 'phone-number': phoneNumber, message,
+    });
+  }
+
+  /**
+   * Current byte counters for one interface, for data-cap accounting.
+   *
+   * The filter is a RouterOS *query word* and has to be passed as one. Smuggled
+   * in as a parameter it becomes `=?name=lte1`, which the device rejects with
+   * "unknown parameter ?name" — and because that error was being swallowed, the
+   * data-cap counter silently read nothing on every poll while the rest of the
+   * feature looked healthy. Errors here are logged rather than discarded for
+   * exactly that reason.
+   */
+  async getInterfaceCounters(name: string): Promise<{ rxBytes: number; txBytes: number } | null> {
+    let rows: Record<string, string>[] | null = await this.client
+      .execute('/interface/print', { stats: '' }, [`?name=${name}`])
+      .catch((err) => {
+        console.error(`[${this.device.name}] counter read for ${name} failed:`, (err as Error).message);
+        return null;
+      });
+
+    // Some versions answer a filtered print with nothing at all; falling back to
+    // the full list costs one call and removes a whole class of silent zero.
+    if (rows && rows.length === 0) {
+      rows = await this.client.execute('/interface/print', { stats: '' }).catch(() => null);
+    }
+    if (!rows) return null;
+
+    const row = rows.find((r) => r['name'] === name);
+    if (!row) {
+      console.warn(`[${this.device.name}] interface ${name} not present in counter read`);
+      return null;
+    }
+    return {
+      rxBytes: parseInt(row['rx-byte'] || '0', 10),
+      txBytes: parseInt(row['tx-byte'] || '0', 10),
+    };
   }
 
   // ─── LTE / cellular → Postgres + InfluxDB ─────────────────────────────────
@@ -2945,6 +4684,7 @@ export class DeviceCollector {
         );
 
         await this.recordObservedBands(name, status);
+        await this.trackDataCap(name);
 
         // Signal series. Fields are written only when the modem reported them —
         // a zero here would read as a signal no transmitter produces.
@@ -2978,6 +4718,153 @@ export class DeviceCollector {
     } catch (error) {
       console.error(`LTE collection failed for ${this.device.name}:`, error);
     }
+  }
+
+  /**
+   * Accumulate cellular usage and fire the carrier's reset SMS when due.
+   *
+   * Runs on every LTE poll rather than on a timer of its own, because the byte
+   * delta is only meaningful between consecutive samples — a separate schedule
+   * would either double-count or miss traffic depending on how the two drifted.
+   *
+   * Failures here are logged and swallowed. A data-cap rule is a convenience;
+   * it must never be able to break the collection it rides on.
+   */
+  private async trackDataCap(interfaceName: string): Promise<void> {
+    try {
+      const rule = await queryOne<{
+        id: number; enabled: boolean; phone_number: string; message: string;
+        threshold_bytes: string; margin_pct: number; reset_hour: number; reset_minute: number;
+        timezone: string; cooldown_minutes: number; period_key: string | null;
+        period_bytes: string; last_rx: string | null; last_tx: string | null;
+        last_sent_at: string | null;
+      }>(
+        `SELECT * FROM lte_data_cap_rules WHERE device_id = $1 AND interface_name = $2`,
+        [this.device.id, interfaceName]
+      );
+      if (!rule) return;
+
+      const counters = await this.getInterfaceCounters(interfaceName);
+      if (!counters) {
+        // A rule that exists but never counts is the failure the user actually
+        // sees, so it must not be silent.
+        console.warn(`[DataCap] ${this.device.name}/${interfaceName}: no counters available; usage not updated`);
+        return;
+      }
+
+      const now = new Date();
+      // A period only moves forwards. In the repeated hour of a daylight-saving
+      // fall-back the local clock goes back past the reset time, and the key
+      // flipped back and forth, resetting usage each time (outside review J12).
+      const rawKey = periodKey(now, rule.reset_hour, rule.reset_minute, rule.timezone);
+      const key = rule.period_key && rawKey < rule.period_key ? rule.period_key : rawKey;
+
+      // A new period starts fresh, but the counter baseline carries over —
+      // otherwise the first sample after midnight would be discarded and the
+      // traffic between it and the previous poll would vanish.
+      const rolled = rule.period_key !== key;
+      const prev = rule.last_rx == null || rule.last_tx == null
+        ? null
+        : { rxBytes: Number(rule.last_rx), txBytes: Number(rule.last_tx) };
+
+      const delta = bytesSince(prev, counters);
+      const periodBytes = (rolled ? 0 : Number(rule.period_bytes)) + delta;
+
+      const decision = shouldSend({
+        periodBytes,
+        thresholdBytes: Number(rule.threshold_bytes),
+        marginPct: rule.margin_pct,
+        lastSentAt: rolled ? null : (rule.last_sent_at ? new Date(rule.last_sent_at) : null),
+        cooldownMinutes: rule.cooldown_minutes,
+        enabled: rule.enabled,
+      }, now);
+
+      const previousSentAt: Date | null = rule.last_sent_at ? new Date(rule.last_sent_at) : null;
+      let sentAt: Date | null = rolled ? null : previousSentAt;
+      // Sending the reset SMS zeroes the carrier's counter — that is what the
+      // message is for, and it is the alternative to waiting for midnight. Our
+      // counter has to follow, or two things go wrong: the bar keeps climbing
+      // past an allowance that no longer applies, and usage stays above the
+      // threshold so the rule re-fires on every cooldown for the rest of the day.
+      let periodBytesAfter = periodBytes;
+      if (decision.send) {
+        // Claim the send before making it.
+        //
+        // shouldSend() reads last_sent_at, then two network round trips happen —
+        // fetching counters and sending — before it is written back. Data-cap
+        // tracking runs from the fast poll, the slow poll and a manual sync, and
+        // fast and slow are separate queues that overlap: two of them could both
+        // read the same stale last_sent_at, both clear the cooldown, and both
+        // send. That is the duplicate pair a user reported.
+        //
+        // This UPDATE is the decision. Whoever's row comes back won it; anyone
+        // else finds the cooldown already satisfied and stands down. The
+        // period_key test mirrors the `rolled` rule above: a new period is not
+        // bound by the previous period's cooldown.
+        const claimed = await query<{ id: number }>(
+          `UPDATE lte_data_cap_rules
+              SET last_sent_at = $2, period_key = $3
+            WHERE id = $1
+              AND (
+                period_key IS DISTINCT FROM $3
+                OR last_sent_at IS NULL
+                OR last_sent_at <= $2::timestamptz - (cooldown_minutes * INTERVAL '1 minute')
+              )
+            RETURNING id`,
+          [rule.id, now, key]
+        );
+
+        if (claimed.length === 0) {
+          console.log(
+            `[DataCap] ${this.device.name}/${interfaceName}: another poll already sent the reset SMS; standing down`
+          );
+          // And writes nothing: its usage and send time are stale, and saving
+          // them overwrote the winning poll's reset (J12).
+          return;
+        } else {
+          try {
+            await this.sendSms(interfaceName, rule.phone_number, rule.message);
+            sentAt = now;
+            periodBytesAfter = 0;
+            await this.logDataCapSend(interfaceName, 'threshold', rule.phone_number, periodBytes, true, null);
+            console.log(`[DataCap] ${this.device.name}/${interfaceName}: reset SMS sent to ${rule.phone_number}`);
+          } catch (e) {
+            // Give the claim back. Holding it would suppress a real retry for a
+            // full cooldown after a send that never happened — and being
+            // throttled costs the user more than a duplicate message does.
+            sentAt = rolled ? null : previousSentAt;
+            await query(
+              `UPDATE lte_data_cap_rules SET last_sent_at = $2 WHERE id = $1`,
+              [rule.id, sentAt]
+            ).catch(() => {});
+            await this.logDataCapSend(interfaceName, 'threshold', rule.phone_number, periodBytes, false, (e as Error).message);
+            console.error(`[DataCap] ${this.device.name}/${interfaceName}: SMS failed:`, (e as Error).message);
+          }
+        }
+      }
+
+      await query(
+        `UPDATE lte_data_cap_rules
+            SET period_key = $2, period_bytes = $3, last_rx = $4, last_tx = $5,
+                last_sent_at = $6, updated_at = NOW()
+          WHERE id = $1`,
+        [rule.id, key, periodBytesAfter, counters.rxBytes, counters.txBytes, sentAt]
+      );
+    } catch (e) {
+      console.error(`[DataCap] ${this.device.name}: tracking failed:`, (e as Error).message);
+    }
+  }
+
+  private async logDataCapSend(
+    interfaceName: string, trigger: string, phone: string,
+    periodBytes: number, ok: boolean, error: string | null,
+  ): Promise<void> {
+    await query(
+      `INSERT INTO lte_data_cap_sends
+         (device_id, interface_name, trigger, phone_number, period_bytes, ok, error)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [this.device.id, interfaceName, trigger, phone, periodBytes, ok, error]
+    ).catch(() => {});
   }
 
   /** Last stored state for an interface, for comparing consecutive polls. */
@@ -3054,61 +4941,70 @@ export class DeviceCollector {
     portName: string,
     pvid: number,
     taggedVlans: number[],
-    untaggedVlans: number[]
-  ): Promise<void> {
-    // 1. Find the bridge port entry and set PVID
+    untaggedVlans: number[],
+    role?: 'access' | 'trunk',
+    replaceTagged = false
+  ): Promise<{ notRemoved: number[] }> {
     const bridgePorts = await this.client
       .execute('/interface/bridge/port/print', {}, [`?interface=${portName}`])
       .catch(() => []);
 
     const bridgePortEntry = bridgePorts[0];
     if (bridgePortEntry?.['.id']) {
+      // PVID *and* frame admission. Setting only the PVID left a trunk still
+      // accepting untagged frames and an access port still accepting tagged
+      // ones, so changing a port's type was half decorative (#151).
       await this.client.execute('/interface/bridge/port/set', {
         '.id': bridgePortEntry['.id'],
         pvid: String(pvid),
+        ...(role ? frameTypesFor(role) : {}),
       });
     }
 
     const bridge = bridgePortEntry?.['bridge'] || '';
-    if (!bridge) return;
+    if (!bridge) return { notRemoved: [] };
 
-    // 2. Update tagged VLANs in bridge VLAN table
-    for (const vlanId of taggedVlans) {
+    const applyVlan = async (vlanId: number, portRole: 'tagged' | 'untagged'): Promise<void> => {
       const existing = await this.client
         .execute('/interface/bridge/vlan/print', {}, [`?bridge=${bridge}`, `?vlan-ids=${vlanId}`])
         .catch(() => []);
 
-      if (existing[0]?.['.id']) {
-        const currentTagged = this.parseList(existing[0]['tagged'] || '');
-        const currentUntagged = this.parseList(existing[0]['untagged'] || '');
-        const newTagged = [...new Set([...currentTagged, portName])];
-        const newUntagged = currentUntagged.filter((p) => p !== portName);
-        await this.client.execute('/interface/bridge/vlan/set', {
-          '.id': existing[0]['.id'],
-          tagged: newTagged.join(','),
-          untagged: newUntagged.join(','),
-        });
-      }
-    }
+      const plan = planVlanWrite(existing[0], portName, portRole);
+      if (plan.action === 'noop') return;
 
-    // 3. Update untagged VLANs in bridge VLAN table
-    for (const vlanId of untaggedVlans) {
-      const existing = await this.client
-        .execute('/interface/bridge/vlan/print', {}, [`?bridge=${bridge}`, `?vlan-ids=${vlanId}`])
-        .catch(() => []);
-
-      if (existing[0]?.['.id']) {
-        const currentTagged = this.parseList(existing[0]['tagged'] || '');
-        const currentUntagged = this.parseList(existing[0]['untagged'] || '');
-        const newUntagged = [...new Set([...currentUntagged, portName])];
-        const newTagged = currentTagged.filter((p) => p !== portName);
+      if (plan.action === 'set') {
         await this.client.execute('/interface/bridge/vlan/set', {
-          '.id': existing[0]['.id'],
-          tagged: newTagged.join(','),
-          untagged: newUntagged.join(','),
+          '.id': plan.id, tagged: plan.tagged, untagged: plan.untagged,
         });
+        return;
       }
+
+      // add: either the VLAN had no row at all, or the only row was dynamic and
+      // therefore unmodifiable. A static row supersedes the dynamic one.
+      await this.client.execute('/interface/bridge/vlan/add', {
+        bridge,
+        'vlan-ids': String(vlanId),
+        tagged: plan.tagged,
+        untagged: plan.untagged,
+      });
+    };
+
+    for (const vlanId of taggedVlans) await applyVlan(vlanId, 'tagged');
+    for (const vlanId of untaggedVlans) await applyVlan(vlanId, 'untagged');
+
+    // Removal runs after the additions, so the port is never briefly on fewer
+    // VLANs than both the old and new configuration agree on (#165).
+    if (!replaceTagged) return { notRemoved: [] };
+    const rows = await this.client
+      .execute('/interface/bridge/vlan/print', {}, [`?bridge=${bridge}`])
+      .catch(() => []);
+    const plan = planTaggedRemovals(rows as Record<string, string>[], bridge, portName, taggedVlans);
+    for (const w of plan.writes) {
+      await this.client.execute('/interface/bridge/vlan/set', {
+        '.id': w.id, tagged: w.tagged, untagged: w.untagged,
+      });
     }
+    return { notRemoved: plan.mixed };
   }
 
   /**
@@ -3172,6 +5068,8 @@ export class DeviceCollector {
         .catch(() => []);
       if (servers[0]) ntpConfig['primary-ntp'] = (servers[0] as Record<string, string>)['address'] || '';
       if (servers[1]) ntpConfig['secondary-ntp'] = (servers[1] as Record<string, string>)['address'] || '';
+      // The form edits the first two; tell it about the rest so it can say they're kept.
+      if (servers.length > 2) ntpConfig['extra-servers'] = String(servers.length - 2);
     }
 
     // RouterOS 7 DNS returns booleans as "true"/"false" instead of "yes"/"no"
@@ -3192,46 +5090,54 @@ export class DeviceCollector {
     await this.client.execute('/system/identity/set', { name });
   }
 
-  async setNtpConfig(enabled: boolean, primaryNtp: string, secondaryNtp: string): Promise<void> {
-    // Try RouterOS v6 format first (primary-ntp / secondary-ntp as direct properties)
-    try {
-      await this.client.execute('/system/ntp/client/set', {
-        enabled: enabled ? 'yes' : 'no',
-        'primary-ntp': primaryNtp,
-        'secondary-ntp': secondaryNtp,
-      });
+  /**
+   * Change the NTP client, touching only what is given. On RouterOS v7 the
+   * servers are a list: the first two entries are set as primary and secondary
+   * and any further servers are kept (they used to be deleted on every save).
+   * An empty primary or secondary removes that entry.
+   */
+  async setNtpConfig(opts: { enabled?: boolean; primary?: string; secondary?: string }): Promise<void> {
+    const { enabled, primary, secondary } = opts;
+    const current = (await this.client.execute('/system/ntp/client/print').catch(() => [{}]))[0] ?? {};
+    const isV6 = 'primary-ntp' in current;
+
+    if (isV6) {
+      const params: Record<string, string> = {};
+      if (enabled !== undefined) params['enabled'] = enabled ? 'yes' : 'no';
+      if (primary !== undefined) params['primary-ntp'] = primary || '0.0.0.0';
+      if (secondary !== undefined) params['secondary-ntp'] = secondary || '0.0.0.0';
+      if (Object.keys(params).length) await this.client.execute('/system/ntp/client/set', params);
       return;
-    } catch {
-      // RouterOS v7 dropped primary-ntp/secondary-ntp — fall through to server-list approach
     }
 
-    // RouterOS v7: enabled flag is separate; servers are managed as a list
-    await this.client.execute('/system/ntp/client/set', {
-      enabled: enabled ? 'yes' : 'no',
-    });
+    if (enabled !== undefined) {
+      await this.client.execute('/system/ntp/client/set', { enabled: enabled ? 'yes' : 'no' });
+    }
+    if (primary === undefined && secondary === undefined) return;
 
-    // Replace existing server entries
-    const existing = await this.client
-      .execute('/system/ntp/client/servers/print')
-      .catch(() => []);
-    for (const s of existing) {
-      await this.client
-        .execute('/system/ntp/client/servers/remove', { '.id': (s as Record<string, string>)['.id'] })
-        .catch(() => {});
+    const existing = (await this.client.execute('/system/ntp/client/servers/print')) as Record<string, string>[];
+    const first = existing[0]?.['address'] ?? '';
+    const second = existing[1]?.['address'] ?? '';
+    const wantFirst = primary !== undefined ? primary.trim() : first;
+    const wantSecond = secondary !== undefined ? secondary.trim() : second;
+    if (wantFirst === first && wantSecond === second) return;
+
+    // Rebuild only the first two slots; everything after them stays as it was.
+    const extras = existing.slice(2).map((e) => e['address']).filter(Boolean);
+    for (const e of existing) {
+      if (e['.id']) await this.client.execute('/system/ntp/client/servers/remove', { '.id': e['.id'] });
     }
-    if (primaryNtp) {
-      await this.client.execute('/system/ntp/client/servers/add', { address: primaryNtp });
-    }
-    if (secondaryNtp) {
-      await this.client.execute('/system/ntp/client/servers/add', { address: secondaryNtp });
+    for (const address of [wantFirst, wantSecond, ...extras].filter(Boolean)) {
+      await this.client.execute('/system/ntp/client/servers/add', { address });
     }
   }
 
-  async setDnsConfig(servers: string, allowRemoteRequests: boolean): Promise<void> {
-    await this.client.execute('/ip/dns/set', {
-      servers,
-      'allow-remote-requests': allowRemoteRequests ? 'yes' : 'no',
-    });
+  /** Change DNS, touching only what is given. */
+  async setDnsConfig(opts: { servers?: string; allowRemote?: boolean }): Promise<void> {
+    const params: Record<string, string> = {};
+    if (opts.servers !== undefined) params['servers'] = opts.servers;
+    if (opts.allowRemote !== undefined) params['allow-remote-requests'] = opts.allowRemote ? 'yes' : 'no';
+    if (Object.keys(params).length) await this.client.execute('/ip/dns/set', params);
   }
 
   // ─── IP Addresses ─────────────────────────────────────────────────────────
@@ -3240,12 +5146,74 @@ export class DeviceCollector {
     return this.client.execute('/ip/address/print', { detail: '' }).catch(() => []);
   }
 
+  /** IPv6 addresses; empty when the device has IPv6 off or the menu is unreadable. */
+  async getIpv6Addresses(): Promise<Record<string, string>[]> {
+    return this.client.execute('/ipv6/address/print', { detail: '' }).catch(() => []);
+  }
+
   async addIpAddress(address: string, interfaceName: string): Promise<void> {
     await this.client.execute('/ip/address/add', { address, interface: interfaceName });
   }
 
   async removeIpAddress(id: string): Promise<void> {
     await this.client.execute('/ip/address/remove', { numbers: id });
+  }
+
+  // ─── Bridges tab (#284) ─────────────────────────────────────────────────
+
+  /** Every bridge with its ports, VLAN entries and addresses, read live. */
+  async getBridgesDetail(): Promise<{
+    bridges: Record<string, string>[]; ports: Record<string, string>[];
+    vlans: Record<string, string>[]; addresses: Record<string, string>[];
+  }> {
+    const none = () => [] as Record<string, string>[];
+    const [bridges, ports, vlans, addresses] = await Promise.all([
+      this.client.execute('/interface/bridge/print', { detail: '' }),
+      this.client.execute('/interface/bridge/port/print', { detail: '' }).catch(none),
+      this.client.execute('/interface/bridge/vlan/print', { detail: '' }).catch(none),
+      this.client.execute('/ip/address/print', { detail: '' }).catch(none),
+    ]);
+    return { bridges, ports, vlans, addresses };
+  }
+
+  async addBridge(fields: Record<string, string>): Promise<void> {
+    await this.client.execute('/interface/bridge/add', fields);
+  }
+
+  /** Rename, spanning tree, comment, disabled, by bridge name. */
+  async updateBridge(name: string, fields: Record<string, string>): Promise<void> {
+    const bridge = (await this.client.execute('/interface/bridge/print')).find((b) => b['name'] === name);
+    if (!bridge?.['.id']) throw new Error(`There is no bridge called ${name} on this device.`);
+    await this.setItem('/interface/bridge', bridge['.id'], fields);
+  }
+
+  // ─── Switch chip VLAN table (#278) ───────────────────────────────────────
+  // Older chips (Atheros 8327, QCA8337…) keep VLANs here rather than in a
+  // VLAN-filtering bridge. Fields are already checked (utils/switchVlanEdit).
+
+  async addSwitchVlan(fields: Record<string, string>): Promise<void> {
+    await this.client.execute('/interface/ethernet/switch/vlan/add', fields);
+  }
+
+  async updateSwitchVlan(id: string, fields: Record<string, string>): Promise<void> {
+    await this.setItem('/interface/ethernet/switch/vlan', id, fields);
+  }
+
+  async removeSwitchVlan(id: string): Promise<void> {
+    await this.client.execute('/interface/ethernet/switch/vlan/remove', { '.id': id });
+  }
+
+  /** A switch port's vlan-mode, vlan-header and default-vlan-id, by port name. */
+  async setSwitchPortVlan(name: string, fields: Record<string, string>): Promise<void> {
+    const port = (await this.client.execute('/interface/ethernet/switch/port/print'))
+      .find((p) => p['name'] === name);
+    if (!port?.['.id']) throw new Error(`Switch port ${name} not found`);
+    await this.setItem('/interface/ethernet/switch/port', port['.id'], fields);
+  }
+
+  /** Edit an address in place (#285): address, interface, comment, disabled; '' clears. */
+  async updateIpAddress(id: string, fields: Record<string, string>): Promise<void> {
+    await this.setItem('/ip/address', id, fields);
   }
 
   // ─── Clock / Time ─────────────────────────────────────────────────────────
@@ -3303,11 +5271,18 @@ export class DeviceCollector {
 
   // ─── Route management ─────────────────────────────────────────────────────
 
-  async addRoute(dstAddress: string, gateway: string, distance?: number, comment?: string): Promise<void> {
+  async addRoute(dstAddress: string, gateway: string, distance?: number, comment?: string, routingTable?: string): Promise<void> {
     const params: Record<string, string> = { 'dst-address': dstAddress, gateway };
+    if (routingTable) params['routing-table'] = routingTable;
     if (distance !== undefined) params['distance'] = String(distance);
     if (comment) params['comment'] = comment;
     await this.client.execute('/ip/route/add', params);
+  }
+
+  /** True when `name` is a routing table on the device (/routing/table). */
+  async routingTableExists(name: string): Promise<boolean> {
+    const rows = await this.client.execute('/routing/table/print', { '.proplist': 'name' });
+    return rows.some((r) => r['name'] === name);
   }
 
   async removeRoute(routeId: string): Promise<void> {
@@ -3325,7 +5300,15 @@ export class DeviceCollector {
 
   async updateBridgeVlan(bridge: string, vlanId: number, taggedPorts: string[], untaggedPorts: string[]): Promise<void> {
     await this.removeBridgeVlan(bridge, vlanId);
-    await this.addBridgeVlan(bridge, vlanId, taggedPorts, untaggedPorts);
+    try {
+      await this.addBridgeVlan(bridge, vlanId, taggedPorts, untaggedPorts);
+    } catch (err) {
+      // The old row is already gone: the VLAN does not exist now.
+      throw new PartialApplyError(
+        `Updating VLAN ${vlanId} on ${bridge} removed the old entry but adding the new one failed: ${(err as Error).message}`,
+        { cause: err },
+      );
+    }
   }
 
   async removeBridgeVlan(bridge: string, vlanId: number): Promise<void> {
@@ -3394,6 +5377,36 @@ export class DeviceCollector {
     return out;
   }
 
+  /** Static VLAN rows on a bridge that list any of `members` as tagged or untagged. */
+  private async vlanRowsListing(bridge: string, members: string[]): Promise<Record<string, string>[]> {
+    const rows = await this.client.execute('/interface/bridge/vlan/print', {}, [`?bridge=${bridge}`]);
+    return rows.filter((r) => r['dynamic'] !== 'true' && r['.id']
+      && [...rosList(r['tagged']), ...rosList(r['untagged'])].some((m) => members.includes(m)));
+  }
+
+  /**
+   * Rewrite VLAN membership after ports were swapped for a bond or back
+   * (outside review P2-8). Without this a port tagged on VLAN 20 became a bond
+   * that wasn't, and VLAN 20 stopped forwarding across the link.
+   */
+  private async replaceVlanMembers(
+    rows: Record<string, string>[], replace: (list: string[]) => string[],
+  ): Promise<string[]> {
+    const failures: string[] = [];
+    for (const row of rows) {
+      const tagged = [...new Set(replace(rosList(row['tagged'])))];
+      const untagged = [...new Set(replace(rosList(row['untagged'])))];
+      try {
+        await this.client.execute('/interface/bridge/vlan/set', {
+          '.id': row['.id'], tagged: tagged.join(','), untagged: untagged.join(','),
+        });
+      } catch (err) {
+        failures.push(`VLAN ${row['vlan-ids']} (${(err as Error).message})`);
+      }
+    }
+    return failures;
+  }
+
   async createBond(name: string, slaves: string[], mode: string, opts: {
     lacpRate?: string; hashPolicy?: string; mtu?: number; minLinks?: number;
   }): Promise<void> {
@@ -3401,42 +5414,67 @@ export class DeviceCollector {
     // with its port settings so the bond can inherit them.
     let originalBridge: string | null = null;
     let carry: Record<string, string> = {};
+    const slavePorts: Record<string, string>[] = [];
     for (const slave of slaves) {
       const bridgePorts = await this.client.execute('/interface/bridge/port/print', {}, [`?interface=${slave}`]).catch(() => []);
       for (const bp of bridgePorts) {
-        if (bp['.id']) {
-          if (!originalBridge) {
-            originalBridge = bp['bridge'] ?? null;
-            carry = DeviceCollector.carryBridgePortAttrs(bp);
-          }
-          await this.client.execute('/interface/bridge/port/remove', { '.id': bp['.id'] });
+        if (!bp['.id']) continue;
+        if (!originalBridge) {
+          originalBridge = bp['bridge'] ?? null;
+          carry = DeviceCollector.carryBridgePortAttrs(bp);
         }
+        slavePorts.push(bp);
       }
     }
-    const params: Record<string, string> = { name, slaves: slaves.join(','), mode };
-    if (opts.lacpRate)   params['lacp-rate'] = this.mapLacpRate(opts.lacpRate);
-    if (opts.hashPolicy) params['transmit-hash-policy'] = this.mapHashPolicy(opts.hashPolicy);
-    if (opts.mtu)        params['mtu'] = String(opts.mtu);
-    if (opts.minLinks != null) params['min-links'] = String(opts.minLinks);
-    await this.client.execute('/interface/bonding/add', params);
-    // Put the new bond into the bridge the slaves came out of. If this fails the
-    // member ports are left unbridged — never swallow it, the device may be
-    // unreachable and the caller must know.
-    if (originalBridge) {
-      try {
-        await this.client.execute('/interface/bridge/port/add', {
-          bridge: originalBridge,
-          interface: name,
-          ...carry,
-        });
-      } catch (err) {
-        throw new Error(
-          `Bond '${name}' was created, but adding it to bridge '${originalBridge}' failed: ` +
-          `${(err as Error).message}. The member ports (${slaves.join(', ')}) are no longer bridged ` +
-          `and may not forward traffic — check the device.`,
-          { cause: err }
-        );
+    // Read VLAN membership before the ports leave the bridge.
+    const vlanRows = originalBridge ? await this.vlanRowsListing(originalBridge, slaves) : [];
+    // From the first write on, a failure leaves ports unbridged (or a bond half
+    // set up): mark it so Change Guard keeps the revert armed. A rejection
+    // before anything was written is a plain failure, so the guard disarms
+    // rather than reverting (in binary mode, rebooting) an unchanged device.
+    let wrote = false;
+    try {
+      for (const bp of slavePorts) {
+        await this.client.execute('/interface/bridge/port/remove', { '.id': bp['.id'] });
+        wrote = true;
       }
+      const params: Record<string, string> = { name, slaves: slaves.join(','), mode };
+      if (opts.lacpRate)   params['lacp-rate'] = this.mapLacpRate(opts.lacpRate);
+      if (opts.hashPolicy) params['transmit-hash-policy'] = this.mapHashPolicy(opts.hashPolicy);
+      if (opts.mtu)        params['mtu'] = String(opts.mtu);
+      if (opts.minLinks != null) params['min-links'] = String(opts.minLinks);
+      await this.client.execute('/interface/bonding/add', params);
+      wrote = true;
+      // Put the new bond into the bridge the slaves came out of. If this fails the
+      // member ports are left unbridged — never swallow it, the device may be
+      // unreachable and the caller must know.
+      if (originalBridge) {
+        try {
+          await this.client.execute('/interface/bridge/port/add', {
+            bridge: originalBridge,
+            interface: name,
+            ...carry,
+          });
+        } catch (err) {
+          throw new Error(
+            `Bond '${name}' was created, but adding it to bridge '${originalBridge}' failed: ` +
+            `${(err as Error).message}. The member ports (${slaves.join(', ')}) are no longer bridged ` +
+            `and may not forward traffic — check the device.`,
+            { cause: err }
+          );
+        }
+        // The bond takes over the VLANs its members carried.
+        const failures = await this.replaceVlanMembers(vlanRows, (list) =>
+          list.some((m) => slaves.includes(m)) ? [...list.filter((m) => !slaves.includes(m)), name] : list);
+        if (failures.length > 0) {
+          throw new Error(
+            `Bond '${name}' was created and bridged, but moving VLAN membership onto it failed for: ` +
+            `${failures.join('; ')}. Those VLANs may not cross the bond — check the device.`
+          );
+        }
+      }
+    } catch (err) {
+      throw stepFailure(err, wrote);
     }
   }
 
@@ -3465,11 +5503,19 @@ export class DeviceCollector {
     const bondPort = bondBridgePorts[0];
     const bridgeName = bondPort?.['bridge'] ?? null;
     const carry = DeviceCollector.carryBridgePortAttrs(bondPort);
+    const vlanRows = bridgeName ? await this.vlanRowsListing(bridgeName, [name]) : [];
 
-    if (bondPort?.['.id']) {
-      await this.client.execute('/interface/bridge/port/remove', { '.id': bondPort['.id'] });
+    // Once the bond's bridge port is gone, a failure leaves the bond unbridged.
+    let wrote = false;
+    try {
+      if (bondPort?.['.id']) {
+        await this.client.execute('/interface/bridge/port/remove', { '.id': bondPort['.id'] });
+        wrote = true;
+      }
+      await this.client.execute('/interface/bonding/remove', { '.id': id });
+    } catch (err) {
+      throw stepFailure(err, wrote);
     }
-    await this.client.execute('/interface/bonding/remove', { '.id': id });
 
     // Removing a bond releases its slaves as standalone interfaces. If the bond was
     // bridged, put each slave back in that bridge with the same port settings —
@@ -3490,9 +5536,15 @@ export class DeviceCollector {
         }
       }
     }
+    // Each freed port takes back the VLANs the bond carried.
+    if (bridgeName && slaves.length > 0) {
+      const vlanFailures = await this.replaceVlanMembers(vlanRows, (list) =>
+        list.includes(name) ? [...list.filter((m) => m !== name), ...slaves] : list);
+      failures.push(...vlanFailures);
+    }
     if (failures.length > 0) {
-      throw new Error(
-        `Bond '${name}' was removed, but restoring bridge membership on '${bridgeName}' failed for: ` +
+      throw new PartialApplyError(
+        `Bond '${name}' was removed, but restoring bridge or VLAN membership on '${bridgeName}' failed for: ` +
         `${failures.join('; ')}. Those ports may not forward traffic — check the device.`
       );
     }
@@ -3536,14 +5588,199 @@ export class DeviceCollector {
 
   // ─── Firmware updates ─────────────────────────────────────────────────────
 
+  /**
+   * Put the device on the configured update channel before checking (#162).
+   *
+   * Done here because every update check -- manual, daily, fleet-wide and the
+   * rollout orchestrator -- goes through checkForUpdates, so no path can check
+   * against the wrong channel. Nothing is changed when no channel is set.
+   */
+  private async applyUpdateChannel(): Promise<void> {
+    const [row] = await query<{ update_channel: string | null }>(
+      `SELECT update_channel FROM devices WHERE id = $1`, [this.device.id]
+    );
+    const [setting] = await query<{ value: unknown }>(
+      `SELECT value FROM app_settings WHERE key = 'firmware_update_channel'`
+    ).catch(() => []);
+    const desired = resolveChannel(row?.update_channel, setting?.value);
+    if (!desired) return;
+    const current = (await this.client.execute('/system/package/update/print'))[0]?.['channel'];
+    if (current !== desired) {
+      await this.client.execute('/system/package/update/set', { channel: desired });
+      console.log(`[${this.device.name ?? this.device.ip_address}] update channel ${current ?? '?'} -> ${desired}`);
+    }
+  }
+
   async checkForUpdates(): Promise<Record<string, string>> {
-    await this.client.execute('/system/package/update/check-for-updates').catch(() => {});
-    // Give the device a moment to complete the check
+    await this.applyUpdateChannel();
+    // Reaches out to MikroTik's servers, so it can outlast the ordinary read
+    // timeout on a slow or filtered link. The failure was previously swallowed
+    // (.catch(() => {})), which hid a timed-out check and left the caller
+    // reading whatever /print happened to return (#136).
+    await this.client.execute(
+      '/system/package/update/check-for-updates', {}, [], { timeoutMs: UPDATE_CHECK_TIMEOUT_MS }
+    );
+    // Give the device a moment to settle the result before reading it back.
     await new Promise<void>((resolve) => setTimeout(resolve, 3000));
-    const result = await this.client
-      .execute('/system/package/update/print')
-      .catch(() => [] as Record<string, string>[]);
-    return (result[0] as Record<string, string>) || {};
+    const result = await this.client.execute('/system/package/update/print');
+    const status = (result[0] as Record<string, string>) || {};
+    if (status['channel']) {
+      await query(`UPDATE devices SET reported_update_channel = $1 WHERE id = $2`, [status['channel'], this.device.id])
+        .catch(() => {});
+    }
+    return status;
+  }
+
+  /**
+   * Download the pending update without rebooting.
+   *
+   * Preferred over `install` because it is *verifiable*: afterwards the device
+   * reports "Downloaded, please reboot", so the caller can confirm the image is
+   * actually on the device before restarting anything. `install` bundles the
+   * download and the reboot into one fire-and-forget call whose success cannot
+   * be observed — and on at least one CCR it neither downloaded nor rebooted
+   * while reporting nothing at all (#firmware).
+   */
+  /**
+   * Download the pending image, returning what the device said while doing it.
+   *
+   * The command streams one row per progress update -- around seventy for a full
+   * image, ending with the outcome. Discarding them, as this used to, threw away
+   * both the authoritative result and the percentage the UI had no other way to
+   * show; the caller then had to infer completion by polling, which is where the
+   * substring bug lived (#141).
+   */
+  async downloadUpdate(timeoutMs = UPDATE_DOWNLOAD_TIMEOUT_MS): Promise<DownloadResult> {
+    // Blocks until the image has landed -- a minute or more is normal, and the
+    // 30-second default read timeout was cutting it off and corrupting the
+    // connection (#136).
+    const rows = await this.client.execute(
+      '/system/package/update/download', {}, [], { timeoutMs }
+    );
+    return { status: latestFromStream(rows), peakPercent: peakPercent(rows), rows: rows.length };
+  }
+
+  /** The device's current update status, parsed. */
+  async getUpdateStatusParsed(): Promise<UpdateStatus> {
+    const rows = await this.client.execute('/system/package/update/print');
+    return parseUpdateStatus(rows[0]?.['status']);
+  }
+
+  /** The `status` line from /system/package/update, e.g. "Downloaded, please reboot…". */
+  async getUpdateStatus(): Promise<string> {
+    const rows = await this.client.execute('/system/package/update/print').catch(() => []);
+    return (rows[0]?.['status'] || '').trim();
+  }
+
+  /** Seconds since the device last booted, for proving a reboot happened. */
+  async getUptimeSeconds(): Promise<number | null> {
+    const res = await this.getSystemResource().catch(() => ({} as Record<string, string>));
+    const raw = res['uptime'];
+    if (!raw) return null;
+    const units: Record<string, number> = { w: 604800, d: 86400, h: 3600, m: 60, s: 1 };
+    let total = 0;
+    let matched = false;
+    for (const [, n, u] of raw.matchAll(/(\d+)([wdhms])/g)) { total += parseInt(n, 10) * units[u]; matched = true; }
+    return matched ? total : null;
+  }
+
+  // ─── Local firmware mirror (#193) ─────────────────────────────────────────
+  //
+  // Client side: /system/package/local-update (RouterOS 7.17+) pulls packages
+  // from a package server, another RouterOS device, over Winbox.
+  // Server side: a read-only login and the packages in a folder of their own.
+
+  async getLocalUpdateSources(): Promise<Record<string, string>[]> {
+    return this.client.execute('/system/package/local-update/update-package-source/print');
+  }
+
+  async addLocalUpdateSource(address: string, user: string, password: string): Promise<void> {
+    await this.client.execute('/system/package/local-update/update-package-source/add', { address, user, password });
+  }
+
+  async removeLocalUpdateSource(id: string): Promise<void> {
+    await this.client.execute('/system/package/local-update/update-package-source/remove', { numbers: id });
+  }
+
+  /** Ask the package server what it holds for this device's architecture. */
+  async refreshLocalUpdate(): Promise<void> {
+    await this.client.execute('/system/package/local-update/refresh', {}, [], { timeoutMs: 120_000 });
+  }
+
+  /** Rows of SOURCE/NAME/VERSION/STATUS (installed, available, scheduled…). */
+  async getLocalUpdatePackages(): Promise<Record<string, string>[]> {
+    return this.client.execute('/system/package/local-update/print');
+  }
+
+  /** Starts in the background; the caller checks the file actually lands. */
+  async downloadLocalUpdate(id: string): Promise<void> {
+    await this.client.execute('/system/package/local-update/download', { numbers: id }, [], { timeoutMs: 120_000 });
+  }
+
+  /** Installed packages, read live (RouterOS 7 marks the rest available=true). */
+  async getInstalledPackages(): Promise<string[]> {
+    const rows = await this.client.execute('/system/package/print');
+    return [...new Set(rows.filter((p) => p['available'] !== 'true' && p['name']).map((p) => p['name']))].sort();
+  }
+
+  /** Every file on the device, for confirming a download landed. */
+  /** Disks (SD, USB, NVMe, RAM) and their mount points; none on a device without any. */
+  async getDisks(): Promise<Record<string, string>[]> {
+    return this.client.execute('/disk/print', { detail: '' }).catch(() => [] as Record<string, string>[]);
+  }
+
+  async getFiles(): Promise<Record<string, string>[]> {
+    return this.client.execute('/file/print');
+  }
+
+  async getUsers(): Promise<Record<string, string>[]> {
+    return this.client.execute('/user/print');
+  }
+
+  /**
+   * The package server login and its group. local-update lists packages with
+   * read and winbox but downloads them over file access, which RouterOS's
+   * built-in read group lacks (it has !ftp): with it, devices see the packages
+   * and every download quietly fails. So the login gets a group of its own,
+   * kept to the given policy on every run.
+   */
+  async ensureMirrorUser(name: string, group: string, policy: string, password: string, comment: string): Promise<'created' | 'updated'> {
+    const groups = await this.client.execute('/user/group/print');
+    const g = groups.find((r) => r['name'] === group);
+    if (g?.['.id']) await this.client.execute('/user/group/set', { numbers: g['.id'], policy, comment });
+    else await this.client.execute('/user/group/add', { name: group, policy, comment });
+
+    const existing = (await this.getUsers()).find((u) => u['name'] === name);
+    if (existing?.['.id']) {
+      await this.client.execute('/user/set', { numbers: existing['.id'], group, password, comment });
+      return 'updated';
+    }
+    await this.client.execute('/user/add', { name, group, password, comment });
+    return 'created';
+  }
+
+  async removeUserGroup(group: string): Promise<boolean> {
+    const g = (await this.client.execute('/user/group/print')).find((r) => r['name'] === group);
+    if (!g?.['.id']) return false;
+    await this.client.execute('/user/group/remove', { numbers: g['.id'] });
+    return true;
+  }
+
+  async removeUserByName(name: string): Promise<boolean> {
+    const existing = (await this.getUsers()).find((u) => u['name'] === name);
+    if (!existing?.['.id']) return false;
+    await this.client.execute('/user/remove', { numbers: existing['.id'] });
+    return true;
+  }
+
+  /** Files whose name starts with a prefix, such as "mtm-packages/". */
+  async getFilesUnder(prefix: string): Promise<Record<string, string>[]> {
+    const rows = await this.client.execute('/file/print');
+    return rows.filter((r) => (r['name'] || '').startsWith(prefix));
+  }
+
+  async removeFileById(id: string): Promise<void> {
+    await this.client.execute('/file/remove', { numbers: id });
   }
 
   async installUpdate(): Promise<void> {
@@ -3555,17 +5792,37 @@ export class DeviceCollector {
     const rb = (result[0] as Record<string, string>) || {};
     const currentFirmware = (rb['current-firmware'] || '').trim();
     const upgradeFirmware = (rb['upgrade-firmware'] || '').trim();
-    const upgradeAvailable = Boolean(upgradeFirmware && currentFirmware && upgradeFirmware !== currentFirmware);
+    // Newer, not just different: after a RouterOS downgrade RouterOS offers an
+    // older RouterBOOT than the one installed, which isn't an upgrade (#372).
+    const upgradeAvailable = Boolean(upgradeFirmware && currentFirmware && compareRosVersions(upgradeFirmware, currentFirmware) > 0);
     return { currentFirmware, upgradeFirmware, upgradeAvailable };
   }
 
   async installRouterboardUpgrade(): Promise<void> {
     await this.client.execute('/system/routerboard/upgrade');
-    await this.client.execute('/system/reboot');
+    // Through reboot(), which expects the session to die. Calling /system/reboot
+    // directly reported "Connection closed" as a failed RouterBOOT upgrade
+    // whenever the socket closed before RouterOS acknowledged the command, a
+    // race, which is why it was rare (#141).
+    await this.reboot();
   }
 
+  /**
+   * Reboot the device.
+   *
+   * A reboot that works necessarily kills the session that asked for it, so the
+   * transport error that follows is the *expected* outcome, not a failure. Left
+   * unhandled it surfaced as "Update failed before reboot: Connection closed" on
+   * a device that had in fact rebooted and upgraded correctly.
+   */
   async reboot(): Promise<void> {
-    await this.client.execute('/system/reboot');
+    try {
+      await this.client.execute('/system/reboot');
+    } catch (e) {
+      const msg = (e as Error).message || '';
+      if (/closed|reset|EPIPE|not connected|timed? ?out|socket/i.test(msg)) return;
+      throw e;
+    }
   }
 
   // ─── Ethernet monitor / SFP DDM ───────────────────────────────────────────
@@ -3581,12 +5838,11 @@ export class DeviceCollector {
     await this.client.execute('/interface/ethernet/set', { numbers: name, 'fec-mode': fecMode });
   }
 
-  async setFlowControl(name: string, txFc: string, rxFc: string): Promise<void> {
-    await this.client.execute('/interface/ethernet/set', {
-      numbers: name,
-      'tx-flow-control': txFc,
-      'rx-flow-control': rxFc,
-    });
+  async setFlowControl(name: string, txFc?: string, rxFc?: string): Promise<void> {
+    const params: Record<string, string> = { numbers: name };
+    if (txFc) params['tx-flow-control'] = txFc;
+    if (rxFc) params['rx-flow-control'] = rxFc;
+    if (Object.keys(params).length > 1) await this.client.execute('/interface/ethernet/set', params);
   }
 
   async setAutoNegotiation(name: string, autoNeg: boolean, speed?: string): Promise<void> {
@@ -3626,7 +5882,10 @@ export class DeviceCollector {
   }
 
   async addOspfArea(params: Record<string, string>): Promise<void> {
-    await this.client.execute('/routing/ospf/area/add', params);
+    // RouterOS calls it area-id; `area` was rejected (outside review C7).
+    const { area, ...rest } = params;
+    if (area !== undefined && rest['area-id'] === undefined) rest['area-id'] = area;
+    await this.client.execute('/routing/ospf/area/add', rest);
   }
 
   async removeOspfArea(id: string): Promise<void> {
@@ -3637,6 +5896,8 @@ export class DeviceCollector {
     connections: Record<string, string>[];
     sessions: Record<string, string>[];
     templates: Record<string, string>[];
+    /** RouterOS 7.20+ (and 6): the instances, which carry the local AS. */
+    instances: Record<string, string>[];
   }> {
     // ROS7 uses /routing/bgp/connection, ROS6 uses /routing/bgp/peer
     const [connections, sessions, templates] = await Promise.all([
@@ -3646,13 +5907,52 @@ export class DeviceCollector {
       this.client.execute('/routing/bgp/template/print', { detail: '' })
         .catch(() => this.client.execute('/routing/bgp/instance/print', { detail: '' }).catch(() => [] as Record<string, string>[])),
     ]);
-    return { connections, sessions, templates };
+    const instances = await this.client.execute('/routing/bgp/instance/print').catch(() => [] as Record<string, string>[]);
+    return { connections, sessions, templates, instances };
   }
 
-  async addBgpConnection(params: Record<string, string>): Promise<void> {
-    // Try ROS7 path first, then ROS6
-    await this.client.execute('/routing/bgp/connection/add', params)
-      .catch(() => this.client.execute('/routing/bgp/peer/add', params));
+  /**
+   * Add a BGP connection the way this RouterOS version wants it:
+   *  - 7.20+: connections belong to an instance, which carries the local AS.
+   *    The named or only instance is used; with none, one is created from the
+   *    local AS given.
+   *  - 7.0–7.19: no instance menu; the local AS goes on the connection.
+   *  - 6: a peer, under the default instance.
+   * The old version tried a 7 add and fell back to a 6 one on any error, so a
+   * 7.20+ device got "missing =instance=" reported as a peer error.
+   */
+  async addBgpConnection(c: BgpConnectionInput): Promise<{ instanceCreated?: string }> {
+    const trapOr = <T>(fallback: T) => (e: unknown) => (e instanceof RouterOSTrapError ? fallback : Promise.reject(e));
+    const ros7 = await this.client.execute('/routing/bgp/connection/print').then(() => true, trapOr(false));
+    if (!ros7) {
+      await this.client.execute('/routing/bgp/peer/add', {
+        name: c.name, 'remote-address': c.remoteAddress, 'remote-as': c.remoteAs,
+      });
+      return {};
+    }
+    const base = { name: c.name, 'remote.address': c.remoteAddress, 'remote.as': c.remoteAs, 'local.role': c.role };
+    const instances = await this.client.execute('/routing/bgp/instance/print').then((r) => r, trapOr(null));
+    if (instances === null) {
+      if (!c.localAs) throw new Error('Enter the local AS: this RouterOS version sets it on each connection.');
+      await this.client.execute('/routing/bgp/connection/add', { ...base, as: c.localAs });
+      return {};
+    }
+    let instance = c.instance;
+    let instanceCreated: string | undefined;
+    if (instance) {
+      if (!instances.some((i) => i['name'] === instance)) throw new Error(`There's no BGP instance called ${instance} on this device.`);
+    } else if (instances.length === 1) {
+      instance = instances[0]['name'];
+    } else if (instances.length > 1) {
+      throw new Error(`This device has ${instances.length} BGP instances; choose which one the connection belongs to.`);
+    } else {
+      if (!c.localAs) throw new Error('Enter the local AS: this device has no BGP instance yet, and one is created with it.');
+      instance = 'default';
+      await this.client.execute('/routing/bgp/instance/add', { name: instance, as: c.localAs, comment: 'created by MikroTik Manager' });
+      instanceCreated = instance;
+    }
+    await this.client.execute('/routing/bgp/connection/add', { ...base, instance: instance! });
+    return { instanceCreated };
   }
 
   async removeBgpConnection(id: string): Promise<void> {
@@ -3683,14 +5983,28 @@ export class DeviceCollector {
     return { rules, chains };
   }
 
+  /** RouterOS 7 replaced /routing/filter with scripted /routing/filter/rule. */
+  private async hasV7RouteFilters(): Promise<boolean> {
+    const major = parseInt(this.device.ros_version ?? '', 10);
+    if (major) return major >= 7;
+    return this.client.execute('/routing/filter/rule/print', { '.proplist': '.id' }).then(() => true, () => false);
+  }
+
   async addFilterRule(params: Record<string, string>): Promise<void> {
-    await this.client.execute('/routing/filter/rule/add', params)
-      .catch(() => this.client.execute('/routing/filter/add', params));
+    // One menu per version, with that version's schema (outside review C7).
+    // RouterOS 7 has no chain/prefix/action properties: the match and action
+    // are one `rule` script. Trying v7 then falling back to v6 also hid the
+    // real error behind "no such command".
+    if (await this.hasV7RouteFilters()) {
+      await this.client.execute('/routing/filter/rule/add', toV7FilterRule(params));
+    } else {
+      await this.client.execute('/routing/filter/add', params);
+    }
   }
 
   async updateFilterRule(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/routing/filter/rule/set', { '.id': id, ...params })
-      .catch(() => this.client.execute('/routing/filter/set', { '.id': id, ...params }));
+    await this.setItem('/routing/filter/rule', id, params)
+      .catch(() => this.setItem('/routing/filter', id, params));
   }
 
   async removeFilterRule(id: string): Promise<void> {
@@ -3725,7 +6039,7 @@ export class DeviceCollector {
 
   async updateDhcpServer(id: string, params: Record<string, string>, protocol: 'ipv4' | 'ipv6'): Promise<void> {
     const base = protocol === 'ipv4' ? '/ip/dhcp-server' : '/ipv6/dhcp-server';
-    await this.client.execute(`${base}/set`, { '.id': id, ...params });
+    await this.setItem(base, id, params);
   }
 
   async removeDhcpServer(id: string, protocol: 'ipv4' | 'ipv6'): Promise<void> {
@@ -3811,7 +6125,7 @@ export class DeviceCollector {
   }
 
   async updateDnsStaticEntry(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/ip/dns/static/set', { '.id': id, ...params });
+    await this.setItem('/ip/dns/static', id, params);
   }
 
   async removeDnsStaticEntry(id: string): Promise<void> {
@@ -3843,35 +6157,21 @@ export class DeviceCollector {
       this.client.execute('/system/ntp/server/print', {}).then(r => normalizeBools(r[0] ?? {})),
       this.client.execute('/system/ntp/client/print', {}).then(r => normalizeBools(r[0] ?? {})),
     ]);
+    const clientRow = client.status === 'fulfilled' ? client.value : {};
+    // RouterOS 6 keeps servers in primary/secondary/server-dns-names; the page
+    // shows and edits them as one list (#180).
+    if (isLegacyClient(clientRow) && !('servers' in clientRow)) clientRow['servers'] = legacyServerList(clientRow);
     return {
       server: server.status === 'fulfilled' ? server.value : {},
-      client: client.status === 'fulfilled' ? client.value : {},
+      client: clientRow,
     };
   }
 
-  async setNtpSettings(settings: {
-    server_enabled?: boolean;
-    server_broadcast?: boolean;
-    server_manycast?: boolean;
-    client_enabled?: boolean;
-    client_mode?: string;
-    client_servers?: string;
-  }): Promise<void> {
-    const serverParams: Record<string, string> = {};
-    if (settings.server_enabled !== undefined) serverParams['enabled'] = settings.server_enabled ? 'yes' : 'no';
-    if (settings.server_broadcast !== undefined) serverParams['broadcast'] = settings.server_broadcast ? 'yes' : 'no';
-    if (settings.server_manycast !== undefined) serverParams['manycast'] = settings.server_manycast ? 'yes' : 'no';
-    if (Object.keys(serverParams).length > 0) {
-      await this.client.execute('/system/ntp/server/set', serverParams);
-    }
-
-    const clientParams: Record<string, string> = {};
-    if (settings.client_enabled !== undefined) clientParams['enabled'] = settings.client_enabled ? 'yes' : 'no';
-    if (settings.client_mode) clientParams['mode'] = settings.client_mode;
-    if (settings.client_servers !== undefined) clientParams['servers'] = settings.client_servers;
-    if (Object.keys(clientParams).length > 0) {
-      await this.client.execute('/system/ntp/client/set', clientParams);
-    }
+  async setNtpSettings(settings: NtpForm): Promise<void> {
+    // Only what changed, in this RouterOS version's terms (#180).
+    const writes = planNtpWrites(settings, await this.getNtpSettings());
+    if (writes.server) await this.client.execute('/system/ntp/server/set', writes.server);
+    if (writes.client) await this.client.execute('/system/ntp/client/set', writes.client);
   }
 
   // Syslog (logging actions + rules) ───────────────────────────────────────────
@@ -3881,11 +6181,13 @@ export class DeviceCollector {
   }
 
   async addSyslogAction(params: Record<string, string>): Promise<void> {
-    await this.client.execute('/system/logging/action/add', params);
+    const modern = usesRemoteLogFormat(await this.getSyslogActions());
+    await this.client.execute('/system/logging/action/add', toSyslogActionParams(params, modern));
   }
 
   async updateSyslogAction(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/system/logging/action/set', { '.id': id, ...params });
+    const modern = usesRemoteLogFormat(await this.getSyslogActions());
+    await this.setItem('/system/logging/action', id, toSyslogActionParams(params, modern));
   }
 
   async removeSyslogAction(id: string): Promise<void> {
@@ -3901,7 +6203,7 @@ export class DeviceCollector {
   }
 
   async updateSyslogRule(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/system/logging/set', { '.id': id, ...params });
+    await this.setItem('/system/logging', id, params);
   }
 
   async removeSyslogRule(id: string): Promise<void> {
@@ -3925,7 +6227,7 @@ export class DeviceCollector {
   }
 
   async updateWireGuardInterface(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/interface/wireguard/set', { '.id': id, ...params });
+    await this.setItem('/interface/wireguard', id, params);
   }
 
   async removeWireGuardInterface(id: string): Promise<void> {
@@ -3946,7 +6248,7 @@ export class DeviceCollector {
   }
 
   async updateWireGuardPeer(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/interface/wireguard/peers/set', { '.id': id, ...params });
+    await this.setItem('/interface/wireguard/peers', id, params);
   }
 
   async removeWireGuardPeer(id: string): Promise<void> {
@@ -3973,7 +6275,7 @@ export class DeviceCollector {
   }
 
   async updateTrafficFlowTarget(id: string, params: Record<string, string>): Promise<void> {
-    await this.client.execute('/ip/traffic-flow/target/set', { '.id': id, ...params });
+    await this.setItem('/ip/traffic-flow/target', id, params);
   }
 
   async removeTrafficFlowTarget(id: string): Promise<void> {

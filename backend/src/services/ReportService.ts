@@ -2,7 +2,11 @@
 // top clients, updates, backups) delivered over the SMTP settings of the first
 // enabled email alert channel. An hourly scheduler sends whatever is due.
 
+import { escapeHtml } from '../utils/html';
+import { outageOverlapsSql, outageSecondsSql } from '../utils/outageWindow';
+import { openConfig } from '../utils/alertChannelSecrets';
 import nodemailer from 'nodemailer';
+import { smtpTransportOptions, describeSmtpError } from '../utils/smtpTransport';
 import { query, queryOne } from '../config/database';
 
 interface ScheduleRow {
@@ -15,7 +19,9 @@ const PERIOD_DAYS: Record<string, number> = { daily: 1, weekly: 7, monthly: 30 }
 export function computeNextRun(frequency: string, from: Date): Date {
   const next = new Date(from);
   if (frequency === 'daily') next.setDate(next.getDate() + 1);
-  else if (frequency === 'monthly') next.setMonth(next.getMonth() + 1);
+  // Monthly reports go out on the 1st. setMonth(+1) from the 31st overflowed
+  // past short months (31 January became 3 March), skipping February (J5).
+  else if (frequency === 'monthly') return new Date(from.getFullYear(), from.getMonth() + 1, 1, from.getHours(), from.getMinutes(), from.getSeconds());
   else next.setDate(next.getDate() + 7);
   return next;
 }
@@ -64,27 +70,26 @@ export class ReportService {
     const recipients = schedule.recipients.split(',').map(r => r.trim()).filter(Boolean);
     if (recipients.length === 0) throw new Error('No recipients configured');
 
-    const transport = nodemailer.createTransport({
-      host: smtp.host, port: smtp.port, secure: smtp.secure,
-      auth: smtp.user ? { user: smtp.user, pass: smtp.pass } : undefined,
-    });
+    const transport = nodemailer.createTransport(smtpTransportOptions(smtp.cfg));
     await transport.sendMail({
       from: smtp.from,
       to: recipients.join(', '),
       subject: `MikroTik Manager — ${schedule.frequency} network report`,
       html,
-    });
+    }).catch((e) => { throw describeSmtpError(e); });
     console.log(`[Reports] sent "${schedule.name}" to ${recipients.length} recipient(s)`);
   }
 
   // SMTP settings come from the first enabled email alert channel
-  private async smtpConfig(): Promise<{ host: string; port: number; secure: boolean; user?: string; pass?: string; from: string }> {
+  private async smtpConfig(): Promise<{ cfg: Record<string, unknown>; host: string; port: number; secure: boolean; user?: string; pass?: string; from: string }> {
     const ch = await queryOne<{ config: Record<string, unknown> }>(
       `SELECT config FROM alert_channels WHERE type = 'email' AND enabled = TRUE ORDER BY id LIMIT 1`);
-    const cfg = ch?.config;
+    // The SMTP password is stored encrypted (S7).
+    const cfg = ch?.config ? openConfig('email', ch.config) : undefined;
     const host = cfg?.smtp_host as string | undefined;
     if (!host) throw new Error('No enabled email alert channel — configure one under Settings → Alerting to send reports');
     return {
+      cfg: cfg!,
       host,
       port: (cfg?.smtp_port as number) || 587,
       secure: !!cfg?.smtp_secure,
@@ -103,19 +108,33 @@ export class ReportService {
                 COUNT(*) FILTER (WHERE firmware_update_available)::text AS updates
          FROM devices`),
       query<{ n: string; secs: string }>(
-        `SELECT COUNT(*)::text AS n, COALESCE(SUM(COALESCE(duration_seconds,0)),0)::text AS secs
-         FROM device_availability WHERE went_offline_at > NOW() - ($1 || ' days')::interval`, [days]),
+        // Every outage overlapping the period, clipped to it (P2-25).
+        `SELECT COUNT(*)::text AS n, COALESCE(SUM(${outageSecondsSql(`($1 || ' days')::interval`)}),0)::bigint::text AS secs
+         FROM device_availability WHERE ${outageOverlapsSql(`($1 || ' days')::interval`)}`, [days]),
       query<{ errors: string; warnings: string }>(
+        // The severity test is in the WHERE too, so only error and warning rows are read
+        // rather than every (mostly info) event of the period.
         `SELECT COUNT(*) FILTER (WHERE severity='error')::text AS errors,
                 COUNT(*) FILTER (WHERE severity='warning')::text AS warnings
-         FROM events WHERE event_time > NOW() - ($1 || ' days')::interval`, [days]),
+         FROM events WHERE severity IN ('error','warning') AND event_time > NOW() - ($1 || ' days')::interval`, [days]),
       query<{ name: string; bytes: string }>(
-        `SELECT COALESCE(NULLIF(c.custom_name,''), NULLIF(c.hostname,''), ctd.mac_address) AS name,
-                SUM(ctd.upload_bytes + ctd.download_bytes)::text AS bytes
-         FROM client_traffic_daily ctd
-         LEFT JOIN clients c ON LOWER(c.mac_address) = ctd.mac_address
-         WHERE ctd.day > CURRENT_DATE - $1::int
-         GROUP BY 1 ORDER BY SUM(ctd.upload_bytes + ctd.download_bytes) DESC LIMIT 5`, [days]),
+        // One name per MAC: joining every client row multiplied a MAC's bytes
+        // by the number of devices that had seen it.
+        `SELECT COALESCE(NULLIF(n.custom_name,''), NULLIF(n.hostname,''), t.mac_address) AS name,
+                t.bytes::text AS bytes
+         FROM (
+           SELECT mac_address, SUM(upload_bytes + download_bytes) AS bytes
+             FROM client_traffic_daily
+            WHERE day > CURRENT_DATE - $1::int
+              AND mac_address NOT IN ('unknown', 'other')
+            GROUP BY mac_address
+         ) t
+         LEFT JOIN LATERAL (
+           SELECT custom_name, hostname FROM clients c
+            WHERE LOWER(c.mac_address) = t.mac_address
+            ORDER BY last_seen DESC NULLS LAST LIMIT 1
+         ) n ON TRUE
+         ORDER BY t.bytes DESC LIMIT 5`, [days]),
       query<{ n: string }>(
         `SELECT COUNT(*)::text AS n FROM backups WHERE created_at > NOW() - ($1 || ' days')::interval`, [days]),
     ]);
@@ -123,14 +142,14 @@ export class ReportService {
     const d = devices[0];
     const outageMin = Math.round(parseInt(outages[0]?.secs || '0', 10) / 60);
     const row = (label: string, value: string) =>
-      `<tr><td style="padding:6px 12px;color:#64748b;">${label}</td><td style="padding:6px 12px;font-weight:600;color:#0f172a;">${value}</td></tr>`;
+      `<tr><td style="padding:6px 12px;color:#64748b;">${escapeHtml(label)}</td><td style="padding:6px 12px;font-weight:600;color:#0f172a;">${escapeHtml(value)}</td></tr>`;
 
     const clientRows = topClients.map((c, i) =>
-      `<tr><td style="padding:4px 12px;color:#64748b;">${i + 1}. ${c.name}</td><td style="padding:4px 12px;color:#0f172a;">${fmtBytes(parseInt(c.bytes, 10))}</td></tr>`).join('');
+      `<tr><td style="padding:4px 12px;color:#64748b;">${i + 1}. ${escapeHtml(c.name)}</td><td style="padding:4px 12px;color:#0f172a;">${fmtBytes(parseInt(c.bytes, 10))}</td></tr>`).join('');
 
     return `
 <div style="font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:0 auto;">
-  <h2 style="color:#0f172a;">MikroTik Manager — ${frequency} report</h2>
+  <h2 style="color:#0f172a;">MikroTik Manager — ${escapeHtml(frequency)} report</h2>
   <p style="color:#64748b;font-size:13px;">Covering the last ${days} day${days !== 1 ? 's' : ''} · generated ${new Date().toUTCString()}</p>
   <table style="border-collapse:collapse;width:100%;background:#f8fafc;border-radius:8px;">
     ${row('Devices online', `${d?.online ?? 0} / ${d?.total ?? 0}`)}

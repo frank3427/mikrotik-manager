@@ -1,8 +1,12 @@
 version: 2
+# From 1.0, main is the stable line (fixes only) and new work lands on dev, so
+# routine updates go to dev and reach stable with the next minor release.
+# Security updates still open against main, the default branch.
 updates:
   # Frontend npm dependencies
   - package-ecosystem: "npm"
     directory: "/frontend"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -11,6 +15,7 @@ updates:
   # Backend npm dependencies
   - package-ecosystem: "npm"
     directory: "/backend"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -19,19 +24,45 @@ updates:
   # Docker dependencies (docker-compose.yml base images)
   - package-ecosystem: "docker"
     directory: "/backend"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"
 
   - package-ecosystem: "docker"
     directory: "/nginx"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"
 
-  # GitHub Actions workflow dependencies
+  # Images in docker-compose.yml, pinned by digest (outside review O2).
+  # Regenerate docker-compose.ghcr.yml in the same PR: npm run compose:generate.
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # Digest and minor/patch updates only for the databases. A major version
+    # can't be taken by bumping the tag: Postgres 18 can't open a 15 data
+    # directory without pg_upgrade (and moved its data path), and Redis and
+    # InfluxDB majors change behaviour. Those are planned upgrades, not PRs.
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "redis"
+        update-types: ["version-update:semver-major"]
+      # InfluxDB minors too: 2.8 migrates its metadata one way, so going back
+      # needs `influxd downgrade`. Held at 2.7 until there's a reason to move
+      # (#181); 2.7.x patch updates still come through.
+      - dependency-name: "influxdb"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # GitHub Actions workflow dependencies (pinned by commit SHA)
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
       day: "monday"

@@ -15,17 +15,22 @@
  *
  * The restore point is created *before* the scheduler, so a binary restore rolls
  * back to a config containing neither the scheduler nor the change: self-cleaning,
- * with no possibility of a revert loop. (Script mode has no reboot to clear the
- * scheduler, so its on-event removes itself explicitly.)
+ * with no possibility of a revert loop. Script mode restores only the menus the
+ * change can touch, with no reboot (see scriptRestore.ts); its scheduler removes
+ * itself before anything else.
  *
  * Everything here runs over the RouterOS API — no SSH — because many deployments
  * never configure SSH credentials and would otherwise have no protection at all.
  */
 import { randomBytes } from 'crypto';
 import { RouterOSClient } from '../mikrotik/RouterOSClient';
+import { usesApiTls } from '../../utils/apiTls';
 import { decrypt } from '../../utils/crypto';
 import { query, queryOne } from '../../config/database';
 import { redis } from '../../config/redis';
+import { heldLockToken, restoreHeldLock } from './deviceLock';
+import { isPartialApply, PartialApplyRevertError } from './partialApply';
+import { restoreScopeFor, captureScope, buildRestorePlan, type RestorePlan } from './scriptRestore';
 
 export type GuardMode = 'binary' | 'script';
 
@@ -34,6 +39,7 @@ export interface GuardDevice {
   name: string;
   ip_address: string;
   api_port: number;
+  api_tls?: boolean | null;
   api_username: string;
   api_password_encrypted: string;
 }
@@ -46,6 +52,31 @@ export interface ChangeMeta {
   userId?: number | null;
   mode?: GuardMode;
   timeoutSec?: number;
+  /**
+   * A floor for the revert timer. The apply and the reachability check are not
+   * bounded by it, so a long-running change (a full import) needs a window that
+   * outlasts its own worst case, whatever the operator's setting says.
+   */
+  minTimeoutSec?: number;
+  /**
+   * Refuse the change, rather than run it unprotected, when auto-revert cannot
+   * be armed. Set for changes predicted to cut off management, or that the
+   * user confirmed past a lockout warning: the dialog they confirmed promises
+   * auto-revert, and without it a mistake strands the device.
+   */
+  requireProtection?: boolean;
+  /**
+   * With `requireProtection`: still refuse when the guard is on but cannot arm,
+   * but run unprotected when the operator has turned Change Guard off in
+   * Settings, as unflagged changes do. For changes that are risky but carry no
+   * lockout warning the user confirmed past (a backup restore).
+   */
+  requireProtectionOnlyWhenEnabled?: boolean;
+}
+
+/** Thrown, before anything is applied, when a change requires protection it cannot have. */
+export class GuardRequiredError extends Error {
+  readonly code = 'guard_required';
 }
 
 export interface GuardOutcome<T> {
@@ -56,13 +87,37 @@ export interface GuardOutcome<T> {
   autoReverting: boolean;
   /** Set when protection could not be armed; the change ran unprotected. */
   unprotectedReason?: string;
+  /**
+   * Set when the change was confirmed but the revert could not be proven
+   * disarmed. The device may still restore its previous configuration (and
+   * reboot, in binary mode) at about this time.
+   */
+  revertMayFireAt?: string;
+  /**
+   * The revert's scheduler was gone before the commit could disable it: the
+   * revert may have fired (or it was removed by hand), so the change may or
+   * may not still be on the device.
+   */
+  revertMayHaveFired?: boolean;
   guardId?: number;
+  /** The restore actually armed: script mode falls back to binary for changes it can't cover. */
+  mode?: GuardMode;
+  /** Why script mode fell back to binary, when it did. */
+  modeNote?: string;
+  /** Milliseconds per phase, for the log: a slow device shows where its time goes (#258). */
+  timings?: Record<string, number>;
 }
 
 const DEFAULT_TIMEOUT_SEC = 120;
 const VERIFY_ATTEMPTS = 4;
 const VERIFY_CONNECT_TIMEOUT_MS = 8_000;
 const LOCK_TTL_SEC = 600;
+/**
+ * Do not commit when the revert is this close to firing (or past it): disarming
+ * races the on-event, and a scheduler that has already removed itself looks
+ * exactly like one we removed.
+ */
+const COMMIT_MARGIN_SEC = 20;
 
 function token(): string {
   return randomBytes(5).toString('hex');
@@ -75,7 +130,8 @@ function newClient(device: GuardDevice, connectTimeoutMs = 15_000): RouterOSClie
     device.api_username,
     decrypt(device.api_password_encrypted),
     connectTimeoutMs,
-    30_000
+    30_000,
+    usesApiTls(device),
   );
 }
 
@@ -93,27 +149,63 @@ async function readSettings(): Promise<{ enabled: boolean; mode: GuardMode; time
 }
 
 /**
- * Can this device protect itself? Requires the API user to be able to write a
- * restore point and add/remove a scheduler. Probes with a harmless scheduler
- * (logs a line, fires in a day) that is removed immediately.
+ * Can this device protect itself? Performs the same two writes a real guard
+ * does, with throwaway names, and removes both:
+ *
+ *   - the restore point: a binary backup, or in script mode a /system script.
+ *     A least-privilege API user often cannot save a binary backup, and before
+ *     this was checked that only came to light when a real change ran
+ *     unprotected.
+ *   - a scheduler (logs a line, fires in a day).
  */
-export async function probeCapability(device: GuardDevice): Promise<{ ok: boolean; reason?: string }> {
+export async function probeCapability(
+  device: GuardDevice, modeOverride?: GuardMode
+): Promise<{ ok: boolean; reason?: string; mode: GuardMode }> {
+  const settings = await readSettings();
+  const mode = modeOverride ?? settings.mode;
+  if (!settings.enabled) return { ok: false, mode, reason: 'Change Guard is turned off in Settings' };
+
   const client = newClient(device);
   const probeName = `mtm-probe-${token()}`;
+  let savedFile = false;
   try {
     await client.connect();
+
+    try {
+      if (mode === 'binary') {
+        await client.execute('/system/backup/save', { name: probeName });
+        savedFile = true;
+      } else {
+        // Script mode keeps its restore steps in /system script.
+        await client.execute('/system/script/add', { name: probeName, source: ':log info "mtm-guard-probe"' });
+        const sc = (await client.execute('/system/script/print')).find((x) => x['name'] === probeName);
+        if (sc?.['.id']) await client.execute('/system/script/remove', { '.id': sc['.id'] });
+      }
+    } catch (err) {
+      return { ok: false, mode, reason: `the device refused to save a restore point (${(err as Error).message})` };
+    }
+
     await client.execute('/system/scheduler/add', {
       name: probeName,
       interval: '1d',
       'on-event': ':log info "mtm-guard-probe"',
     });
     const found = (await client.execute('/system/scheduler/print')).find((s) => s['name'] === probeName);
-    if (!found?.['.id']) return { ok: false, reason: 'could not create a scheduler on the device' };
+    if (!found?.['.id']) return { ok: false, mode, reason: 'could not create a scheduler on the device' };
     await client.execute('/system/scheduler/remove', { '.id': found['.id'] });
-    return { ok: true };
+    return { ok: true, mode };
   } catch (err) {
-    return { ok: false, reason: (err as Error).message };
+    return { ok: false, mode, reason: (err as Error).message };
   } finally {
+    if (savedFile) {
+      const wanted = `${probeName}.backup`;
+      const files = await client.execute('/file/print').catch(() => [] as Record<string, string>[]);
+      for (const f of files) {
+        if ((f['name'] === wanted || f['name'] === probeName) && f['.id']) {
+          await client.execute('/file/remove', { '.id': f['.id'] }).catch(() => {});
+        }
+      }
+    }
     client.disconnect();
   }
 }
@@ -295,7 +387,13 @@ async function verifyReachable(device: GuardDevice, attempts = VERIFY_ATTEMPTS):
   return false;
 }
 
+/** How long an unprotected restore's device lock outlives an ambiguous failure. */
+const UNPROTECTED_HOLD_SEC = 300;
+
 async function acquireLock(deviceId: number): Promise<boolean> {
+  // The request already holds this device's write lock (deviceLock.ts); the
+  // guarded change runs under it.
+  if (heldLockToken(deviceId)) return true;
   try {
     const res = await redis.set(`changeguard:lock:${deviceId}`, '1', 'EX', LOCK_TTL_SEC, 'NX');
     return res === 'OK';
@@ -305,21 +403,35 @@ async function acquireLock(deviceId: number): Promise<boolean> {
 }
 
 async function releaseLock(deviceId: number): Promise<void> {
+  // Hand the lock back to the request that holds it rather than dropping it;
+  // the request releases it when it finishes.
+  const token = heldLockToken(deviceId);
+  if (token) { await restoreHeldLock(deviceId, token); return; }
   await redis.del(`changeguard:lock:${deviceId}`).catch(() => {});
+}
+
+/**
+ * Keep the device locked until a revert that may still be armed has fired.
+ * Releasing straight away let a second guarded change be applied and
+ * confirmed, only for the first change's revert to restore an older backup
+ * over it.
+ */
+async function holdLock(deviceId: number, seconds: number): Promise<void> {
+  await redis.set(`changeguard:lock:${deviceId}`, '1', 'EX', Math.max(1, Math.ceil(seconds))).catch(() => {});
 }
 
 async function recordGuard(
   device: GuardDevice, meta: ChangeMeta, mode: GuardMode, restorePoint: string,
-  schedulerName: string, timeoutSec: number
+  schedulerName: string, timeoutSec: number, note?: string
 ): Promise<number | undefined> {
   const row = await queryOne<{ id: number }>(
     `INSERT INTO device_change_guards
        (device_id, token, mode, restore_point, scheduler_name, status, change_kind,
-        change_summary, user_id, expires_at)
-     VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8, NOW() + ($9 || ' seconds')::interval)
+        change_summary, user_id, expires_at, note)
+     VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,$8, NOW() + ($9 || ' seconds')::interval, $10)
      RETURNING id`,
     [device.id, schedulerName, mode, restorePoint, schedulerName, meta.kind,
-     meta.summary, meta.userId ?? null, String(timeoutSec)]
+     meta.summary, meta.userId ?? null, String(timeoutSec), note ?? null]
   ).catch(() => null);
   return row?.id;
 }
@@ -347,9 +459,9 @@ async function setGuardStatus(id: number | undefined, status: string, note?: str
 /**
  * Run `applyFn` with a self-restore safety net armed on the device.
  *
- * If protection can't be armed the change still runs (refusing would make the
- * platform less useful than before), but the caller is told via
- * `unprotectedReason` so the UI can say so plainly.
+ * If protection can't be armed, a routine change still runs and the caller is
+ * told via `unprotectedReason`. A change marked `requireProtection` is refused
+ * instead, before anything is applied (GuardRequiredError).
  */
 export async function withSafeApply<T>(
   device: GuardDevice,
@@ -357,11 +469,41 @@ export async function withSafeApply<T>(
   applyFn: () => Promise<T>
 ): Promise<GuardOutcome<T>> {
   const settings = await readSettings();
-  const mode: GuardMode = meta.mode ?? settings.mode;
-  const timeoutSec = meta.timeoutSec ?? settings.timeoutSec;
+  let mode: GuardMode = meta.mode ?? settings.mode;
+  let modeNote: string | undefined;
+  const timings: Record<string, number> = {};
+  let mark = Date.now();
+  const phase = (name: string) => { const now = Date.now(); timings[name] = now - mark; mark = now; };
+  const timeoutSec = Math.max(meta.minTimeoutSec ?? 0, meta.timeoutSec ?? settings.timeoutSec);
 
   if (!settings.enabled) {
-    return { result: await applyFn(), confirmed: false, autoReverting: false, unprotectedReason: 'Change Guard is disabled in settings' };
+    if (meta.requireProtection && !meta.requireProtectionOnlyWhenEnabled) {
+      throw new GuardRequiredError(
+        'Change Guard is turned off in Settings, so this change would have no auto-revert. ' +
+        'It could cut off management, so it was not applied. Turn Change Guard on to apply it.'
+      );
+    }
+    const unprotectedReason = 'Change Guard is disabled in settings';
+    if (!meta.requireProtectionOnlyWhenEnabled) {
+      return { result: await applyFn(), confirmed: false, autoReverting: false, unprotectedReason };
+    }
+    // A restore that runs without a revert still must not overlap another
+    // import or a revert that is still armed: serialisation is not optional.
+    if (!(await acquireLock(device.id))) {
+      throw new Error('Another change is already in progress on this device. Please wait for it to finish.');
+    }
+    let hold = false;
+    try {
+      return { result: await applyFn(), confirmed: false, autoReverting: false, unprotectedReason };
+    } catch (err) {
+      // An import that failed after dispatch may still be running on the
+      // device; keep it locked until it can no longer overlap a retry.
+      hold = isPartialApply(err);
+      throw err;
+    } finally {
+      if (hold) await holdLock(device.id, Math.max(timeoutSec, UNPROTECTED_HOLD_SEC));
+      else await releaseLock(device.id);
+    }
   }
   if (!(await acquireLock(device.id))) {
     throw new Error('Another protected change is already in progress on this device. Please wait for it to finish.');
@@ -373,23 +515,46 @@ export async function withSafeApply<T>(
   const client = newClient(device);
   let armed = false;
   let guardId: number | undefined;
+  let armedAt: number | undefined;
+  /** Seconds to keep the device locked after we return; 0 releases it. */
+  let holdFor = 0;
 
   try {
     // ── Arm ────────────────────────────────────────────────────────────────
     try {
       await client.connect();
+      phase('connect');
+      // Script mode: a restore of just the menus this kind of change touches.
+      // Where there's no such scope, or no RouterOS 7, a binary restore point
+      // instead: still protected, with a reboot if it fires.
+      let plan: RestorePlan | undefined;
+      if (mode === 'script') {
+        const scope = restoreScopeFor(meta.kind);
+        const version = scope ? (await client.execute('/system/resource/print'))[0]?.['version'] ?? '' : '';
+        if (!scope) {
+          modeNote = `Script mode has no targeted restore for this kind of change (${meta.kind}), so a binary restore point was used; a revert would reboot the device.`;
+        } else if (!/^7\./.test(version)) {
+          modeNote = `Script mode needs RouterOS 7 (this device runs ${version || 'an unknown version'}), so a binary restore point was used; a revert would reboot the device.`;
+        } else {
+          plan = buildRestorePlan(await captureScope((path) => client.execute(path), scope), schedulerName);
+        }
+        if (!plan) mode = 'binary';
+      }
+
       if (mode === 'binary') {
         await client.execute('/system/backup/save', { name: restorePoint });
       } else {
-        await client.execute('/export', { file: restorePoint });
+        for (const [n, source] of plan!.chunks.entries()) {
+          await client.execute('/system/script/add', { name: `${schedulerName}-${n + 1}`, source });
+        }
       }
 
       const onEvent = mode === 'binary'
         // Restores exactly (recovers deleted interfaces) and reboots. The restored
         // config predates this scheduler, so it disappears with the restore.
         ? `/system backup load name=${restorePoint} password=""`
-        // No reboot, but /import is additive, so the scheduler must remove itself.
-        : `/import file-name=${restorePoint}.rsc\n/system scheduler remove [find name="${schedulerName}"]`;
+        // Removes the scheduler first, runs the restore steps, removes them.
+        : plan!.onEvent;
 
       await client.execute('/system/scheduler/add', {
         name: schedulerName,
@@ -397,14 +562,26 @@ export async function withSafeApply<T>(
         'on-event': onEvent,
       });
       armed = true;
-      guardId = await recordGuard(device, meta, mode, restorePoint, schedulerName, timeoutSec);
+      armedAt = Date.now();
+      phase('arm');
+      guardId = await recordGuard(device, meta, mode, restorePoint, schedulerName, timeoutSec, modeNote);
     } catch (err) {
-      // Couldn't arm — clean up any half-created artifacts and run unprotected.
-      await cleanup(client, restorePoint, schedulerName, mode).catch(() => {});
+      // Couldn't arm. Clean up anything half-created first, either way.
+      phase('arm');
+      await disarm(device, restorePoint, schedulerName, mode).catch(() => {});
+      phase('cleanup');
+      if (meta.requireProtection) {
+        throw new GuardRequiredError(
+          `The device could not arm its auto-revert (${(err as Error).message}), and this change could ` +
+          'cut off management, so it was not applied. Nothing on the device was changed.'
+        );
+      }
       const result = await applyFn();
+      phase('apply');
       return {
         result, confirmed: false, autoReverting: false,
         unprotectedReason: `Could not arm auto-revert on this device (${(err as Error).message})`,
+        mode, modeNote, timings,
       };
     }
 
@@ -427,9 +604,14 @@ export async function withSafeApply<T>(
     } catch (err) {
       applyError = err;
     }
+    phase('apply');
+
+    const fireAt = new Date((armedAt ?? Date.now()) + timeoutSec * 1000);
+    const secondsUntilFire = () => (fireAt.getTime() - Date.now()) / 1000;
 
     // ── Verify ─────────────────────────────────────────────────────────────
     const reachable = await verifyReachable(device);
+    phase('verify');
     if (!reachable) {
       // Leave the scheduler armed: the device will restore itself and come back.
       const note = applyError
@@ -437,53 +619,212 @@ export async function withSafeApply<T>(
         : 'Device unreachable after change; left to self-restore';
       await setGuardStatus(guardId, 'reverted', note);
       armed = false; // deliberately not cleaned up
+      holdFor = secondsUntilFire() + LOCK_AFTER_FIRE_SEC;
       // `result` is undefined when the change took the connection with it. The
       // caller only reports the outcome in that case, so the guard fields carry the
       // meaning rather than the result.
-      return { result: result as T, confirmed: false, autoReverting: true, guardId };
+      return { result: result as T, confirmed: false, autoReverting: true, guardId, mode, modeNote, timings };
+    }
+
+    // The revert is about to fire (or has): a disarm now races it, and an absent
+    // scheduler is indistinguishable from one the revert removed. Commit nothing.
+    // The same goes for a writer that failed midway: the restore point is the
+    // only way back from a half-applied configuration.
+    const partial = !!applyError && isPartialApply(applyError);
+    if (partial || secondsUntilFire() < COMMIT_MARGIN_SEC) {
+      armed = false; // deliberately left armed on the device
+      holdFor = Math.max(secondsUntilFire(), 0) + LOCK_AFTER_FIRE_SEC;
+      const at = fireAt.toLocaleTimeString();
+      if (partial) {
+        const msg = (applyError as Error).message;
+        await setGuardStatus(guardId, 'reverted', `Change only partly applied (${msg}); left to self-restore`);
+        throw new PartialApplyRevertError(
+          `${msg} The change was only partly applied, so the device will restore its previous configuration ` +
+          `at about ${at}${mode === 'binary' ? ' and reboot' : ''}.`,
+          applyError, fireAt,
+        );
+      }
+      await setGuardStatus(guardId, 'uncertain',
+        'Applied, but the apply and verify took until the revert timer was about to fire, so it was not disarmed');
+      if (applyError) {
+        throw new Error(
+          `${(applyError as Error).message}. The change ran into the revert timer, so the device may restore ` +
+          `its previous configuration at about ${at}.`
+        );
+      }
+      return {
+        result: result as T, confirmed: false, autoReverting: true, guardId,
+        revertMayFireAt: fireAt.toISOString(), mode, modeNote, timings,
+      };
     }
 
     if (applyError) {
       // Still reachable, so the change genuinely failed and nothing needs undoing.
       // Disarm, or the device would reboot for no reason.
-      await cleanup(client, restorePoint, schedulerName, mode).catch(() => {});
-      await setGuardStatus(guardId, 'failed', (applyError as Error).message);
+      const d = await disarm(device, restorePoint, schedulerName, mode, { requirePresent: true, fireAtMs: fireAt.getTime() });
       armed = false;
+      if (!d.disarmed) {
+        holdFor = secondsUntilFire() + LOCK_AFTER_FIRE_SEC;
+        await setGuardStatus(guardId, 'uncertain',
+          `Change failed (${(applyError as Error).message}) and the revert could not be confirmed disarmed: ${d.reason}`);
+        throw new Error(
+          `${(applyError as Error).message}. The auto-revert could not be confirmed as removed, so the device ` +
+          `may restore its previous configuration at about ${fireAt.toLocaleTimeString()}.`
+        );
+      }
+      await setGuardStatus(guardId, 'failed', (applyError as Error).message);
       throw applyError;
     }
 
     // ── Commit ─────────────────────────────────────────────────────────────
-    await cleanup(client, restorePoint, schedulerName, mode);
+    // Only a disarm we have proven counts. A failed read used to look like "no
+    // scheduler left", so a good change was recorded as committed and then
+    // reverted, with a reboot, when the scheduler fired anyway.
+    const d = await disarm(device, restorePoint, schedulerName, mode, { requirePresent: true, fireAtMs: fireAt.getTime() });
+    phase('disarm');
     armed = false;
+    if (!d.disarmed && d.alreadyGone) {
+      // Gone before we disabled it, so not our doing: the on-event probably ran
+      // (or someone removed it by hand). Its restore steps may be mid-way, so
+      // they are left where they are and the change is not reported as kept.
+      holdFor = LOCK_AFTER_FIRE_SEC;
+      await setGuardStatus(guardId, 'uncertain', `The revert may already have fired (${d.reason}); the device may have restored its previous configuration`);
+      return {
+        result: result as T, confirmed: false, autoReverting: true, revertMayHaveFired: true, guardId,
+        revertMayFireAt: fireAt.toISOString(), mode, modeNote, timings,
+      };
+    }
+    if (!d.disarmed) {
+      holdFor = secondsUntilFire() + LOCK_AFTER_FIRE_SEC;
+      await setGuardStatus(guardId, 'uncertain', `Applied and reachable, but the revert could not be confirmed disarmed: ${d.reason}`);
+      return {
+        result: result as T, confirmed: true, autoReverting: false, guardId,
+        revertMayFireAt: fireAt.toISOString(), mode, modeNote, timings,
+      };
+    }
     await setGuardStatus(guardId, 'committed');
     // Reaching here means applyFn returned normally, so `result` is assigned; the
     // optional type only exists for the severed-connection path above.
-    return { result: result as T, confirmed: true, autoReverting: false, guardId };
+    return { result: result as T, confirmed: true, autoReverting: false, guardId, mode, modeNote, timings };
   } finally {
     if (armed) await setGuardStatus(guardId, 'pending');
     client.disconnect();
-    await releaseLock(device.id);
+    if (holdFor > 0) await holdLock(device.id, holdFor);
+    else await releaseLock(device.id);
   }
 }
 
-/** Disarm: remove the scheduler, then the restore point. Uses a fresh connection if needed. */
-async function cleanup(
-  client: RouterOSClient, restorePoint: string, schedulerName: string, mode: GuardMode
-): Promise<void> {
-  if (!client.isConnected()) await client.connect();
-  const scheds = await client.execute('/system/scheduler/print').catch(() => []);
-  for (const s of scheds) {
-    if (s['name'] === schedulerName && s['.id']) {
-      await client.execute('/system/scheduler/remove', { '.id': s['.id'] });
+/** How long past a revert's fire time the device stays locked (restore + reboot). */
+const LOCK_AFTER_FIRE_SEC = 180;
+const DISARM_ATTEMPTS = 3;
+const DISARM_CUTOFF_MS = 3_000;
+
+/**
+ * Disarm: disable the scheduler and see it disabled, remove it, prove it is
+ * gone, then remove the restore point.
+ *
+ * Every attempt uses a fresh connection (the change may have left the old one
+ * poisoned), and a failed read is a failure, not an empty list. The restore
+ * point is only deleted once the scheduler is proven gone, so a revert that
+ * does fire still has something to restore.
+ */
+async function disarm(
+  device: GuardDevice, restorePoint: string, schedulerName: string, mode: GuardMode,
+  opts: { requirePresent?: boolean; fireAtMs?: number } = {}
+): Promise<{ disarmed: boolean; reason?: string; alreadyGone?: boolean }> {
+  let reason = 'unknown';
+  /**
+   * The scheduler was seen disabled before the cutoff. A disabled scheduler
+   * never runs its on-event, so from then on an absent one is our own removal
+   * (its reply lost), never the revert.
+   */
+  let disabledConfirmed = false;
+  /** Past this, a disable can no longer be told apart from one the revert beat. */
+  const cutoff = opts.fireAtMs !== undefined ? opts.fireAtMs - DISARM_CUTOFF_MS : Infinity;
+  for (let attempt = 0; attempt < DISARM_ATTEMPTS; attempt++) {
+    if (Date.now() >= cutoff && !disabledConfirmed) {
+      return { disarmed: false, reason: 'the revert timer was about to fire, so the disarm was abandoned' };
     }
-  }
-  const wanted = mode === 'binary' ? `${restorePoint}.backup` : `${restorePoint}.rsc`;
-  const files = await client.execute('/file/print').catch(() => []);
-  for (const f of files) {
-    if ((f['name'] === wanted || f['name'] === restorePoint) && f['.id']) {
-      await client.execute('/file/remove', { '.id': f['.id'] }).catch(() => {});
+    const client = newClient(device, VERIFY_CONNECT_TIMEOUT_MS);
+    try {
+      await client.connect();
+      const find = async () => (await client.execute('/system/scheduler/print'))
+        .filter((s) => s['name'] === schedulerName && s['.id']);
+      let present = await find();
+      if (opts.requirePresent && !disabledConfirmed) {
+        // After a commit attempt the scheduler must still be there. The revert's
+        // on-event removes it before restoring (script mode) or loads a backup
+        // that predates it (binary), so an absent one means it may have fired,
+        // or someone removed it by hand. Its restore steps may be mid-way.
+        if (present.length === 0) {
+          return {
+            disarmed: false, alreadyGone: true,
+            reason: 'the revert scheduler was gone before it could be disabled',
+          };
+        }
+        // Disable first, then remove. A lost reply on a bare remove left a
+        // retry unable to tell our removal from the revert's own; a disabled
+        // scheduler stays visible and cannot fire, so the retry can.
+        const live = present.filter((s) => s['disabled'] !== 'true');
+        if (live.length > 0) {
+          for (const s of live) {
+            await client.execute('/system/scheduler/set', { '.id': s['.id'], disabled: 'yes' });
+          }
+          present = await find();
+          if (present.length === 0) {
+            return {
+              disarmed: false, alreadyGone: true,
+              reason: 'the revert scheduler disappeared while it was being disabled',
+            };
+          }
+          if (present.some((s) => s['disabled'] !== 'true')) {
+            reason = 'the scheduler was still enabled after disabling it';
+            continue;
+          }
+        }
+        // Seen disabled only after the cutoff: the disable may have landed after
+        // the on-event began (binary mode loads the backup without removing the
+        // scheduler first). Keep the restore point.
+        if (Date.now() >= cutoff) {
+          return { disarmed: false, reason: 'the scheduler was disabled too close to its fire time to prove it had not started' };
+        }
+        disabledConfirmed = true;
+      }
+      for (const s of present) {
+        await client.execute('/system/scheduler/remove', { '.id': s['.id'] });
+      }
+      const after = await client.execute('/system/scheduler/print');
+      if (after.some((s) => s['name'] === schedulerName)) {
+        reason = 'the scheduler was still present after removing it';
+        continue;
+      }
+
+      if (mode === 'binary') {
+        const wanted = `${restorePoint}.backup`;
+        const files = await client.execute('/file/print').catch(() => [] as Record<string, string>[]);
+        for (const f of files) {
+          if ((f['name'] === wanted || f['name'] === restorePoint) && f['.id']) {
+            await client.execute('/file/remove', { '.id': f['.id'] }).catch(() => {});
+          }
+        }
+      } else {
+        // The restore steps (`<scheduler>-1`, `-2`, …).
+        const scripts = await client.execute('/system/script/print').catch(() => [] as Record<string, string>[]);
+        for (const sc of scripts) {
+          if ((sc['name'] ?? '').startsWith(`${schedulerName}-`) && sc['.id']) {
+            await client.execute('/system/script/remove', { '.id': sc['.id'] }).catch(() => {});
+          }
+        }
+      }
+      return { disarmed: true };
+    } catch (err) {
+      reason = (err as Error).message;
+    } finally {
+      client.disconnect();
     }
+    if (attempt < DISARM_ATTEMPTS - 1) await new Promise((r) => setTimeout(r, 2_000));
   }
+  return { disarmed: false, reason };
 }
 
 /**

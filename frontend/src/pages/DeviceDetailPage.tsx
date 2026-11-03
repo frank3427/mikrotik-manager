@@ -1,12 +1,15 @@
 import { useState } from 'react';
-import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  ArrowLeft, RefreshCw, Activity, Cpu, MemoryStick, Clock, ExternalLink, TerminalSquare, ShieldCheck,
+  ArrowLeft, RefreshCw, Activity, Cpu, MemoryStick, Clock, ExternalLink, TerminalSquare, ShieldCheck, Copy, Check, GitBranch,
 } from 'lucide-react';
+import { hostPort, winboxAddress } from '../utils/deviceAddress';
 import { devicesApi, metricsApi } from '../services/api';
 import { useCanWrite } from '../hooks/useCanWrite';
+import { invalidateDevice } from '../utils/invalidateDevice';
 import SwitchPortDiagram from '../components/ports/SwitchPortDiagram';
+import DeviceTagPicker from '../components/devices/DeviceTagPicker';
 import TerminalModal from '../components/TerminalModal';
 import DeviceLocationSection from '../components/device-detail/DeviceLocationSection';
 import VlansTab from '../components/device-detail/VlansTab';
@@ -22,8 +25,15 @@ import ConnectionsTab from '../components/device-detail/ConnectionsTab';
 import QueuesTab from '../components/device-detail/QueuesTab';
 import SecurityTab from '../components/device-detail/SecurityTab';
 import clsx from 'clsx';
+import { displayState, STATE_LABEL } from '../utils/deviceState';
+import DeviceHealthCard from '../components/device-detail/DeviceHealthCard';
+import BridgesTab from '../components/device-detail/BridgesTab';
+import PollingNote from '../components/device-detail/PollingNote';
+import { DeviceIdentityBanner } from '../components/security/IdentityChange';
+import { isWirelessDevice } from '../utils/wireless';
+import SshOnlyBanner from '../components/device-detail/SshOnlyBanner';
 
-type TabKey = 'overview' | 'ports' | 'vlans' | 'routing' | 'firewall' | 'security' | 'queues' | 'connections' | 'config' | 'config-history' | 'hardware' | 'tools' | 'radios' | 'lte';
+type TabKey = 'overview' | 'ports' | 'bridges' | 'vlans' | 'routing' | 'firewall' | 'security' | 'queues' | 'connections' | 'config' | 'config-history' | 'hardware' | 'tools' | 'radios' | 'lte';
 
 function formatUptime(raw: string): string {
   if (!raw) return '—';
@@ -51,11 +61,15 @@ export default function DeviceDetailPage() {
   const queryClient = useQueryClient();
   const canWrite = useCanWrite();
   const [searchParams] = useSearchParams();
-  const VALID_TABS: TabKey[] = ['overview', 'ports', 'vlans', 'routing', 'firewall', 'security', 'queues', 'connections', 'config', 'config-history', 'hardware', 'tools', 'radios', 'lte'];
+  const VALID_TABS: TabKey[] = ['overview', 'ports', 'bridges', 'vlans', 'routing', 'firewall', 'security', 'queues', 'connections', 'config', 'config-history', 'hardware', 'tools', 'radios', 'lte'];
   const requestedTab = searchParams.get('tab') as TabKey | null;
   const [activeTab, setActiveTab] = useState<TabKey>(requestedTab && VALID_TABS.includes(requestedTab) ? requestedTab : 'overview');
   const [autoOpenBridge, setAutoOpenBridge] = useState<string | null>(null);
   const [showTerminal, setShowTerminal] = useState(false);
+  const [addrCopied, setAddrCopied] = useState(false);
+  // Why Web Admin couldn't open, or a caveat about where it went (#335).
+  const [webNote, setWebNote] = useState<string | null>(null);
+  const [syncNote, setSyncNote] = useState<{ ok: boolean; text: string } | null>(null);
 
   const deviceId = parseInt(id!);
 
@@ -69,7 +83,8 @@ export default function DeviceDetailPage() {
     queryKey: ['device-resources-live', deviceId],
     queryFn: () => devicesApi.getResources(deviceId).then((r) => r.data),
     refetchInterval: 30_000,
-    enabled: device?.status === 'online',
+    // Read over the API, which an SSH-only device doesn't have yet (#174).
+    enabled: device?.status === 'online' && !device?.ssh_only,
   });
 
   const { data: availability } = useQuery({
@@ -78,12 +93,28 @@ export default function DeviceDetailPage() {
     refetchInterval: 60_000,
   });
 
-  const syncMutation = useMutation({
-    mutationFn: () => devicesApi.sync(deviceId),
+  // "Use this name": take the router's identity and follow it from now on (#253).
+  const adoptIdentity = useMutation({
+    meta: { inlineError: true },
+    mutationFn: () => devicesApi.update(deviceId, { unlock_name: true }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['device', deviceId] });
-      queryClient.invalidateQueries({ queryKey: ['interfaces', deviceId] });
+      queryClient.invalidateQueries({ queryKey: ['devices'] });
     },
+  });
+
+  // Sync reads everything from the device, then every tab reloads what it shows:
+  // it used to refresh only the header and interfaces, so a tab such as VLANs
+  // kept its old content after a sync.
+  const syncMutation = useMutation({
+    meta: { inlineError: true },
+    mutationFn: () => devicesApi.sync(deviceId),
+    onSuccess: () => {
+      setSyncNote({ ok: true, text: 'Synced' });
+      window.setTimeout(() => setSyncNote((n) => (n?.ok ? null : n)), 5_000);
+      void invalidateDevice(queryClient, deviceId);
+    },
+    onError: (e: unknown) => setSyncNote({ ok: false, text: (e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Sync failed' }),
   });
 
   if (isLoading) {
@@ -105,15 +136,41 @@ export default function DeviceDetailPage() {
     );
   }
 
+  // Web Admin opens where WebFig actually answers: HTTPS when www-ssl is on,
+  // each on its configured port (#335). The tab is opened before the lookup so
+  // the popup blocker sees a click, and its opener is cut before it navigates.
+  async function openWebAdmin() {
+    if (!device) return;
+    setWebNote(null);
+    // An IPv6 literal needs brackets in a URL (addresses can be IPv6 since #170).
+    const host = device.ip_address.includes(':') ? `[${device.ip_address}]` : device.ip_address;
+    const fallback = `http://${host}/`;
+    const tab = window.open('about:blank', '_blank');
+    if (tab) tab.opener = null;
+    const go = (url: string) => {
+      if (tab) tab.location.href = url;
+      else window.open(url, '_blank', 'noopener,noreferrer');
+    };
+    try {
+      const { data } = await devicesApi.getWebAdmin(deviceId);
+      setWebNote(data.note);
+      if (data.url) go(data.url);
+      else tab?.close();
+    } catch {
+      // The device didn't answer the API; the old guess is better than nothing.
+      go(fallback);
+    }
+  }
+
   // Show the Radios tab when the device actually has radios, not when someone
   // tagged it "wireless_ap". A router can carry radios, and a CAPsMAN controller is
   // normally tagged a router — both had no way to reach this tab (#94).
-  const isWirelessAP = device.device_type === 'wireless_ap'
-    || (device.wifi_role != null && device.wifi_role !== 'none');
+  const isWirelessAP = isWirelessDevice(device);
 
-  const tabs: { key: TabKey; label: string }[] = [
+  const allTabs: { key: TabKey; label: string }[] = [
     { key: 'overview', label: 'Overview' },
     { key: 'ports', label: 'Ports' },
+    { key: 'bridges', label: 'Bridges' },
     { key: 'vlans', label: 'VLANs' },
     { key: 'routing', label: 'Routing' },
     { key: 'firewall', label: 'Firewall' },
@@ -132,6 +189,10 @@ export default function DeviceDetailPage() {
     ...(device.has_lte ? [{ key: 'lte' as TabKey, label: 'LTE' }] : []),
     { key: 'tools', label: 'Tools' },
   ];
+  // Added over SSH only (#174): only what works without the API.
+  const tabs = allTabs.filter((t) => !device.ssh_only || t.key === 'overview' || t.key === 'config-history');
+  // A tab that isn't offered (an SSH-only device, or a link to one) shows the overview.
+  const shownTab: TabKey = tabs.some((t) => t.key === activeTab) ? activeTab : 'overview';
 
   const cpuLoad = parseInt(resources?.['cpu-load'] || '0', 10);
   const memTotal = parseInt(resources?.['total-memory'] || '0', 10);
@@ -154,27 +215,47 @@ export default function DeviceDetailPage() {
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-bold text-gray-900 dark:text-white">{device.name}</h1>
-              <span
-                className={clsx(
-                  'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium flex-shrink-0',
-                  device.status === 'online' && 'status-online',
-                  device.status === 'offline' && 'status-offline',
-                  device.status === 'unknown' && 'status-unknown'
-                )}
-              >
-                <span
-                  className={clsx(
-                    'w-1.5 h-1.5 rounded-full',
-                    device.status === 'online' && 'bg-green-500 animate-pulse',
-                    device.status === 'offline' && 'bg-red-500',
-                    device.status === 'unknown' && 'bg-gray-400'
-                  )}
-                />
-                {device.status}
-              </span>
+              <DeviceTagPicker deviceId={deviceId} />
+              {(() => {
+                const st = displayState(device);
+                return (
+                  <span
+                    className={clsx(
+                      'inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium flex-shrink-0',
+                      st === 'online' && 'status-online',
+                      st === 'degraded' && 'status-degraded',
+                      st === 'offline' && 'status-offline',
+                      (st === 'unknown' || st === 'expected-offline') && 'status-unknown'
+                    )}
+                  >
+                    <span
+                      className={clsx(
+                        'w-1.5 h-1.5 rounded-full',
+                        st === 'online' && 'bg-green-500 animate-pulse',
+                        st === 'degraded' && 'bg-amber-500 animate-pulse',
+                        st === 'offline' && 'bg-red-500',
+                        (st === 'unknown' || st === 'expected-offline') && 'bg-gray-400'
+                      )}
+                    />
+                    {STATE_LABEL[st]}
+                  </span>
+                );
+              })()}
+              {device.user_manager && (
+                <Link to={`/user-manager?device=${device.id}`} title="This device runs User Manager (RADIUS)"
+                  className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300 hover:underline">
+                  User Manager
+                </Link>
+              )}
             </div>
             <p className="text-sm text-gray-500 dark:text-slate-400 font-mono truncate">
-              {device.ip_address}:{device.api_port}
+              {/* An SSH-only device is reached on its SSH port (#174). */}
+              {device.ssh_only ? `${hostPort(device.ip_address, device.ssh_port ?? 22)} (SSH)` : hostPort(device.ip_address, device.api_port)}
+              <button type="button" title="Copy the address for Winbox" aria-label="Copy the address for Winbox"
+                onClick={() => { void navigator.clipboard.writeText(winboxAddress(device.ip_address)).then(() => { setAddrCopied(true); setTimeout(() => setAddrCopied(false), 1500); }); }}
+                className="inline-flex align-middle ml-1.5 p-0.5 rounded text-gray-400 hover:text-blue-600 dark:hover:text-blue-400">
+                {addrCopied ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
+              </button>
               {device.model && ` · ${device.model}`}
               {device.ros_version && ` · ROS ${device.ros_version}`}
             </p>
@@ -182,13 +263,25 @@ export default function DeviceDetailPage() {
         </div>
         <div className="flex items-center gap-2 flex-wrap sm:ml-auto sm:flex-shrink-0">
           <button
-            onClick={() => window.open(`http://${device.ip_address}/`, '_blank', 'noopener,noreferrer')}
+            onClick={() => void openWebAdmin()}
             className="btn-secondary flex items-center gap-2 text-sm"
             title="Open device web interface"
           >
             <ExternalLink className="w-4 h-4" />
             <span className="hidden sm:inline">Web Admin</span>
           </button>
+          {webNote && (
+            <span className="text-xs text-amber-600 dark:text-amber-400 max-w-xs" role="status">{webNote}</span>
+          )}
+          {/* This device's part of the map (#305). */}
+          <Link
+            to={`/topology?device=${device.id}`}
+            className="btn-secondary flex items-center gap-2 text-sm"
+            title="Show this device and its neighbours on the topology map"
+          >
+            <GitBranch className="w-4 h-4" />
+            <span className="hidden sm:inline">Topology</span>
+          </Link>
           {canWrite && (
             <button
               onClick={() => setShowTerminal(true)}
@@ -201,16 +294,26 @@ export default function DeviceDetailPage() {
           )}
           {canWrite && (
             <button
-              onClick={() => syncMutation.mutate()}
+              onClick={() => { setSyncNote(null); syncMutation.mutate(); }}
               disabled={syncMutation.isPending}
               className="btn-secondary flex items-center gap-2 text-sm"
+              title="Read everything from the device now"
             >
               <RefreshCw className={clsx('w-4 h-4', syncMutation.isPending && 'animate-spin')} />
-              <span className="hidden sm:inline">Sync</span>
+              <span className="hidden sm:inline">{syncMutation.isPending ? 'Syncing…' : 'Sync'}</span>
             </button>
+          )}
+          {syncNote && !syncMutation.isPending && (
+            <span role="status" className={clsx('text-xs max-w-xs', syncNote.ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400')}>
+              {syncNote.text}
+            </span>
           )}
         </div>
       </div>
+
+      {/* A changed certificate or host key stops the manager connecting (P1-4). */}
+      <DeviceIdentityBanner deviceId={deviceId} deviceName={device.name} />
+      {device.ssh_only && <SshOnlyBanner device={device} />}
 
       {/* Tabs */}
       <div className="flex gap-1 border-b border-gray-200 dark:border-slate-700 overflow-x-auto">
@@ -220,7 +323,7 @@ export default function DeviceDetailPage() {
             onClick={() => setActiveTab(tab.key)}
             className={clsx(
               'px-4 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px whitespace-nowrap',
-              activeTab === tab.key
+              shownTab === tab.key
                 ? 'border-blue-600 text-blue-600 dark:text-blue-400'
                 : 'border-transparent text-gray-500 dark:text-slate-400 hover:text-gray-700 dark:hover:text-slate-300'
             )}
@@ -231,9 +334,10 @@ export default function DeviceDetailPage() {
       </div>
 
       {/* Tab content */}
-      {activeTab === 'overview' && (
+      {shownTab === 'overview' && (
         <div className="space-y-4">
-          {/* Resource stats */}
+          {/* Resource stats (read over the API; none for an SSH-only device, #174) */}
+          {!device.ssh_only && (
           <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div className="card p-4">
               <div className="flex items-center gap-2 mb-2">
@@ -279,6 +383,12 @@ export default function DeviceDetailPage() {
               <div className="text-xl font-bold text-gray-900 dark:text-white truncate">
                 {resources ? formatUptime(resources['uptime'] || '') : '—'}
               </div>
+              {/* Time since it last booted, not availability (#326). */}
+              {device.boot_at && (
+                <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5" title="Worked out from the device's uptime counter">
+                  since {new Date(device.boot_at).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}
+                </div>
+              )}
             </div>
 
             <div className="card p-4">
@@ -294,6 +404,7 @@ export default function DeviceDetailPage() {
               </div>
             </div>
           </div>
+          )}
 
           {/* Availability card */}
           <div className="card p-4">
@@ -310,11 +421,16 @@ export default function DeviceDetailPage() {
                   )}>
                     {availability.uptimePct.toFixed(2)}%
                   </div>
-                  <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">Uptime</div>
+                  <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5" title="Share of the last 30 days the manager could reach this device">Availability</div>
                 </div>
                 <div>
                   <div className="text-2xl font-bold text-gray-900 dark:text-white">{availability.totalOutages}</div>
                   <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">Outages</div>
+                </div>
+                {/* Reboots, seen from the uptime counter: one quicker than a poll never shows as an outage (#326). */}
+                <div title={device.last_reboot_at ? `Last: ${new Date(device.last_reboot_at).toLocaleString()}` : 'Counted from the device’s uptime, including reboots too quick to show as outages'}>
+                  <div className="text-2xl font-bold text-gray-900 dark:text-white">{device.reboots_30d ?? 0}</div>
+                  <div className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">Reboots</div>
                 </div>
                 {availability.longestOutageSec > 0 && (
                   <div>
@@ -351,18 +467,37 @@ export default function DeviceDetailPage() {
               System Information
             </h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
-              {[
-                ['Name', device.name],
+              <div className="flex justify-between py-1 border-b border-gray-100 dark:border-slate-700">
+                <span className="text-gray-500 dark:text-slate-400" title="The name shown in the manager">Name</span>
+                <span className="font-medium text-gray-900 dark:text-white text-right">{device.name}</span>
+              </div>
+              {/* The router's own name, when it differs from the manager's (#253). */}
+              {device.ros_identity && device.ros_identity.trim() !== device.name.trim() && (
+                <div className="flex justify-between items-center gap-2 py-1 border-b border-gray-100 dark:border-slate-700">
+                  <span className="text-gray-500 dark:text-slate-400" title="The name set on the router itself (/system identity)">Identity on the router</span>
+                  <span className="flex items-center gap-2 min-w-0">
+                    <span className="font-medium text-gray-900 dark:text-white truncate">{device.ros_identity}</span>
+                    {canWrite && (
+                      <button type="button" disabled={adoptIdentity.isPending} onClick={() => adoptIdentity.mutate()}
+                        title="Show the router's own name here, and follow it if it changes"
+                        className="text-xs text-blue-600 dark:text-blue-400 hover:underline flex-shrink-0 disabled:opacity-50">
+                        {adoptIdentity.isPending ? 'Switching…' : 'Use this name'}
+                      </button>
+                    )}
+                  </span>
+                </div>
+              )}
+              {([
                 ['IP Address', device.ip_address],
                 ['Model', device.model || '—'],
                 ['Serial Number', device.serial_number || '—'],
                 ['RouterOS Version', device.ros_version || '—'],
                 ['Firmware', device.firmware_version || '—'],
                 ['Type', device.device_type],
-                ['API Port', String(device.api_port)],
+                ['API Port', device.ssh_only ? 'Not enabled yet' : String(device.api_port)],
                 ['Added', new Date(device.created_at).toLocaleDateString()],
                 ['Last Seen', device.last_seen ? new Date(device.last_seen).toLocaleString() : '—'],
-              ].map(([k, v]) => (
+              ] as [string, string][]).map(([k, v]) => (
                 <div key={k} className="flex justify-between py-1 border-b border-gray-100 dark:border-slate-700">
                   <span className="text-gray-500 dark:text-slate-400">{k}</span>
                   <span className="font-medium text-gray-900 dark:text-white text-right">{v}</span>
@@ -371,20 +506,27 @@ export default function DeviceDetailPage() {
             </div>
           </div>
 
+          {/* Hardware health and intermittent setting (#168) */}
+          <DeviceHealthCard device={device} />
+
           {/* Physical location, rack & notes */}
           <DeviceLocationSection device={device} />
+
+          {/* Polling and backup settings in force, and where each comes from (#261) */}
+          <PollingNote deviceId={deviceId} siteId={device.site_id ?? null} />
         </div>
       )}
 
-      {activeTab === 'ports' && (
+      {shownTab === 'ports' && (
         <SwitchPortDiagram
           deviceId={deviceId}
           deviceName={device?.name}
+          deviceModel={device?.model}
           autoOpenBridge={autoOpenBridge ?? undefined}
           onBridgeOpened={() => setAutoOpenBridge(null)}
         />
       )}
-      {activeTab === 'vlans' && (
+      {shownTab === 'vlans' && (
         <VlansTab
           deviceId={deviceId}
           deviceName={device?.name}
@@ -392,17 +534,21 @@ export default function DeviceDetailPage() {
           onGoToPorts={(bridgeName) => { setAutoOpenBridge(bridgeName); setActiveTab('ports'); }}
         />
       )}
-      {activeTab === 'routing' && <RoutingTab deviceId={deviceId} deviceName={device.name} />}
-      {activeTab === 'firewall' && <FirewallTab deviceId={deviceId} />}
-      {activeTab === 'security' && <SecurityTab deviceId={deviceId} deviceName={device.name} />}
-      {activeTab === 'queues' && <QueuesTab deviceId={deviceId} />}
-      {activeTab === 'connections' && <ConnectionsTab deviceId={deviceId} />}
-      {activeTab === 'config' && <SystemConfigTab deviceId={deviceId} device={device} />}
-      {activeTab === 'config-history' && <ConfigHistoryTab deviceId={deviceId} />}
-      {activeTab === 'hardware' && <HardwareTab deviceId={deviceId} />}
-      {activeTab === 'radios' && <RadiosTab deviceId={deviceId} deviceStatus={device.status} />}
-      {activeTab === 'lte' && <LteTab deviceId={deviceId} />}
-      {activeTab === 'tools' && <ToolsTab deviceId={deviceId} />}
+      {shownTab === 'bridges' && (
+        <BridgesTab deviceId={deviceId} deviceName={device.name}
+          onGoToPorts={(bridgeName) => { if (bridgeName) setAutoOpenBridge(bridgeName); setActiveTab('ports'); }} />
+      )}
+      {shownTab === 'routing' && <RoutingTab deviceId={deviceId} deviceName={device.name} />}
+      {shownTab === 'firewall' && <FirewallTab deviceId={deviceId} deviceName={device.name} />}
+      {shownTab === 'security' && <SecurityTab deviceId={deviceId} deviceName={device.name} />}
+      {shownTab === 'queues' && <QueuesTab deviceId={deviceId} />}
+      {shownTab === 'connections' && <ConnectionsTab deviceId={deviceId} />}
+      {shownTab === 'config' && <SystemConfigTab deviceId={deviceId} device={device} />}
+      {shownTab === 'config-history' && <ConfigHistoryTab deviceId={deviceId} />}
+      {shownTab === 'hardware' && <HardwareTab deviceId={deviceId} />}
+      {shownTab === 'radios' && <RadiosTab deviceId={deviceId} deviceStatus={device.status} />}
+      {shownTab === 'lte' && <LteTab deviceId={deviceId} />}
+      {shownTab === 'tools' && <ToolsTab deviceId={deviceId} />}
 
       {showTerminal && (
         <TerminalModal

@@ -5,21 +5,25 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
 import {
-  Users, AlertTriangle, Wifi, MapPin, ArrowUpCircle, Cpu, X,
+  AlertTriangle, Wifi, MapPin, ArrowUpCircle, Cpu, X,
   RefreshCw, Terminal, HardDrive, GitBranch, Activity,
-  Shield, Clock, FileText, Bell, ChevronRight, CheckCircle2,
-} from 'lucide-react';
+  Shield, Clock, FileText, Bell, ChevronRight, } from 'lucide-react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { metricsApi, eventsApi, devicesApi, clientsApi, trafficApi, operationsApi, topologyApi, systemApi } from '../services/api';
+import { metricsApi, eventsApi, devicesApi, clientsApi, trafficApi, operationsApi, topologyApi, systemApi, settingsApi} from '../services/api';
 import type { OpsAttentionItem, OpsCapacityRow, OpsActivityItem } from '../services/api';
 import TerminalModal from '../components/TerminalModal';
+import ProxyUsageCard from '../components/ProxyUsageCard';
 import { useSocket } from '../hooks/useSocket';
 import { useCanWrite } from '../hooks/useCanWrite';
 import { useQueryClient, useMutation } from '@tanstack/react-query';
 import { format, formatDistanceToNow } from 'date-fns';
 import type { Device, DeviceEvent } from '../types';
-import clsx from 'clsx';
+import { fleetStatus } from '../utils/fleetStatus';
+import { escapeHtml } from '../utils/escapeHtml';
+import DeviceTypePill from '../components/devices/DeviceTypePill';
+import { byAttention, CARD_ROWS } from '../utils/deviceCards';
+import { filterDevices } from '../utils/devicePicker';
 
 // ─── Primitives ───────────────────────────────────────────────────────────────
 
@@ -59,30 +63,15 @@ function Sparkline({ data, w = 120, h = 24, color = 'var(--accent)', area = true
   );
 }
 
-function TypePill({ type }: { type: string }) {
-  const map: Record<string, { label: string; color: string }> = {
-    wireless_ap: { label: 'AP',  color: 'var(--info)' },
-    switch:      { label: 'SW',  color: 'var(--accent)' },
-    router:      { label: 'RTR', color: 'var(--violet)' },
-  };
-  const { label, color } = map[type] ?? { label: type.slice(0, 3).toUpperCase(), color: 'var(--ink-3)' };
-  return (
-    <span
-      className="mono text-[10.5px] font-medium px-[6px] py-[2px] rounded-full"
-      style={{ color, border: '1px solid var(--line)' }}
-    >
-      {label}
-    </span>
-  );
-}
 
 // ─── Device Locations Map ─────────────────────────────────────────────────────
 
+
 function DeviceLocationsMap({ devices }: { devices: Device[] }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Devices without their own location sit at their site's (#167).
   const mapped = useMemo(() =>
-    devices.filter(d => d.location_lat != null && d.location_lng != null &&
-      !isNaN(Number(d.location_lat)) && !isNaN(Number(d.location_lng))),
+    devices.filter(d => d.effective_location?.lat != null && d.effective_location?.lng != null),
     [devices]
   );
 
@@ -95,29 +84,29 @@ function DeviceLocationsMap({ devices }: { devices: Device[] }) {
 
     const groups = new Map<string, Device[]>();
     for (const d of mapped) {
-      const key = `${Number(d.location_lat).toFixed(6)},${Number(d.location_lng).toFixed(6)}`;
+      const key = `${Number(d.effective_location!.lat).toFixed(6)},${Number(d.effective_location!.lng).toFixed(6)}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key)!.push(d);
     }
 
     const markers: L.Layer[] = [];
     groups.forEach((groupDevices) => {
-      const lat = Number(groupDevices[0].location_lat);
-      const lng = Number(groupDevices[0].location_lng);
+      const lat = Number(groupDevices[0].effective_location!.lat);
+      const lng = Number(groupDevices[0].effective_location!.lng);
       const count = groupDevices.length;
       const hasOffline = groupDevices.some(d => d.status === 'offline');
-      const color = hasOffline ? 'var(--bad)' : 'var(--accent)';
       const colorHex = hasOffline ? '#f08a8a' : '#c1f17e';
 
       const deviceRows = groupDevices.map(d => {
         const c = d.status === 'online' ? '#8de08a' : '#f08a8a';
-        return `<b>${d.name}</b>&nbsp;<span style="color:${c};font-size:11px">● ${d.status}</span>`;
+        return `<b>${escapeHtml(d.name)}</b>&nbsp;<span style="color:${c};font-size:11px">● ${escapeHtml(d.status)}</span>`;
       }).join('<br/>');
-      const address = groupDevices[0].location_address
-        ? `<br/><span style="color:#8a877e;font-size:11px">${groupDevices[0].location_address}</span>`
+      const addr = groupDevices[0].effective_location?.address;
+      const address = addr
+        ? `<br/><span style="color:#8a877e;font-size:11px">${escapeHtml(addr)}</span>`
         : '';
       const tooltipHtml = groupDevices.map(d =>
-        `${d.status === 'online' ? '●' : '○'} ${d.name}`
+        `${d.status === 'online' ? '●' : '○'} ${escapeHtml(d.name)}`
       ).join('<br/>');
 
       let marker: L.Layer;
@@ -140,7 +129,7 @@ function DeviceLocationsMap({ devices }: { devices: Device[] }) {
     });
 
     if (markers.length === 1) {
-      map.setView([Number(mapped[0].location_lat), Number(mapped[0].location_lng)], 13);
+      map.setView([Number(mapped[0].effective_location!.lat), Number(mapped[0].effective_location!.lng)], 13);
     } else {
       map.fitBounds(L.featureGroup(markers).getBounds(), { padding: [40, 40] });
     }
@@ -150,7 +139,7 @@ function DeviceLocationsMap({ devices }: { devices: Device[] }) {
   if (mapped.length === 0) {
     return (
       <div className="flex items-center justify-center text-sm" style={{ height: 220, color: 'var(--ink-4)' }}>
-        No device locations configured — add addresses via Device › Overview › Physical Details
+        No locations yet. Add an address to a site, or to a device under Overview › Physical Details
       </div>
     );
   }
@@ -160,14 +149,16 @@ function DeviceLocationsMap({ devices }: { devices: Device[] }) {
 // ─── Health Bar ───────────────────────────────────────────────────────────────
 
 function HealthBar({
-  summary, devices, wirelessCount, clientSparkline,
+  summary, wirelessCount, clientSparkline,
 }: {
-  summary: { devices: { total: number; online: number; offline: number }; clients: { active: number; total: number }; alerts: { critical: number; warning: number }; availability?: { fleetUptimePct30d: number } } | undefined;
-  devices: Device[];
+  summary: { devices: { total: number; online: number; offline: number }; clients: { active: number; total: number }; alerts: { critical: number; warning: number }; availability?: { fleetUptimePct30d: number; reboots30d?: number } } | undefined;
   wirelessCount: number;
   clientSparkline: number[];
 }) {
-  const allOnline = (summary?.devices.offline ?? 0) === 0 && (summary?.devices.total ?? 0) > 0;
+  const navigate = useNavigate();
+  const status = fleetStatus(summary?.devices);
+  const alertsHref = (summary?.alerts.critical ?? 0) > 0 ? '/events?severity=error'
+    : (summary?.alerts.warning ?? 0) > 0 ? '/events?severity=warning' : null;
   const reachFraction = summary?.devices.total
     ? (summary.devices.online / summary.devices.total)
     : 1;
@@ -182,17 +173,30 @@ function HealthBar({
             style={{ background: 'var(--accent-soft)' }}
           >
             <StatusDot
-              color={allOnline ? 'var(--accent)' : 'var(--warn)'}
+              color={status.tone === 'good' ? 'var(--accent)'
+                   : status.tone === 'warn' ? 'var(--warn)' : 'var(--ink-4)'}
               glow size={10}
             />
           </div>
           <div>
             <div className="text-[14px] font-semibold" style={{ color: 'var(--ink)' }}>
-              {allOnline ? 'All systems nominal' : `${summary?.devices.offline ?? 0} device(s) unreachable`}
+              {status.headline}
             </div>
             <div className="text-[12px]" style={{ color: 'var(--ink-3)' }}>
               {summary?.devices.online ?? 0} of {summary?.devices.total ?? 0} reachable
-              {(summary?.alerts.critical ?? 0) > 0 && ` · ${summary!.alerts.critical} critical alert`}
+              {(summary?.alerts.critical ?? 0) > 0 && (
+                <>
+                  {' · '}
+                  <button
+                    type="button"
+                    className="underline hover:no-underline"
+                    onClick={() => navigate('/events?severity=error')}
+                    title="Show the error events from the last 24 hours"
+                  >
+                    {summary!.alerts.critical} critical alert{summary!.alerts.critical === 1 ? '' : 's'}
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -237,19 +241,36 @@ function HealthBar({
               : 'none',
             spark: [] as number[],
             color: (summary?.alerts.critical ?? 0) > 0 ? 'var(--bad)' : 'var(--ink-3)',
+            href: alertsHref,
           },
           {
-            label: 'Uptime 30d',
+            // Availability, not time since boot (#326), with the reboots the
+            // polls were too slow to see as outages.
+            label: 'Availability 30d',
+            title: 'Share of the last 30 days the manager could reach your devices. A device’s Uptime is time since it last booted.',
             value: summary?.availability != null
               ? `${summary.availability.fleetUptimePct30d.toFixed(1)}%`
               : '—',
+            sub: (summary?.availability?.reboots30d ?? 0) > 0
+              ? `${summary!.availability!.reboots30d} reboot${summary!.availability!.reboots30d === 1 ? '' : 's'}`
+              : undefined,
             spark: [] as number[],
             color: (summary?.availability?.fleetUptimePct30d ?? 100) >= 99 ? 'var(--accent)' : (summary?.availability?.fleetUptimePct30d ?? 100) >= 95 ? 'var(--warn)' : 'var(--bad)',
           },
-        ].map(({ label, value, spark, color }) => (
-          <div key={label} style={{ minWidth: 110, paddingLeft: 20, borderLeft: '1px solid var(--line)' }}>
+        ].map(({ label, value, spark, color, title, sub, href }: { label: string; value: string; spark: number[]; color: string; title?: string; sub?: string; href?: string | null }) => (
+          <div
+            key={label}
+            role={href ? 'link' : undefined}
+            tabIndex={href ? 0 : undefined}
+            title={title ?? (href ? 'Show these events' : undefined)}
+            onClick={href ? () => navigate(href) : undefined}
+            onKeyDown={href ? (e) => { if (e.key === 'Enter') navigate(href); } : undefined}
+            className={href ? 'cursor-pointer hover:opacity-80' : undefined}
+            style={{ minWidth: 110, paddingLeft: 20, borderLeft: '1px solid var(--line)' }}
+          >
             <div className="text-[11px] mb-[2px]" style={{ color: 'var(--ink-3)' }}>{label}</div>
             <div className="text-[18px] font-semibold num-tab mb-[4px]" style={{ color: 'var(--ink)' }}>{value}</div>
+            {sub && <div className="text-[11px] -mt-[2px] mb-[2px]" style={{ color: 'var(--ink-3)' }}>{sub}</div>}
             {spark.length >= 2 && <Sparkline data={spark} w={100} h={18} color={color} />}
           </div>
         ))}
@@ -275,8 +296,20 @@ function downsample<T>(arr: T[], max: number): T[] {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function SummaryView(props: Record<string, any>) {
+  // Privacy switch for map tiles and geocoding (#106). Read here because this
+  // card renders a map unprompted, unlike the device page where the operator
+  // has navigated to a location panel.
+  const { data: appSettings } = useQuery({
+    queryKey: ['app-settings'],
+    queryFn: () => settingsApi.get().then(r => r.data),
+    staleTime: 300_000,
+  });
+  // Off until settings have loaded (outside review U6): unknown used to count as on,
+  // so a Dark Site install fetched map tiles and geocoding before, or without, the setting.
+  const mapsEnabled = appSettings !== undefined && appSettings['maps_enabled'] !== false;
+
   const { summary, devices, wirelessCount, clientSparkline, clientsOverTime,
-    chartRange, setChartRange, topClients, usingNetflowTop, recentEvents, severities, toggleSeverity, navigate } = props;
+    chartRange, setChartRange, topClients, topClientsError, usingNetflowTop, recentEvents, severities, toggleSeverity, navigate } = props;
   const formatBytes = (bytes: number) => {
     if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
     if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
@@ -309,7 +342,6 @@ function SummaryView(props: Record<string, any>) {
     <div className="space-y-4">
       <HealthBar
         summary={summary}
-        devices={devices}
         wirelessCount={wirelessCount}
         clientSparkline={clientSparkline}
       />
@@ -394,8 +426,10 @@ function SummaryView(props: Record<string, any>) {
               Manage →
             </button>
           </div>
+          {/* A large fleet gets the devices needing attention, not a page of
+              names (#303). */}
           <div className="space-y-[1px]">
-            {(devices as Device[]).map((d) => (
+            {byAttention(devices as Device[]).slice(0, CARD_ROWS).map((d) => (
               <div
                 key={d.id}
                 className="flex items-center gap-[10px] px-[6px] py-[7px] rounded-[5px] cursor-pointer transition-colors"
@@ -417,12 +451,24 @@ function SummaryView(props: Record<string, any>) {
                   {d.firmware_update_available && <span>↑</span>}
                   {d.ros_version}
                 </div>
-                <TypePill type={d.device_type} />
+                <DeviceTypePill type={d.device_type} />
               </div>
             ))}
           </div>
+          {(devices as Device[]).length > CARD_ROWS && (
+            <button
+              onClick={() => navigate('/devices')}
+              className="mt-2 w-full text-left px-[6px] text-[11.5px]"
+              style={{ color: 'var(--ink-3)' }}
+            >
+              {CARD_ROWS} of {(devices as Device[]).length}, offline and updates first · <span style={{ color: 'var(--accent)' }}>View all →</span>
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Proxy usage — renders nothing unless a container proxy has logged connections. */}
+      <ProxyUsageCard />
 
       {/* Second row: Mix + Top talkers + Activity */}
       <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 1.2fr 1fr' }}>
@@ -496,8 +542,9 @@ function SummaryView(props: Record<string, any>) {
               })}
             </div>
           ) : (
-            <div className="flex items-center justify-center text-[12px]" style={{ height: 80, color: 'var(--ink-4)' }}>
-              No active clients
+            <div className="flex items-center justify-center text-[12px]" style={{ height: 80, color: topClientsError ? 'var(--warn, #d97706)' : 'var(--ink-4)' }}>
+              {/* An unreadable list isn't an empty one (U5). */}
+              {topClientsError ? 'Couldn’t load clients' : 'No active clients'}
             </div>
           )}
         </div>
@@ -562,7 +609,12 @@ function SummaryView(props: Record<string, any>) {
         </div>
       </div>
 
-      {/* Locations map */}
+      {/* Locations map. Gated on maps_enabled, which exists so that operators on
+          isolated networks make no third-party tile requests and disclose no
+          device locations (#106). The setting covered the device page and the
+          sites view but not this card, so the map stayed visible here — the one
+          place it is shown without being asked for (#159). */}
+      {mapsEnabled && (
       <div className="card" style={{ overflow: 'hidden' }}>
         <div
           className="flex items-center justify-between px-[18px] py-[14px]"
@@ -573,13 +625,14 @@ function SummaryView(props: Record<string, any>) {
             <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Locations</span>
           </div>
           <span className="mono text-[11px]" style={{ color: 'var(--ink-3)' }}>
-            {(devices as Device[]).filter(d => d.location_lat != null).length} of {(devices as Device[]).length} mapped
+            {(devices as Device[]).filter(d => d.effective_location?.lat != null).length} of {(devices as Device[]).length} mapped
           </span>
         </div>
         <div style={{ padding: '0 0' }}>
           <DeviceLocationsMap devices={devices as Device[]} />
         </div>
       </div>
+      )}
     </div>
   );
 }
@@ -594,9 +647,10 @@ function OperationsView({
 }) {
   const qc = useQueryClient();
   const canWrite = useCanWrite();
-  const allOnline = (summary?.devices.offline ?? 0) === 0 && (summary?.devices.total ?? 0) > 0;
-  const statusText = allOnline ? "Everything's running." : `${summary?.devices.offline} device${summary?.devices.offline !== 1 ? 's' : ''} unreachable.`;
-  const statusColor = allOnline ? 'var(--accent)' : 'var(--warn)';
+  const status = fleetStatus(summary?.devices);
+  const statusText = status.sentence;
+  const statusColor = status.tone === 'good' ? 'var(--accent)'
+                    : status.tone === 'warn' ? 'var(--warn)' : 'var(--ink-4)';
 
   const deviceList = devices as Device[];
   const onlineDevices = deviceList.filter(d => d.status === 'online');
@@ -611,6 +665,11 @@ function OperationsView({
   const dismissInsight = useMutation({
     mutationFn: (v: { fingerprint: string; hours: number; category?: string; title?: string }) =>
       operationsApi.dismissInsight(v.fingerprint, v.hours, v.category, v.title),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['ops-insights'] }),
+  });
+  // "Had N outages this week": count again from now (#85).
+  const resetOutages = useMutation({
+    mutationFn: (deviceId: number) => devicesApi.resetOutages(deviceId),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['ops-insights'] }),
   });
   const capacity: OpsCapacityRow[] = insights?.capacity ?? [];
@@ -629,33 +688,44 @@ function OperationsView({
   const hiddenRequests = activityAll.length - activity.length;
 
   // Platform update availability (checked against GitHub, cached server-side)
+  // Skipped outright in Dark Site Mode. The server would refuse to contact
+  // GitHub anyway; not asking at all keeps the dashboard from implying a check
+  // happened.
+  const { data: dashSettings } = useQuery({
+    queryKey: ['app-settings'],
+    queryFn: () => settingsApi.get().then(r => r.data),
+    staleTime: 300_000,
+  });
+  const updateCheckOn = dashSettings?.['update_check_enabled'] !== false;
   const { data: versionInfo } = useQuery({
     queryKey: ['version-check'],
     queryFn: () => systemApi.versionCheck().then(r => r.data),
     staleTime: 60 * 60_000,
     refetchOnWindowFocus: false,
+    enabled: updateCheckOn,
   });
 
   // Fleet security posture rollup (live per-device; cached 5 min, lazy)
-  const { data: posture } = useQuery({
-    queryKey: ['ops-security', onlineDevices.map(d => d.id).join(',')],
+  // One request, served from the cache and refreshed a few devices at a time
+  // (#302); it used to ask every online device separately.
+  const { data: postureAll } = useQuery({
+    queryKey: ['ops-security'],
     enabled: onlineDevices.length > 0,
     staleTime: 5 * 60_000,
     refetchOnWindowFocus: false,
-    queryFn: async () => {
-      const settled = await Promise.allSettled(
-        onlineDevices.map(d =>
-          devicesApi.getSecurityPosture(d.id).then(r => ({ id: d.id, name: d.name, score: r.data.score, checks: r.data.checks }))
-        )
-      );
-      return settled.flatMap(s => s.status === 'fulfilled' ? [s.value] : []);
-    },
+    queryFn: () => operationsApi.securityPosture().then(r => r.data),
+    refetchInterval: (q) => ((q.state.data?.refreshing ?? 0) > 0 ? 5_000 : false),
   });
+  const posture = postureAll?.devices;
 
   // Action state
   const [busy, setBusy] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [pickTerminal, setPickTerminal] = useState(false);
+  const [terminalSearch, setTerminalSearch] = useState('');
+  // Capacity lists the busiest devices first and stops at CAPACITY_ROWS, which
+  // silently hid the rest: nine devices showed eight rows, reported as a bug.
+  const [showAllCapacity, setShowAllCapacity] = useState(false);
   const [terminalDevice, setTerminalDevice] = useState<{ id: number; name: string } | null>(null);
 
   async function runAction(key: string, fn: () => Promise<string>) {
@@ -667,22 +737,26 @@ function OperationsView({
     } finally { setBusy(null); }
   }
 
-  const actions = [
+  // Every quick action needs write access on the server, so viewers aren't
+  // offered them (U10). Backup all and Sync touch every device in view, so
+  // they ask first.
+  const fleetConfirm = (what: string) => window.confirm(`${what} for all ${onlineDevices.length} online device${onlineDevices.length === 1 ? '' : 's'} in view?`);
+  const actions = !canWrite ? [] : [
     { key: 'discovery', label: 'Run discovery', sub: 'Scan ARP / CDP / MNDP', icon: Wifi, color: 'var(--accent)',
       run: () => runAction('discovery', async () => {
         const r = await topologyApi.discover();
         return (r.data as { message?: string })?.message || 'Discovery triggered';
       }) },
     { key: 'backup', label: 'Backup all', sub: `${onlineDevices.length} online`, icon: HardDrive, color: 'var(--info)',
-      run: () => runAction('backup', async () => {
+      run: () => fleetConfirm('Back up') && runAction('backup', async () => {
         const r = await operationsApi.backupAll();
         const ok = r.data.results.filter(x => x.ok).length;
         return `Backed up ${ok}/${r.data.total} device${r.data.total !== 1 ? 's' : ''}`;
       }) },
-    ...(canWrite ? [{ key: 'terminal', label: 'Open terminal', sub: 'Pick a device', icon: Terminal, color: 'var(--violet)',
-      run: () => { setActionMsg(null); setPickTerminal(true); } }] : []),
+    { key: 'terminal', label: 'Open terminal', sub: 'Pick a device', icon: Terminal, color: 'var(--violet)',
+      run: () => { setActionMsg(null); setTerminalSearch(''); setPickTerminal(true); } },
     { key: 'sync', label: 'Sync config', sub: 'Pull latest /export', icon: RefreshCw, color: 'var(--ink-2)',
-      run: () => runAction('sync', async () => {
+      run: () => fleetConfirm('Pull the configuration') && runAction('sync', async () => {
         const r = await operationsApi.syncAll();
         const ok = r.data.results.filter(x => x.ok).length;
         qc.invalidateQueries({ queryKey: ['ops-insights'] });
@@ -702,6 +776,14 @@ function OperationsView({
   const scoreColor = (s: number | null) => s == null ? 'var(--ink-3)' : s >= 85 ? 'var(--good)' : s >= 60 ? 'var(--warn)' : 'var(--bad)';
 
   const sortedCapacity = [...capacity].sort((a, b) => Math.max(b.cpu, b.mem_pct) - Math.max(a.cpu, a.mem_pct));
+  const CAPACITY_ROWS = 8;
+  // Fleet strip: two rows of tiles at most, the last one linking to the rest (#303).
+  const FLEET_TILES = 10;
+  const fleetList = devices as Device[];
+  const fleetTiles = fleetList.length > FLEET_TILES ? byAttention(fleetList).slice(0, FLEET_TILES - 1) : fleetList;
+  const fleetHidden = fleetList.length - fleetTiles.length;
+  const fleetOffline = fleetList.filter((d) => d.status === 'offline').length;
+  const shownCapacity = showAllCapacity ? sortedCapacity : sortedCapacity.slice(0, CAPACITY_ROWS);
   const meterColor = (v: number) => v >= 90 ? 'var(--bad)' : v >= 75 ? 'var(--warn)' : 'var(--accent)';
 
   const sevColor = (s: string) => s === 'error' ? 'var(--bad)' : s === 'warn' ? 'var(--warn)' : 'var(--info)';
@@ -854,6 +936,19 @@ function OperationsView({
                 >
                   {item.action} →
                 </button>
+                {item.resetOutagesDeviceId != null && canWrite && (
+                  <button
+                    onClick={() => resetOutages.mutate(item.resetOutagesDeviceId!)}
+                    disabled={resetOutages.isPending && resetOutages.variables === item.resetOutagesDeviceId}
+                    title="Count outages from now on. Uptime figures and history are kept."
+                    className="text-[11.5px] rounded-[5px] px-2 py-[6px] whitespace-nowrap transition-colors disabled:opacity-50"
+                    style={{ background: 'transparent', border: '1px solid var(--line)', color: 'var(--ink-3)' }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--surface-3)')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+                  >
+                    Reset count
+                  </button>
+                )}
                 {/* "Not now" rather than "never": an item that is genuinely resolved
                     stops being generated, so a dismissal is time-boxed (#102). */}
                 {item.fingerprint && (
@@ -862,7 +957,9 @@ function OperationsView({
                       fingerprint: item.fingerprint!, hours: 24,
                       category: item.category, title: item.title,
                     })}
-                    disabled={dismissInsight.isPending}
+                    // Only the insight being snoozed: one shared flag dimmed
+                    // every button in the list at once (#215).
+                    disabled={dismissInsight.isPending && dismissInsight.variables?.fingerprint === item.fingerprint}
                     title="Hide this for 24 hours. It returns if it is still true."
                     className="text-[11.5px] rounded-[5px] px-2 py-[6px] whitespace-nowrap transition-colors disabled:opacity-50"
                     style={{ background: 'transparent', border: '1px solid var(--line)', color: 'var(--ink-3)' }}
@@ -895,14 +992,14 @@ function OperationsView({
           <div className="flex items-center gap-2 px-5 py-[14px]" style={{ borderBottom: '1px solid var(--line)' }}>
             <Cpu className="w-4 h-4" style={{ color: 'var(--accent)' }} />
             <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Capacity &amp; health</span>
-            <span className="mono text-[11px] ml-auto" style={{ color: 'var(--ink-3)' }}>CPU · MEM</span>
+            <span className="mono text-[11px] ml-auto" style={{ color: 'var(--ink-3)' }}>busiest first · CPU · MEM</span>
           </div>
           {sortedCapacity.length === 0 ? (
             <div className="py-8 text-center text-[13px]" style={{ color: 'var(--ink-3)' }}>No resource data yet.</div>
           ) : (
-            <div className="px-5 py-3 space-y-3">
-              {sortedCapacity.slice(0, 8).map((c) => (
-                <button key={c.id} onClick={() => navigate(`/devices/${c.id}`)}
+            <div className="px-5 py-3 space-y-3" style={showAllCapacity ? { maxHeight: 'min(52vh, 460px)', overflowY: 'auto' } : undefined}>
+              {shownCapacity.map((c) => (
+                <button key={c.id} onClick={() => navigate(`/devices/${c.id}`)} title={c.name}
                   className="w-full text-left flex items-center gap-3 group">
                   <div className="text-[12.5px] font-medium truncate" style={{ color: 'var(--ink)', width: 130 }}>{c.name}</div>
                   <div className="flex-1 flex items-center gap-3">
@@ -918,6 +1015,20 @@ function OperationsView({
                   </div>
                 </button>
               ))}
+              {sortedCapacity.length > CAPACITY_ROWS && (
+                <div className="pt-1 text-[11.5px] flex items-center gap-2" style={{ color: 'var(--ink-3)' }}>
+                  {showAllCapacity
+                    ? `All ${sortedCapacity.length} devices`
+                    : `${CAPACITY_ROWS} busiest of ${sortedCapacity.length} shown`}
+                  <button
+                    onClick={() => setShowAllCapacity((v) => !v)}
+                    className="underline"
+                    style={{ color: 'var(--accent)' }}
+                  >
+                    {showAllCapacity ? 'Show fewer' : 'Show all'}
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1010,10 +1121,13 @@ function OperationsView({
           <div className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Fleet</div>
           <span className="mono text-[11px]" style={{ color: 'var(--ink-3)' }}>
             {(devices as Device[]).length} device{(devices as Device[]).length !== 1 ? 's' : ''}
+            {fleetOffline > 0 && <span style={{ color: 'var(--bad)' }}> · {fleetOffline} offline</span>}
           </span>
         </div>
-        <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(${Math.min((devices as Device[]).length, 5)}, 1fr)` }}>
-          {(devices as Device[]).map((d) => {
+        {/* One tile per device stops at two rows; past that, the tiles needing
+            attention and a link to the rest (#303). */}
+        <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(${Math.min((devices as Device[]).length, 5)}, minmax(0, 1fr))` }}>
+          {fleetTiles.map((d) => {
             const hasAlert = d.firmware_update_available || d.routerboard_upgrade_available;
             return (
               <button
@@ -1029,9 +1143,7 @@ function OperationsView({
                     color={d.status === 'online' ? 'var(--good)' : d.status === 'offline' ? 'var(--bad)' : 'var(--warn)'}
                     glow size={6}
                   />
-                  <span className="mono text-[10px]" style={{ color: 'var(--ink-3)' }}>
-                    {d.device_type === 'wireless_ap' ? 'AP' : d.device_type === 'router' ? 'RTR' : 'SW'}
-                  </span>
+                  <DeviceTypePill type={d.device_type} />
                   {hasAlert && (
                     <span
                       className="ml-auto text-[10px] font-bold px-[5px] py-[1px] rounded-full"
@@ -1044,6 +1156,18 @@ function OperationsView({
               </button>
             );
           })}
+          {fleetHidden > 0 && (
+            <button
+              onClick={() => navigate('/devices')}
+              className="text-left rounded-[8px] p-[14px] transition-colors flex flex-col justify-center"
+              style={{ background: 'transparent', border: '1px dashed var(--line)' }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--surface-2)')}
+              onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
+            >
+              <div className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>+{fleetHidden} more</div>
+              <div className="text-[11px]" style={{ color: 'var(--accent)' }}>View all devices →</div>
+            </button>
+          )}
         </div>
       </div>
 
@@ -1059,8 +1183,24 @@ function OperationsView({
                 <X className="w-4 h-4" />
               </button>
             </div>
+            <div className="px-5 py-2" style={{ borderBottom: '1px solid var(--line)' }}>
+              <input
+                autoFocus
+                value={terminalSearch}
+                onChange={(e) => setTerminalSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return;
+                  const first = filterDevices(deviceList, terminalSearch).find((d) => d.status === 'online');
+                  if (first) { setTerminalDevice({ id: first.id, name: first.name }); setPickTerminal(false); }
+                }}
+                placeholder="Name, address, site or model"
+                aria-label="Search devices"
+                className="w-full bg-transparent text-[13px] outline-none py-1"
+                style={{ color: 'var(--ink)' }}
+              />
+            </div>
             <div className="max-h-[360px] overflow-y-auto">
-              {[...deviceList].sort((a, b) => (a.status === 'online' ? 0 : 1) - (b.status === 'online' ? 0 : 1)).map((d) => (
+              {[...filterDevices(deviceList, terminalSearch)].sort((a, b) => (a.status === 'online' ? 0 : 1) - (b.status === 'online' ? 0 : 1)).map((d) => (
                 <button key={d.id} disabled={d.status !== 'online'}
                   onClick={() => { setTerminalDevice({ id: d.id, name: d.name }); setPickTerminal(false); }}
                   className="w-full text-left flex items-center gap-3 px-5 py-[11px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1093,6 +1233,8 @@ function OperationsView({
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
+/** Device names the update banner lists before "and N more" (#303). */
+const BANNER_NAMES = 6;
 const ALL_SEVERITIES = ['error', 'warning', 'info'] as const;
 const SEVERITY_KEY = 'dashboard:severities';
 
@@ -1147,7 +1289,7 @@ export default function DashboardPage() {
     refetchInterval: 60_000,
   });
   const usingNetflowTop = netflowTopClients.length > 0;
-  const { data: counterTopClients = [] } = useQuery({
+  const { data: counterTopClients = [], isError: counterTopError } = useQuery({
     queryKey: ['top-clients'],
     queryFn: () => metricsApi.topClients(8).then(r => r.data),
     refetchInterval: 60_000,
@@ -1177,7 +1319,7 @@ export default function DashboardPage() {
 
   const { data: recentEvents } = useQuery({
     queryKey: ['events-recent', severityParam],
-    queryFn: () => eventsApi.list({ limit: 5, severity: severityParam }).then(r => r.data),
+    queryFn: () => eventsApi.recent({ limit: 5, severity: severityParam }).then(r => r.data),
     refetchInterval: 30_000,
   });
 
@@ -1267,7 +1409,7 @@ export default function DashboardPage() {
                   <ArrowUpCircle className="w-3 h-3" />
                   RouterOS ({devicesWithRosUpdates.length}):
                 </span>
-                {devicesWithRosUpdates.map((d, i) => (
+                {devicesWithRosUpdates.slice(0, BANNER_NAMES).map((d, i) => (
                   <span key={d.id}>
                     {i > 0 && <span style={{ color: 'var(--ink-3)' }}> · </span>}
                     <button
@@ -1279,6 +1421,11 @@ export default function DashboardPage() {
                     </button>
                   </span>
                 ))}
+                {devicesWithRosUpdates.length > BANNER_NAMES && (
+                  <button onClick={() => navigate('/firmware')} className="underline underline-offset-2" style={{ color: 'var(--ink-3)' }}>
+                    and {devicesWithRosUpdates.length - BANNER_NAMES} more
+                  </button>
+                )}
               </div>
             )}
             {devicesWithRbUpgrades.length > 0 && (
@@ -1287,7 +1434,7 @@ export default function DashboardPage() {
                   <Cpu className="w-3 h-3" />
                   RouterBOOT ({devicesWithRbUpgrades.length}):
                 </span>
-                {devicesWithRbUpgrades.map((d, i) => (
+                {devicesWithRbUpgrades.slice(0, BANNER_NAMES).map((d, i) => (
                   <span key={d.id}>
                     {i > 0 && <span style={{ color: 'var(--ink-3)' }}> · </span>}
                     <button
@@ -1299,6 +1446,11 @@ export default function DashboardPage() {
                     </button>
                   </span>
                 ))}
+                {devicesWithRbUpgrades.length > BANNER_NAMES && (
+                  <button onClick={() => navigate('/firmware')} className="underline underline-offset-2" style={{ color: 'var(--ink-3)' }}>
+                    and {devicesWithRbUpgrades.length - BANNER_NAMES} more
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -1328,6 +1480,7 @@ export default function DashboardPage() {
           chartRange={chartRange}
           setChartRange={setChartRange}
           topClients={topClients}
+          topClientsError={!usingNetflowTop && counterTopError}
           usingNetflowTop={usingNetflowTop}
           recentEvents={recentEvents}
           severities={severities}

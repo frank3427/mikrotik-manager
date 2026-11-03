@@ -4,10 +4,13 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 0.16.x (current beta) | Yes |
-| Earlier versions | No |
+| The latest release | Yes |
+| Anything older | No |
 
-MikroTik Manager is currently in beta. Security fixes will be applied to the latest release only.
+MikroTik Manager is in beta, and security fixes go into the latest release only. Every commit to
+`main` is a release: its version is in `backend/package.json`, shown in the app's sidebar and
+tagged on the published images. Updating (`git pull` and `docker compose up -d --build`, or
+`docker compose pull` with the published images) is how a fix is applied.
 
 ## Reporting a Vulnerability
 
@@ -16,7 +19,7 @@ MikroTik Manager is currently in beta. Security fixes will be applied to the lat
 If you discover a security vulnerability, please use one of the following channels:
 
 - **GitHub Private Security Advisory** *(preferred)*: Use the [Report a Vulnerability](../../security/advisories/new) button in the Security tab of this repository. This lets us discuss the issue privately before public disclosure.
-- **Email**: Send details to the repository maintainer via the contact information on their GitHub profile.
+- **Email**: Send details to [contact@2guystek.tv](mailto:contact@2guystek.tv).
 
 ### What to include in your report
 
@@ -33,16 +36,54 @@ If you discover a security vulnerability, please use one of the following channe
 
 We ask that you give us reasonable time to address the issue before any public disclosure. We will credit you in the release notes if you wish.
 
+## Acknowledgements
+
+Thank you to the people and organizations who have taken the time to review MikroTik Manager
+and report what they found.
+
+- **[Novus Insight](https://novusinsight.com)** carried out an independent code and security
+  review of version 0.24.32 in September 2026: 12 serious findings, 36 bugs and 54 hardening
+  items, each traced through the code and several reproduced. Every one of them is fixed, in
+  0.24.35 through 0.24.51. The review led to session revocation, per-site access roles, API-SSL
+  with certificate and host-key pinning, Change Guard refusing what it can't protect, honest
+  restore results and signed, digest-pinned images, among much else. Novus Insight supports
+  schools, municipalities and non-profit organizations, and runs MikroTik throughout.
+- **Onur Alp Akin ([@otuva](https://github.com/otuva))** found that a viewer account could open an SSH terminal,
+  the device's admin command line, on any managed device
+  ([GHSA-9jf3-mmv2-wh47](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-9jf3-mmv2-wh47)).
+  Fixed in 0.16.8.
+- **Artur Chlebicki ([@Artur12555](https://github.com/Artur12555))** found that a user limited
+  to one site could reach devices on other sites through the way device ids were read from the
+  request path
+  ([GHSA-6xq3-q9m5-7hxp](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-6xq3-q9m5-7hxp)).
+  Fixed in 0.45.1.
+- **David Coulson ([@davidcoulson](https://github.com/davidcoulson))** found that alert and
+  webhook address checks could be bypassed with IPv4-mapped IPv6 addresses written in hex, that
+  alert and report emails inserted device and client text as HTML, that webhook URLs were
+  readable by viewers and automation settings by site-limited accounts, and that the HTTPS
+  certificate upload checked only its first block
+  ([GHSA-28hr-v457-cc6g](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-28hr-v457-cc6g)).
+  Fixed in 1.0.0-rc.1.
+- **Pim ([@pimlie](https://github.com/pimlie))** found that site-limited accounts could reach
+  other sites' devices, backups and rollouts through ids written in unusual ways
+  ([GHSA-j9x4-qwcj-p8v8](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-j9x4-qwcj-p8v8)),
+  and that device passwords could be sent unencrypted when adding a device or to another
+  address when moving one, that alert email didn't check the mail server's certificate, and
+  that two-factor codes were limited per address only
+  ([GHSA-63v6-w7qf-349f](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-63v6-w7qf-349f)).
+  Fixed in 1.0.1.
+
 ## Security Considerations for Self-Hosted Deployments
 
 MikroTik Manager is designed to be run on your local network. A few things to keep in mind:
 
 - **Do not expose this application directly to the public internet.** It is intended for LAN or VPN-only access.
-- The `.env` file contains sensitive credentials (JWT secret, encryption key, database passwords). Protect this file and never commit it to version control.
-- Device credentials stored in the database are encrypted at rest using AES-256.
-- HTTPS is enforced by default. The included nginx configuration redirects all HTTP traffic to HTTPS.
-- Default credentials should be changed immediately after first login.
-- The built-in role-based access control (Admin / Operator / Viewer) should be used to limit user privileges.
+- The `.env` file holds the internal database passwords, and the JWT secret and encryption key if you set them yourself. Left unset, those two are generated on first start and kept in the `app_data` volume, which then needs the same protection. Never commit `.env` to version control.
+- The internal database passwords default to publicly known values. Set your own; see [Internal service passwords](docs/configuration.md#internal-service-passwords).
+- Device passwords are encrypted at rest with AES-256-GCM, and so are backups that contain secrets. Anyone holding both the database and the encryption key can decrypt them, so back up and protect them separately.
+- The included nginx configuration redirects HTTP to HTTPS. Its certificate is self-signed until you upload your own.
+- The first sign-in as `admin`/`admin` must set a new password before anything else works.
+- Use the roles (admin, operator, viewer, fleet-wide or per site) to give people only the access they need.
 
 ## AI-Assisted Security Infrastructure
 

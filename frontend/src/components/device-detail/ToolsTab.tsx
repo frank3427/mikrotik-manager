@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Play, Loader2, CheckCircle, XCircle, Wifi, RotateCcw, Download, Activity } from 'lucide-react';
 import { deviceToolsApi, devicesApi } from '../../services/api';
 import clsx from 'clsx';
 import { useCanWrite } from '../../hooks/useCanWrite';
+import DevicePicker from '../common/DevicePicker';
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -390,10 +391,11 @@ function PacketCaptureTool({ deviceId, interfaces }: { deviceId: number; interfa
   const [ready, setReady] = useState(false);
   const [downloadUrl, setDownloadUrl] = useState('');
   const [fileName, setFileName] = useState('');
+  // Release the capture's memory when it's replaced or the panel closes (U12).
+  useEffect(() => () => { if (downloadUrl) URL.revokeObjectURL(downloadUrl); }, [downloadUrl]);
 
   const run = async () => {
     setLoading(true); setError(''); setReady(false);
-    if (downloadUrl) URL.revokeObjectURL(downloadUrl);
     try {
       const res = await deviceToolsApi.capture(deviceId, {
         interface: iface || undefined,
@@ -540,14 +542,12 @@ function BandwidthTestTool({ deviceId }: { deviceId: number }) {
 
       <div className="flex flex-wrap gap-3">
         {mode === 'managed' ? (
-          <select className="input flex-1 min-w-48" value={targetDeviceId} onChange={(e) => setTargetDeviceId(e.target.value)}>
-            <option value="">— Select target device —</option>
-            {targetDevices.map((d: { id: number; name: string; ip_address: string; status?: string }) => (
-              <option key={d.id} value={d.id}>
-                {d.name} ({d.ip_address}){d.status === 'offline' ? ' — offline' : ''}
-              </option>
-            ))}
-          </select>
+          <DevicePicker
+            className="flex-1 min-w-48" placeholder="Select target device" aria-label="Target device"
+            devices={targetDevices as { id: number; name: string; ip_address: string; status?: string }[]}
+            value={targetDeviceId ? Number(targetDeviceId) : null}
+            onChange={(id) => setTargetDeviceId(id == null ? '' : String(id))}
+          />
         ) : (
           <input
             className="input flex-1 min-w-48"
@@ -634,6 +634,8 @@ export default function ToolsTab({ deviceId }: { deviceId: number }) {
     <div className="space-y-4">
       {canWrite && <RebootSection deviceId={deviceId} />}
 
+      {/* Run on the device, so the server requires write access (U10). */}
+      {canWrite && (<>
       <ToolCard title="Ping" icon={({ className }) => (
         <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
           <circle cx="12" cy="12" r="3" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
@@ -659,6 +661,8 @@ export default function ToolsTab({ deviceId }: { deviceId: number }) {
       )}>
         <IpScanTool deviceId={deviceId} interfaces={interfaceNames} />
       </ToolCard>
+
+      </>)}
 
       {canWrite && (
         <ToolCard title="Wake-on-LAN" icon={Wifi}>
